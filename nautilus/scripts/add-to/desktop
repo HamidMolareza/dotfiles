@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Check if file path is provided
+if [ -z "$1" ]; then
+    zenity --error --text="No file path provided."
+    exit 1
+fi
+
+# Get absolute path of the file
+FILE_PATH=$(realpath "$1")
+
+# Check if file exists
+if [ ! -e "$FILE_PATH" ]; then
+    zenity --error --text="File '$FILE_PATH' does not exist."
+    exit 1
+fi
+
+# Ensure Desktop folder exists
+DESKTOP="$HOME/Desktop"
+mkdir -p "$DESKTOP"
+
+# Create symlink
+LINK_NAME=$(basename "$FILE_PATH")
+LINK_PATH="$DESKTOP/$LINK_NAME"
+
+ln -sf "$FILE_PATH" "$LINK_PATH"

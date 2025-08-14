@@ -64,8 +64,7 @@ backup_and_link_dir ".config"
 backup_and_link_dir "scripts"
 chmod +x -R $HOME/scripts
 
-
-ln -sf $DOTFILES_DIR/nautilus/* $HOME/.local/share/nautilus/
-chmod +x -R $HOME/.local/share/nautilus/
+ln -sf $DOTFILES_DIR/nautilus/scripts $HOME/.local/share/nautilus/
+chmod +x -R $HOME/.local/share/nautilus/scripts
 
 echo "✅ Symlinks created. Restart your shell to apply."
