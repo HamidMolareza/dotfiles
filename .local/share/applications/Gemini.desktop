@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=Gemini
+Exec=open https://gemini.google.com/app
+Icon=/home/home/.icons/gemini.png
+Terminal=false
+Type=Application
+Categories=;

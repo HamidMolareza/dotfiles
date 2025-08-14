@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=Snapp
+Exec=open https://app.snapp.taxi/
+Icon=/home/home/.icons/snapp.png
+Terminal=false
+Type=Application
+Categories=;

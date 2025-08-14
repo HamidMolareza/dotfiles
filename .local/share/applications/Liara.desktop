@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=Liara
+Exec=open https://console.liara.ir/apps/
+Icon=/home/home/.icons/liara.png
+Terminal=false
+Type=Application
+Categories=;

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=Bale Messanger
+Exec=open https://web.bale.ai/chat
+Icon=/home/home/.icons/bale-messanger.png
+Terminal=false
+Type=Application
+Categories=Messanger;Social;

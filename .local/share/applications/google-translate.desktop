@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=google-translate
+Exec=xdg-open "https://translate.google.com/?hl=fa&sl=auto&tl=en&op=translate/"
+Icon=/home/home/.icons/google-translate.png
+Terminal=false
+Type=Application
+Categories=Translate;Utility;Web;

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=Grok
+Exec=open https://grok.com/
+Icon=/home/home/.icons/grok.png
+Terminal=false
+Type=Application
+Categories=;

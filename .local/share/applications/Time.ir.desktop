@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Name=Time.ir
+Exec=open https://time.ir/
+Icon=/home/home/.icons/time-ir.png
+Terminal=false
+Type=Application
+Categories=Calendar;Utility;

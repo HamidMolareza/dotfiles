@@ -1,0 +1,9 @@
+chrome-*
+DataGrip-*
+install4j-*
+jetbrains-*
+PyCharm-*
+Rider-*
+WebStorm-*
+install4j_*
+*.cache
