@@ -1,0 +1,67 @@
+#!/bin/bash
+
+alias zsh-reload='source ~/.zshrc' 
+alias zsh-stats='zsh_stats'
+
+alias bash-reload='source ~/.bashrc' 
+
+# enable color support of ls and also add handy aliases
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    #alias dir='dir --color=auto'
+    #alias vdir='vdir --color=auto'
+
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+fi
+
+# some more ls aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+
+# Remove Folder
+alias rf='rd'
+
+alias ..='cd ..'
+alias ....='cd ../..'
+
+alias c="clear"
+
+# Path
+alias p='path'
+alias pc='path | clipboard'
+alias pce='path | clipboard && exit'
+
+alias tor-restart='sudo service tor stop; sudo service tor start'
+
+# dotnet
+alias dr='dotnet restore'
+alias dema='dotnet ef migrations add'
+alias dedu='dotnet ef database update'
+alias dap='dotnet add package'
+alias dotnet-outdated='dotnet outdated'
+
+alias restart-wifi='sudo systemctl restart NetworkManager; nmcli radio wifi off; nmcli radio wifi on'
+
+alias size='du -sh * | sort -rh'
+alias size-all='du -sh .'
+
+alias wifi-connection-name="nmcli -t -f DEVICE,STATE connection show --active | grep ':activated' | cut -d':' -f1 | head -n 1"
+alias wifi-usage="vnstat -i '$(wifi-connection-name)'"
+
+alias v2ray-config="/usr/local/etc/v2ray/config.json"
+
+te() {
+    temp "$1" && exit
+}
+
+# GitHub
+alias gh-pr-open='gh pr list --state open --json number'
+alias gh-repo-open='gh repo view --web'
+
+# Add an "alert" alias for long running commands.  Use like so:
+#   sleep 10; alert
+alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history|tail -n1|sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
