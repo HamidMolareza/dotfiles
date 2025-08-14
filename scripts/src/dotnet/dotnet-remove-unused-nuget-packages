@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Find all .csproj files and process each one
+for project in $(find . -name "*.csproj"); do
+    echo "Processing project: $project"
+    
+    # Restore packages to ensure the project is in a clean state
+    dotnet restore "$project"
+
+    # Use dotnet list to find unused packages
+    unused_packages=$(dotnet list "$project" package --outdated | grep '>' | awk '{print $2}')
+
+    if [ -z "$unused_packages" ]; then
+        echo "No unused packages found in $project."
+        continue  # Use continue instead of exit to process the next project
+    fi
+
+    echo "Unused packages found in $project:"
+    echo "$unused_packages"
+    
+    # Prompt for user confirmation
+    read -rp "Do you want to remove these unused packages? (y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        for package in $unused_packages; do
+            echo "Removing package: $package"
+            dotnet remove "$project" package "$package"
+        done
+    else
+        echo "Skipping removal of unused packages for $project."
+    fi
+done

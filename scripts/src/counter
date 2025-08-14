@@ -1,0 +1,46 @@
+#!/bin/python3
+
+import sys
+import os
+from typing import Optional
+
+class CounterApp:
+    def __init__(self, limit: Optional[int]):
+        if limit is not None and limit < 1:
+            raise Exception("Limit can not less than 1.")
+        
+        self.count = limit if limit is not None else 0
+        self.limit = limit
+        
+    @staticmethod
+    def clear_console():
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def run(self):
+        try:
+            while self.count >= 0:
+                self.clear_console()
+                print("Press Enter to continue. Press 'q' to quit.")
+                print("Current count:", self.count)
+                key = input()
+
+                if key == '':
+                    if limit is None:
+                        self.count += 1
+                    else:
+                        self.count -= 1
+                elif key.lower() == 'q':
+                    break
+        except KeyboardInterrupt:
+            pass
+
+def get_argument(index: int) -> Optional[str]:
+    return sys.argv[index] if len(sys.argv) > index else None
+
+
+if __name__ == "__main__":
+    limit = get_argument(1)
+    if limit is not None:
+        limit = int(limit)
+    counter_app = CounterApp(limit)
+    counter_app.run()

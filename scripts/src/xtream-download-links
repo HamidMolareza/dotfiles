@@ -1,0 +1,39 @@
+#!/bin/python3
+
+import sqlite3
+from pathlib import Path
+import itertools
+
+
+home_path = Path.home()  # Fetches the $HOME path
+db_path = f"{home_path}/.xdm-app-data/downloads.db"
+
+# Connect to the SQLite database
+conn = sqlite3.connect(db_path)
+
+# Create a cursor object
+cursor = conn.cursor()
+
+# Define the SQL query
+query = '''
+select targetdir, primary_url
+from downloads
+where completed = 0
+order by targetdir, progress desc, size, date_added;
+'''
+
+# Execute the query
+cursor.execute(query)
+
+# Fetch all rows from the result
+results = cursor.fetchall()
+
+grouped_data = itertools.groupby(results, key=lambda x: x[0])
+for key, group in grouped_data:
+    print(f"targetdir: {key}")
+    for item in group:
+        print(item[1])
+    print()
+
+# Close the connection
+conn.close()

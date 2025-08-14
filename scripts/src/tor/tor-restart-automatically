@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# This Bash script checks if the internet is connected, if Tor is running, and if YouTube is accessible through Tor, taking appropriate actions based on the results.
+
+# This function restarts the Tor service.
+restart_tor() {
+    sudo service tor stop
+    sudo service tor start
+}
+
+# This function logs the given message to the specified file.
+log_info() {
+    local message="$1"
+
+    if [ -n "$logs_path" ]; then
+        echo "$(date "+%Y-%m-%d-%H-%M-%S"): $message" >>"$logs_path"
+    fi
+}
+
+logs_path="$1"
+if [ -n "$logs_path" ]; then
+    base_dir=$(dirname "$logs_path")
+    mkdir -p "$base_dir"
+fi
+
+# Check if the internet connection is available by trying to access a site.
+if ! curl --max-time 25 https://time.ir >/dev/null 2>&1; then
+    # If the exit code of the previous command is not 0, it means the internet is not connected.
+    exit 0
+fi
+
+# Check if the Tor service is running
+if ! pgrep -x "tor" >/dev/null; then
+    # If Tor is not running on port 9050, it's possible the user doesn't want it, so we skip.
+    log_info "The tor is not run on 9050"
+    exit 0
+fi
+
+# Check if YouTube is accessible through Tor
+youtube=$(curl --max-time 40 --socks5-hostname localhost:9050 https://www.youtube.com/)
+if [ $? -ne 0 ]; then
+    # If the exit code of the previous command is not 0, it means the connection to YouTube failed.
+    log_info "Can not connect to youtube. Restarting Tor."
+    restart_tor
+elif echo "$youtube" | grep "302 Moved" >/dev/null 2>&1; then
+    # If the status code be "302 Moved", it means the connection to YouTube failed.
+    log_info "Can not connect to youtube. It returns 302 Moved code. So restarting Tor."
+    restart_tor
+fi

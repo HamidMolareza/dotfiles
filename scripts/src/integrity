@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Check if a file or URL is provided as an argument
+if [ $# -ne 1 ]; then
+  echo "Usage: $(basename "$0") <file_or_url>"
+  exit 1
+fi
+
+# Get the file or URL from the command line argument
+target="$1"
+
+# Function to calculate SHA-256 hash
+calculate_integrity() {
+  local input="$1"
+  if [ -f "$input" ]; then
+    hash=$(openssl dgst -sha384 -binary "$input" | openssl base64 -A)
+  elif [ -n "$(command -v curl)" ]; then
+    # If curl is available, use it to download and calculate integrity
+    hash=$(curl -s "$input" | openssl dgst -sha384 -binary | openssl base64 -A)
+  else
+    echo "Error: You need to have either the file or curl installed to use this script."
+    exit 1
+  fi
+
+  echo "sha384-$hash"
+}
+
+# Calculate and display integrity
+calculate_integrity "$target"

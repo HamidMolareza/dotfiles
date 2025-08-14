@@ -1,0 +1,165 @@
+#!/bin/bash
+
+#------------------------------------------------------------------------------
+# Functions
+
+usage() {
+  script_name=$(basename "$0")
+  echo "Usage:"
+  printf "\t%s -d dir -m 1 -t *.zip -o output/dir -p password\n", "$script_name"
+  printf "\t%s --dir dir --maxdepth 1 --pattern *.zip --output output/dir --password password\n", "$script_name"
+}
+
+# Function to find zip files in the directory with max depth 1
+find_zip_files_recursive() {
+  local directory="$1"
+  local maxdepth="$2"
+  local pattern="$3"
+
+  zip_files=()
+  shopt -s nullglob
+  # Use find command with maxdepth option
+  while IFS= read -r -d $'\0' file; do
+    zip_files+=("$file")
+  done < <(find "$directory" -maxdepth "$maxdepth" -type f -name "$pattern" -print0)
+}
+
+# Function to check if a zip file is password-protected
+is_zip_password_protected() {
+  local zip_file="$1"
+  
+  if 7z l -slt "$zip_file" | grep -q 'Encrypted = +'; then
+    return 0 # Zip file is password-protected
+  else
+    return 1 # Zip file is not password-protected
+  fi
+}
+
+is_any_file_protected() {
+  for file in "${zip_files[@]}"; do
+    if is_zip_password_protected "$file"; then
+      return 0 #The zip file is password-protected.
+    fi
+  done
+  return 1 #not password-protected.
+}
+
+# Function to unzip files
+unzip_files() {
+  local pass="$1"
+  local delete_choice="$2"
+  local requested_output="$3"
+
+  for file in "${zip_files[@]}"; do
+    if [ -z "$requested_output" ]; then
+      output_dir=$(dirname "$file")
+    else
+      output_dir="$requested_output"
+    fi
+
+    printf "Unzipping %s to %s... " "$file" "$output_dir"
+    if 7z x -o"$output_dir" -p"$pass" -aoa "$file" >/dev/null; then
+      if [ "$delete_choice" = 'y' ] || [ "$delete_choice" = 'Y' ]; then
+        rm -f "$file"
+      fi
+      echo "Done."
+    else
+      echo "Failed."
+      echo
+    fi
+  done
+}
+
+#------------------------------------------------------------------------------
+# Main
+
+if ! command-exists 7z; then
+    echo "Error: 7z is not installed. Please install it before running this script."
+    echo "You can use: sudo apt-get install p7zip-full"
+    exit 1
+fi
+
+# Default inputs
+help=false
+directory="."
+maxdepth="1"
+pattern="*.zip"
+password=""
+output_directory=""
+
+while [ "$1" != "" ]; do
+  case $1 in
+  -h | --help)
+    shift
+    help=true
+    ;;
+  -d | --dir)
+    shift
+    directory="$1"
+    ;;
+  -m | --maxdepth)
+    shift
+    maxdepth="$1"
+    ;;
+  -t | --pattern)
+    shift
+    pattern="$1"
+    ;;
+  -o | --output)
+    shift
+    output_directory="$1"
+    ;;
+  -p | --password)
+    shift
+    password="-p $1"
+    ;;
+  esac
+  shift
+done
+
+if $help || [ "$1" = "help" ]; then
+  usage
+  exit 0
+fi
+
+# Validate directory
+if [ ! -d "$directory" ]; then
+  echo "The directory '$directory' is not valid."
+  echo "Please provide a valid directory path."
+  exit 1
+fi
+# Check if maxdepth is a number
+if ! [[ "$maxdepth" =~ ^[0-9]+$ ]]; then
+  echo "Error: maxdepth must be a positive integer."
+  exit 1
+fi
+
+# Find zip files
+find_zip_files_recursive "$directory" "$maxdepth" "$pattern"
+if [ ${#zip_files[@]} -eq 0 ]; then
+  echo "No zip files found in the directory '$directory' ."
+  echo "You can set maxdepth with -m or --maxdepth to search more sub directories."
+  exit 0
+fi
+
+# Confirm
+echo "${#zip_files[@]} zip file(s) found in '$directory' (with max-depth: $maxdepth)"
+read -rp "Do you want to unzip these files? (Y/n): " unzip_choice
+if [ "$unzip_choice" = 'n' ] || [ "$unzip_choice" = 'N' ]; then
+  exit 0
+fi
+echo
+
+if is_any_file_protected && [ -z "$password" ]; then
+  echo "At least one of your files requires a password."
+
+  # Prompt the user for a password
+  read -r -s -p "Enter your password: " password
+  echo # Add a newline after the user presses Enter
+  echo
+fi
+
+read -r -p "Do you want to delete the zips after successful unzipping? (y/N): " delete_choice
+
+echo
+unzip_files "$password" "$delete_choice" "$output_directory"

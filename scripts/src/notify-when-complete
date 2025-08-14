@@ -1,0 +1,15 @@
+#!/bin/bash
+
+
+exit_code="$1"
+message="$2"
+
+if [ -z "$message" ]; then
+    message="Code: $exit_code"
+else
+    message="$message - Code: $exit_code"
+fi
+
+notify-send -u critical -i "$([ "$exit_code" = 0 ] && echo terminal || echo error)" "$message"
+
+exit "$exit_code"

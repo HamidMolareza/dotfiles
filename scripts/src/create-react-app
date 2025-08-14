@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Display help message
+help() {
+  echo "Usage: $(basename $0) <project_name>"
+  echo "Creates a new React app with TypeScript using create-react-app."
+  echo "  <project_name>   The name for your new React app."
+  exit 1
+}
+
+# Check if there are no arguments or the first argument is 'help'
+if [ $# -eq 0 ] || [ "$1" == "help" ]; then
+  help
+fi
+
+# Assign the project name to a variable
+project_name=$1
+
+# Create a new React app with TypeScript
+yarn create react-app $project_name  --template typescript
+
+# Navigate to the project directory
+cd $project_name
+
+# Display success message
+echo "React app with TypeScript created successfully in $project_name directory."

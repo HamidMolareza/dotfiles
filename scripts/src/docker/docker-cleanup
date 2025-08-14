@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Remove all stopped containers
+echo "Removing all stopped containers..."
+docker container prune -f
+
+# Optionally, remove all unused images, networks, and volumes
+echo "Removing all unused images, networks, and volumes..."
+docker system prune -f
+
+# Additional step to remove containers older than a certain period (e.g., 24 hours)
+# Modify the period as necessary. Here it's set to 24 hours.
+echo "Removing containers older than 24 hours..."
+old_containers=$(docker ps -a --filter "status=exited" --filter "status=created" --format "{{.ID}} {{.CreatedAt}}" | while read -r id created_at; do
+    created_seconds=$(date -d "$created_at" +%s)
+    current_seconds=$(date +%s)
+    age=$(( (current_seconds - created_seconds) / 3600 )) # age in hours
+    if (( age >= 24 )); then
+        echo $id
+    fi
+done)
+
+if [ -n "$old_containers" ]; then
+    echo "$old_containers" | xargs docker rm
+else
+    echo "No containers older than 24 hours to remove."
+fi
+
+echo "Cleanup completed."

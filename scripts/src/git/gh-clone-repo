@@ -1,0 +1,27 @@
+#!/bin/bash
+
+if ! command-exists gh; then
+    echo "Error: GitHub cli (gh) is not installed. Please install it before running this script."
+    exit 1
+fi
+
+source "$HOME/my-files/scripts/src/try"
+
+account="$1"
+
+# Get date time
+current_datetime=$(date "+%Y-%m-%d-%H-%M-%S")
+
+# Set directory
+base_dir="repo-$account-$current_datetime"
+# Create directory
+mkdir "$base_dir"
+
+# List every gist in reverse order, then clone all of them
+gh repo list "$account" --limit 1000 | cut -f1 | tac | while read repo_path; do
+  repo_name=$(echo "$repo_path" | cut -d'/' -f2)
+  dir="$base_dir/$repo_name"
+
+  try "gh repo clone $repo_path $dir" 5 4
+  echo ""
+done

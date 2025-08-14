@@ -1,0 +1,141 @@
+#!/bin/python3
+
+from flask import Flask, send_from_directory, Response
+import os
+
+app = Flask(__name__)
+IMAGE_DIR = os.getcwd()  # Serve images from the current directory
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Slider</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background-color: #000;
+            color: #fff;
+        }
+        .slider {
+            position: relative;
+            max-width: 100%;
+            margin: auto;
+            overflow: hidden;
+            align-items: center;
+        }
+        .slides img {
+            width: 100%;
+            display: none;
+            cursor: pointer;
+        }
+        .slides img.active {
+            display: block;
+        }
+        .buttons {
+            display: flex;
+            justify-content: space-between;
+            position: absolute;
+            width: 100%;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+        .button {
+            background-color: rgba(0, 0, 0, 0.5);
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .button:hover {
+            background-color: rgba(0, 0, 0, 0.8);
+        }
+        @media (hover: none) {
+            .buttons {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="slider">
+        <div class="slides">
+            <!-- Image placeholders -->
+            {{ images }}
+        </div>
+        <div class="buttons">
+            <button id="prev" class="button">Previous</button>
+            <button id="next" class="button">Next</button>
+        </div>
+    </div>
+    <script>
+        let currentSlide = 0;
+        const slides = document.querySelectorAll('.slider-image');
+        slides[currentSlide].classList.add('active');
+
+        function showSlide(index) {
+            slides[currentSlide].classList.remove('active');
+            currentSlide = (index + slides.length) % slides.length;
+            slides[currentSlide].classList.add('active');
+        }
+
+        // Buttons for desktop mode
+        document.getElementById('prev').addEventListener('click', () => showSlide(currentSlide - 1));
+        document.getElementById('next').addEventListener('click', () => showSlide(currentSlide + 1));
+
+        // Swipe gesture support
+        let startX = 0;
+        let endX = 0;
+
+        const slider = document.querySelector('.slider');
+        slider.addEventListener('touchstart', (event) => {
+            startX = event.touches[0].clientX;
+        });
+
+        slider.addEventListener('touchend', (event) => {
+            endX = event.changedTouches[0].clientX;
+            if (endX < startX) {
+                showSlide(currentSlide + 1); // Swipe left
+            } else if (endX > startX) {
+                showSlide(currentSlide - 1); // Swipe right
+            }
+        });
+
+        // Full-screen toggle
+        function toggleFullScreen(image) {
+            if (!document.fullscreenElement) {
+                image.requestFullscreen().catch(err => {
+                    alert(`Error attempting to enable full-screen mode: ${err.message} (${err.name})`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    # Get all image files sorted by filename
+    image_files = sorted(
+        [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))]
+    )
+    # Generate HTML for image tags
+    images_html = "".join(
+        f'<img src="/images/{image}" class="slider-image" onclick="toggleFullScreen(this)">' for image in image_files
+    )
+    # Inject images into the HTML template
+    return Response(HTML_TEMPLATE.replace("{{ images }}", images_html), mimetype='text/html')
+
+@app.route('/images/<filename>')
+def serve_image(filename):
+    return send_from_directory(IMAGE_DIR, filename)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000)

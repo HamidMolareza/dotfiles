@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Get the remote URL
+remote_url=$(git config --get remote.origin.url)
+
+# Extract the owner and repo name from the URL
+if [[ $remote_url =~ ([^/:]+)\/([^/]+)(\.git)?$ ]]; then
+  owner="${BASH_REMATCH[1]}"
+  repo="${BASH_REMATCH[2]%.git}"
+else
+  echo "Failed to extract owner and repo name."
+  exit 1
+fi
+
+# Fetch all workflow run IDs with 'failure' conclusion
+failed_run_ids=$(gh run list --status failure --json databaseId --repo "$owner"/"$repo" --limit 100 | jq '.[].databaseId')
+
+if [ -z "$failed_run_ids" ]; then
+  echo "No failed workflow runs found."
+  exit 0
+fi
+
+# Delete each failed run by ID
+for run_id in $failed_run_ids; do
+  yes | gh run delete "$run_id" --repo "$owner"/"$repo"
+done
+
+echo "All failed workflow runs deleted."

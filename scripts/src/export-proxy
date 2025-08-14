@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# Set the default port
+port=${1:-9910}
+
+# Create the proxy configuration text
+proxy_text="export https_proxy=\"http://localhost:$port\"\nexport http_proxy=\"http://localhost:$port\""
+
+# Copy the text to the clipboard
+echo -e "$proxy_text" | xclip -selection clipboard
+
+echo "Proxy settings have been copied to the clipboard for port $port."

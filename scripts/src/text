@@ -1,0 +1,9 @@
+#!/bin/bash
+
+input="$1"
+if [ ! -f "$input" ]; then
+   echo "Error! You must enter a valid file path."
+   exit 1
+fi
+
+gnome-text-editor --new-window "$input"

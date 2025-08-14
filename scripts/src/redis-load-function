@@ -1,0 +1,13 @@
+#!/bin/bash
+
+file="$1"
+if [ -z "$file" ]; then
+    read -rp "File path: " file
+fi
+
+if [ ! -f "$file" ]; then
+    echo "File not found: $file"
+    exit 1
+fi
+
+cat "$file" | redis-cli -x function load replace

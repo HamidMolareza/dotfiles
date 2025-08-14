@@ -1,0 +1,146 @@
+#!/bin/bash
+
+# Default backup directory
+BACKUP_DIR=""
+SCRIPTS_DIR="/home/home/my-files/mitmproxy"
+SYSTEMD_FILE="/etc/systemd/system/mitmproxy.service"
+MITMPROXY_CONFIG_DIR="$HOME/.mitmproxy"
+
+# Function to show help
+show_help() {
+    echo "Usage: $(basename "$0") [OPTIONS] {backup|restore}"
+    echo
+    echo "Options:"
+    echo "  --backup-dir <path>  Specify a custom backup directory"
+    echo "  --help               Show this help message and exit"
+    echo
+    echo "Commands:"
+    echo "  backup               Backup mitmproxy configuration, scripts, and service"
+    echo "  restore              Restore mitmproxy configuration, scripts, and service"
+}
+
+# Function to parse arguments
+parse_args() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --backup-dir)
+                BACKUP_DIR="$2"
+                shift 2
+                ;;
+            --help)
+                show_help
+                exit 0
+                ;;
+            backup|restore)
+                COMMAND="$1"
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$COMMAND" ]]; then
+        echo "Error: No command provided."
+        show_help
+        exit 1
+    fi
+}
+
+# Function to back up mitmproxy setup
+backup_mitmproxy() {
+    local DATE=$(date +%Y%m%d_%H%M%S)
+
+    # Ensure backup directory exists
+    mkdir -p "$BACKUP_DIR"
+
+    # Backup scripts
+    echo "Backing up mitmproxy scripts..."
+    tar -czvf "$BACKUP_DIR/mitmproxy-scripts-backup_$DATE.tar.gz" "$SCRIPTS_DIR" 2>/dev/null
+
+    # Backup systemd service
+    if [[ -f "$SYSTEMD_FILE" ]]; then
+        echo "Backing up mitmproxy systemd service..."
+        cp "$SYSTEMD_FILE" "$BACKUP_DIR/mitmproxy-service-backup_$DATE"
+    else
+        echo "No systemd service file found at $SYSTEMD_FILE"
+    fi
+
+    # Backup mitmproxy configuration
+    if [[ -d "$MITMPROXY_CONFIG_DIR" ]]; then
+        echo "Backing up mitmproxy configuration..."
+        tar -czvf "$BACKUP_DIR/mitmproxy-config-backup_$DATE.tar.gz" "$MITMPROXY_CONFIG_DIR" 2>/dev/null
+    else
+        echo "No mitmproxy configuration directory found at $MITMPROXY_CONFIG_DIR"
+    fi
+
+    echo "Use 'backup-mitmproxy' script to restore this backup." >> "$BACKUP_DIR/how-to-restore.txt"
+
+    # Display backup summary
+    echo "Backup complete! Files saved to $BACKUP_DIR"
+    ls -lh "$BACKUP_DIR"
+}
+
+# Function to restore mitmproxy setup
+restore_mitmproxy() {
+    # Install mitmproxy
+    sudo apt install mitmproxy
+
+    # Ensure backup directory exists
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        echo "Error: Backup directory $BACKUP_DIR does not exist."
+        exit 1
+    fi
+
+    # Restore scripts
+    local LATEST_SCRIPTS_ARCHIVE=$(ls "$BACKUP_DIR"/mitmproxy-scripts-backup_*.tar.gz 2>/dev/null | tail -n 1)
+    if [[ -f "$LATEST_SCRIPTS_ARCHIVE" ]]; then
+        echo "Restoring mitmproxy scripts..."
+        mkdir -p "$SCRIPTS_DIR"
+        tar -xzvf "$LATEST_SCRIPTS_ARCHIVE" -C /
+    else
+        echo "No scripts archive found in $BACKUP_DIR."
+    fi
+
+    # Restore systemd service
+    local LATEST_SYSTEMD_FILE=$(ls "$BACKUP_DIR"/mitmproxy-service-backup_* 2>/dev/null | tail -n 1)
+    if [[ -f "$LATEST_SYSTEMD_FILE" ]]; then
+        echo "Restoring mitmproxy systemd service..."
+        sudo cp "$LATEST_SYSTEMD_FILE" "$SYSTEMD_FILE"
+        sudo systemctl daemon-reload
+        sudo systemctl enable mitmproxy.service
+    else
+        echo "No systemd service backup found in $BACKUP_DIR."
+    fi
+
+    # Restore mitmproxy configuration
+    local LATEST_CONFIG_ARCHIVE=$(ls "$BACKUP_DIR"/mitmproxy-config-backup_*.tar.gz 2>/dev/null | tail -n 1)
+    if [[ -f "$LATEST_CONFIG_ARCHIVE" ]]; then
+        echo "Restoring mitmproxy configuration..."
+        tar -xzvf "$LATEST_CONFIG_ARCHIVE" -C ~/
+    else
+        echo "No mitmproxy configuration archive found in $BACKUP_DIR."
+    fi
+
+    # Restart mitmproxy service
+    echo "Restarting mitmproxy service..."
+    sudo systemctl restart mitmproxy.service
+
+    echo "Restore complete!"
+}
+
+# Main Script Logic
+parse_args "$@"
+
+if [[ "$COMMAND" == "backup" ]]; then
+    backup_mitmproxy
+elif [[ "$COMMAND" == "restore" ]]; then
+    restore_mitmproxy
+else
+    echo "Unknown command: $COMMAND"
+    show_help
+    exit 1
+fi

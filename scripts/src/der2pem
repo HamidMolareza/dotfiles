@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Source common shell functions
+if [ -f $LIBS_DIR/common_functions.sh ]; then
+    . $LIBS_DIR/common_functions.sh
+else
+    echo "Error: common_functions.sh not found in '$LIBS_DIR'" >&2
+    exit 1
+fi
+
+if ! command-exists openssl; then
+    echo_error "openssl is not installed. Please install it before running this script."
+    exit 1
+fi
+
+der_file="$1"
+if [ -z "$der_file" ]; then
+    read -rp "DER file path: " der_file
+fi
+if [ ! -f "$der_file" ]; then
+    echo_error "The der file ($der_file) is not exist."
+    exit 1
+fi
+
+base_dir=$(dirname "$der_file")
+output="$base_dir/cacert.pem"
+
+openssl x509 -inform DER -in $der_file -out "$output"
+hash=$(openssl x509 -inform PEM -subject_hash_old -in "$output" | head -1)
+mv "$output" "$base_dir/$hash.0"

@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Restart Bluetooth service
+sudo systemctl restart bluetooth
+
+# Reset Bluetooth adapter
+sudo rfkill block bluetooth
+sudo rfkill unblock bluetooth
+
+# Check Bluetooth status
+sudo systemctl status bluetooth
+
+# Reload Bluetooth module
+sudo modprobe -r btusb && sudo modprobe btusb
+
+# Check for errors
+dmesg | grep -i bluetooth
+
+# Update system packages
+sudo apt update
+sudo apt upgrade -y
+
+# Run Bluetooth troubleshooting tool
+ubuntu-bug bluetooth

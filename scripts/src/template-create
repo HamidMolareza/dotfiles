@@ -1,0 +1,60 @@
+#!/bin/python3
+
+import os
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+home_path = Path.home()  # Fetches the $HOME path
+SRC_DIRECTORIES = f"{home_path}/Templates"
+
+def list_files(directory):
+    """Lists files in the specified directory."""
+    try:
+        files = os.listdir(directory)
+        files = [f for f in files if os.path.isfile(os.path.join(directory, f))]
+        return files
+    except Exception as e:
+        print(f"Error reading directory: {e}")
+        return []
+
+def select_file(files):
+    """Allows the user to select a file from the list."""
+    for idx, file in enumerate(files):
+        print(f"{idx + 1}. {file}")
+    
+    while True:
+        try:
+            choice = int(input("Select a file by number: ")) - 1
+            if 0 <= choice < len(files):
+                return files[choice]
+            else:
+                print("Invalid selection. Please try again.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+def copy_file_with_timestamp(src_directory, file_name):
+    """Copies the selected file to the current directory with a timestamp."""
+    try:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base, ext = os.path.splitext(file_name)
+        new_file_name = f"{base}_{timestamp}{ext}"
+        src_path = os.path.join(src_directory, file_name)
+        dest_path = os.path.join(os.getcwd(), new_file_name)
+        shutil.copy2(src_path, dest_path)
+        print(f"File copied to: {dest_path}")
+    except Exception as e:
+        print(f"Error copying file: {e}")
+
+def main():
+    files = list_files(SRC_DIRECTORIES)
+    
+    if not files:
+        print("No files found in the specified directory.")
+        return
+    
+    selected_file = select_file(files)
+    copy_file_with_timestamp(SRC_DIRECTORIES, selected_file)
+
+if __name__ == "__main__":
+    main()

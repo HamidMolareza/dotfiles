@@ -1,0 +1,12 @@
+#!/bin/bash
+
+file="$1"
+
+if [[ -f "$file" ]]; then
+    inotifywait -m "$file" -e modify |
+    while read -r; do
+        print-message "File '$file' has been modified." "yellow"
+    done
+else
+    print-message "File '$file' does not exist." "red"
+fi

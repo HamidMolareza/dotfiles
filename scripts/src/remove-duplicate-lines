@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Check if a file path is provided
+if [ -z "$1" ]; then
+  echo "Usage: $(basename "$0") <file-path>"
+  exit 1
+fi
+
+# File containing the list of files
+file_path="$1"
+
+# Check if the file exists
+if [ ! -f "$file_path" ]; then
+  echo "Error: File '$file_path' not found!"
+  exit 1
+fi
+
+# Remove duplicate lines from the file and overwrite it
+sort -u "$file_path" -o "$file_path"
+
+echo "Duplicates removed and file '$file_path' has been updated."

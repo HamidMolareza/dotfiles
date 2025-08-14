@@ -1,0 +1,51 @@
+#!/bin/bash
+
+if ! command-exists whois; then
+    echo "Error: whois is not installed. Please install it before running this script."
+    exit 1
+fi
+if ! command-exists curl; then
+    echo "Error: curl is not installed. Please install it before running this script."
+    exit 1
+fi
+
+# Function to check domain availability
+check_domain_availability() {
+    local domain="$1"
+    printf "%s: " "$domain"
+
+    result=$(whois "$domain" | grep -iE "No match for domain|no entries found")
+    if [ -n "$result" ]; then
+        echo "It's FREE!"
+    else
+        # Send a GET request to the domain and store the response
+        response=$(curl -I -sf "http://$domain" || curl -I -sf "https://$domain")
+        # Check if the response contains the HTTP/HTTPS header (indicating a website is assigned)
+        if echo "$response" | grep -qi "HTTP/1\|HTTP/2\|HTTPS"; then
+            echo "It's TAKEN and assigned to a website."
+        else
+            echo "It's TAKEN but NOT assigned to a website."
+        fi
+
+        dig +short NS "$domain"
+    fi
+}
+
+# Extract the script name without the path
+script_name=$(basename "$0")
+
+# Check domain availability
+if [ $# -eq 0 ]; then
+    echo "Usage: $script_name <domain>"
+    exit 1
+fi
+
+domain="$1"
+
+# Loop through the suffix arguments and echo the result
+for suffix in "${@:2}"; do
+    # Check if the suffix starts with a dot and add it if not
+    [[ $suffix == .* ]] || suffix=".$suffix"
+    check_domain_availability "$domain$suffix"
+    echo ""
+done

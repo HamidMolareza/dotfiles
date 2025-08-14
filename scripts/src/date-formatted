@@ -1,0 +1,9 @@
+#!/bin/bash
+
+type="$1"
+
+if [ "$type" == "h" ] || [ "$type" == "H" ]; then
+    date "+%Y-%m-%d %H-%M-%S"
+else
+    date "+%Y%m%d%H%M%S"
+fi

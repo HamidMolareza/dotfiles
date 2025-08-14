@@ -1,0 +1,22 @@
+#!/bin/bash
+
+if [[ -z "$1" ]]; then
+    echo "Please provide a (file or folder) path as an argument."
+
+    program_name=$(basename "$0")
+    echo "Usage: $program_name file_or_folder_path"
+
+    exit 1
+fi
+
+if [[ -z "$2" ]]; then
+    filename=$(basename "$1")
+else
+    filename=$2
+fi
+
+file_path="$HOME/Desktop/$filename"
+
+ln -sr "$1" "$file_path"
+
+echo "Shortcut created for $1 at $file_path"

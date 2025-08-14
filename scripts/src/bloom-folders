@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# Bloom's taxonomy levels and sample questions
+declare -A BLOOM_LEVELS
+# BLOOM_LEVELS["0-Remember"]="
+# # Remember
+# Questions to recall basic facts and concepts:
+# - What is...?
+# - When did... happen?
+# - Who is...?
+# - Where is...?
+# - Which one...?
+# - How would you describe...?
+# "
+
+BLOOM_LEVELS["1-Understand"]="- Do you know what it is?
+- Can you explain it in your own words?
+- What are its concepts and uses?
+"
+
+BLOOM_LEVELS["2-Apply"]="- Can you use it?
+- How would you solve...?
+- What approach would you use to...?
+- How would you demonstrate...?
+"
+
+BLOOM_LEVELS["3-Analyze"]="- Do you know how it works?
+- What are the parts of...?
+- How is... related to...?
+- What assumptions are made...?
+- What evidence can you find...?
+- How would you compare and contrast...?
+"
+
+BLOOM_LEVELS["4-Evaluate"]="- What are its strengths and weaknesses?
+- Do you agree with... and why?
+- Has better way?
+- Is it optimize?
+"
+
+BLOOM_LEVELS["5-Create"]="- Do you have a better solution?
+- Can you design a...?
+- How would you improve...?
+- What alternative would you suggest...?
+"
+
+# Create folders and README.txt files
+for LEVEL in "${!BLOOM_LEVELS[@]}"; do
+    mkdir -p "$LEVEL"
+    echo "${BLOOM_LEVELS[$LEVEL]}" > "$LEVEL/README.txt"
+done
+
+echo "✅ Bloom's taxonomy folders and README.txt files have been created."

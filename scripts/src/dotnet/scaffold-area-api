@@ -1,0 +1,36 @@
+#!/bin/bash
+
+add_folder(){
+    base_path="$1"
+    base_path=${base_path%/}  # Remove any trailing slashes (if present)
+    folder_name="$2"
+
+    mkdir -p "$base_path/$folder_name"
+
+    folder_path="$base_path/$folder_name"
+    if [ ! -f "$folder_path" ]; then
+        echo "Put your $folder_name in this folder." >> "$folder_path/remove-me.txt"
+    fi
+}
+
+area_name="$1"
+if [ -z "$area_name" ]; then
+    printf "Area Name: "
+    read -r area_name
+fi
+area_name=${area_name%/}  # Remove any trailing slashes (if present)
+
+if [ -d "$area_name" ]; then
+    printf "The directory '%s' is exists. Do you want to continue operation?(Y/n) " "$area_name"
+    read -r continue
+    if [ "$continue" == 'n' ] || [ "$continue" == 'N' ]; then
+        exit 0
+    fi
+fi
+
+mkdir -p "$area_name"
+
+add_folder "$area_name" "Controllers"
+add_folder "$area_name" "Models"
+add_folder "$area_name" "ViewModels"
+add_folder "$area_name" "Services"

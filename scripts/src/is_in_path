@@ -1,0 +1,10 @@
+#!/bin/bash
+
+path_to_check="$1"
+
+# Check if the path is already in $PATH
+if [[ ":$PATH:" != *":$path_to_check:"* ]]; then
+  return 1 # Is not exists
+else
+  return 0 # Already exists
+fi

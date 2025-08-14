@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Source common shell functions
+if [ -f $LIBS_DIR/common_functions.sh ]; then
+    . $LIBS_DIR/common_functions.sh
+else
+    echo "Error: common_functions.sh not found in '$LIBS_DIR'" >&2
+    exit 1
+fi
+
+if [ $# -eq 0 ]; then
+    echo_error "Usage: $(basename "$0") <pattern>"
+    exit 1
+fi
+
+pattern="$1"
+gitignore_file=".gitignore"
+
+# Add the pattern to .gitignore if not already present
+append_line_to_file "$gitignore_file" "$pattern"
+echo_info "The '$pattern' added to $gitignore_file"
+
+# Check if the file is currently tracked by Git
+if git ls-files --error-unmatch "$pattern" >/dev/null 2>&1; then
+    # Use git rm --cached to remove the file from the index
+    git rm --cached "$pattern"
+    echo_success "File $pattern removed from the index."
+fi

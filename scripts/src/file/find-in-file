@@ -1,0 +1,10 @@
+#!/bin/bash
+
+string="$1"
+file="$2"
+
+if grep -n "$string" "$file"; then
+    print-message "String '$string' found in '$file'." "green"
+else
+    print-message "String '$string' not found in '$file'." "red"
+fi

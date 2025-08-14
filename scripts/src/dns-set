@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# set-dns.sh
+# Usage: sudo ./set-dns.sh "1.1.1.1 8.8.8.8"
+
+set -e
+
+NEW_DNS="$1"
+
+if [ -z "$NEW_DNS" ]; then
+    echo "Usage: $0 \"DNS1 DNS2 ...\""
+    exit 1
+fi
+
+echo "[INFO] Setting new DNS servers: $NEW_DNS"
+
+# Function to restart DNS services
+restart_dns_services() {
+    if systemctl is-active --quiet systemd-resolved; then
+        echo "[INFO] Restarting systemd-resolved..."
+        systemctl restart systemd-resolved
+    fi
+}
+
+# Detect if systemd-resolved is in use
+if resolvectl status &>/dev/null; then
+    echo "[INFO] Detected systemd-resolved"
+    sudo mkdir -p /etc/systemd
+    echo "[Resolve]" | sudo tee /etc/systemd/resolved.conf >/dev/null
+    echo "DNS=$NEW_DNS" | sudo tee -a /etc/systemd/resolved.conf >/dev/null
+    echo "FallbackDNS=" | sudo tee -a /etc/systemd/resolved.conf >/dev/null
+    restart_dns_services
+    exit 0
+fi
+
+# Detect if Netplan is used
+if [ -d /etc/netplan ]; then
+    NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -n 1)
+    if [ -n "$NETPLAN_FILE" ]; then
+        echo "[INFO] Detected Netplan: $NETPLAN_FILE"
+        sudo sed -i "/nameservers:/,/addresses:/d" "$NETPLAN_FILE"
+        sudo bash -c "cat >> '$NETPLAN_FILE' <<EOL
+    nameservers:
+      addresses: [${NEW_DNS// /, }]
+EOL"
+        sudo netplan apply
+        exit 0
+    fi
+fi
+
+# Detect if NetworkManager is used
+if command -v nmcli &>/dev/null; then
+    ACTIVE_CON=$(nmcli -t -f NAME,DEVICE connection show --active | grep ':' | cut -d: -f1 | head -n 1)
+    if [ -n "$ACTIVE_CON" ]; then
+        echo "[INFO] Detected NetworkManager connection: $ACTIVE_CON"
+        nmcli con mod "$ACTIVE_CON" ipv4.dns "$NEW_DNS"
+        nmcli con up "$ACTIVE_CON"
+        exit 0
+    fi
+fi
+
+# Fallback: Modify /etc/resolv.conf directly
+echo "[WARN] No DNS manager detected. Modifying /etc/resolv.conf directly."
+{
+    for dns in $NEW_DNS; do
+        echo "nameserver $dns"
+    done
+} | sudo tee /etc/resolv.conf >/dev/null
+
+echo "[INFO] DNS updated successfully!"

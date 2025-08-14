@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Source common shell functions
+if [ -f $LIBS_DIR/common_functions.sh ]; then
+    . $LIBS_DIR/common_functions.sh
+else
+    echo "Error: common_functions.sh not found in '$LIBS_DIR'" >&2
+    exit 1
+fi
+
+if ! command-exists ffmpeg; then
+    echo_error "ffmpeg is not installed. Please install it before running this script."
+    exit 1
+fi
+
+# Check if input file is provided
+if [ -z "$1" ]; then
+    echo_error "Usage: $(basename $0) <input_video>"
+    exit 1
+fi
+
+input_video="$1"
+output_video="${input_video%.*}.mp4"
+
+# Convert the video to MP4
+ffmpeg -i "$input_video" -c:v h264 -c:a aac -strict experimental "$output_video"
+
+echo_info "Conversion complete. Output: $output_video"

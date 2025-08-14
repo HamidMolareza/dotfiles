@@ -1,0 +1,94 @@
+#!/bin/python3
+
+import os
+import random
+import time
+
+
+def stepper():
+    number = random.randint(-1000, 1000)
+
+    adder = 0
+    while adder == 0:
+        adder = random.randint(-9, 9)
+
+    if adder > 0:
+        print(f"We want to add {adder} units to {number} each time.")
+    else:
+        print(f"We want to subtract {adder} units from {number} each time.")
+
+    while True:
+        print(number, end="")
+        input()
+        number += adder
+
+
+def add_or_subtract():
+    while True:
+        number1 = random.randint(-100, 100)
+        number2 = random.randint(-100, 100)
+        
+        user_input = input(f"{number1} {'-' if number2 < 0 else '+'} {abs(number2)}: ")
+        correct_answer = number1 + number2
+
+        if user_input == '' or int(user_input) != correct_answer:
+            print(f"Wrong! {correct_answer}")
+
+
+def sum_of_digits():
+    while True:
+        number = random.randint(1, 1000000000)
+
+        summation = sum(int(digit) for digit in str(number))
+        user_input = input(f"summation of digits {number}: ")
+
+        if summation == int(user_input):
+            print("Correct.")
+        else:
+            print(f"Wrong! {summation}")
+
+
+def multiplication():
+    while True:
+        number1 = random.randint(-100, 100)
+        number2 = random.randint(-10, 10)
+
+        user_input = input(f"{number1} * {number2}: ")
+        correct_answer = number1 * number2
+
+        if int(user_input) == correct_answer:
+            print("Correct.")
+        else:
+            print(f"Wrong! {correct_answer}")
+
+
+def memory():
+    while True:
+        number = random.randint(1000000, 10000000)
+        print(f"Remember this number: {number}")
+
+        time.sleep(len(str(number)))
+        os.system('cls')
+        os.system('clear')
+
+        user_input = input("Number: ")
+        if int(user_input) == number:
+            print("Correct.")
+        else:
+            print(f"Wrong! {number}")
+        time.sleep(1)
+        
+
+
+def main():
+    games = [stepper, sum_of_digits, add_or_subtract, multiplication, memory]
+    game_index = random.randint(0, len(games) - 1)
+    games[game_index]()
+
+
+try:
+    main()
+except KeyboardInterrupt:
+    pass
+finally:
+    print()

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import subprocess
+
+FILE_NAME = os.path.expanduser('~/.secure-exports')
+EXPORT_PATTERN = re.compile(r'export (\w+)="(.*)"')
+
+def read_exports():
+    exports = {}
+    if os.path.exists(FILE_NAME):
+        with open(FILE_NAME, 'r') as file:
+            for line in file:
+                match = EXPORT_PATTERN.match(line.strip())
+                if match:
+                    key, value = match.groups()
+                    exports[key] = value
+    return exports
+
+def write_exports(data):
+    with open(FILE_NAME, 'w') as file:
+        for key, value in data.items():
+            file.write(f'export {key}="{value}"\n')
+    reload_exports()
+
+def list_exports():
+    data = read_exports()
+    for key, value in data.items():
+        print(f'export {key}="{value}"')
+
+def add_export(key, value):
+    data = read_exports()
+    data[key] = value
+    write_exports(data)
+    print(f'Added export {key}="{value}"')
+
+def delete_export(key):
+    data = read_exports()
+    if key in data:
+        del data[key]
+        write_exports(data)
+        print(f'Deleted export {key}')
+    else:
+        print(f'Key {key} not found')
+
+def get_export(key):
+    data = read_exports()
+    if key in data:
+        print(f'export {key}="{data[key]}"')
+    else:
+        print(f'Key {key} not found')
+        
+def reload_exports():
+    shell = os.getenv('SHELL')
+    if 'zsh' in shell:
+        command = f'source {os.path.expanduser('~/.zshrc')}'
+    elif 'bash' in shell:
+        command = f'source {os.path.expanduser('~/.bashrc')}'
+    else:
+        print(f'Unsupported shell: {shell}')
+        return
+    print(f'Reloading exports...')
+    subprocess.run([shell, '-c', command], check=True)
+
+def main():
+    parser = argparse.ArgumentParser(description='Manage secure exports')
+    subparsers = parser.add_subparsers(dest='command')
+
+    subparsers.add_parser('list', help='List all exports')
+    subparsers.add_parser('reload', help='Reload shell file')
+
+    add_parser = subparsers.add_parser('add', help='Add a new export')
+    add_parser.add_argument('key', type=str, help='The key to add')
+    add_parser.add_argument('value', type=str, help='The value for the key')
+
+    delete_parser = subparsers.add_parser('delete', help='Delete an export')
+    delete_parser.add_argument('key', type=str, help='The key to delete')
+
+    get_parser = subparsers.add_parser('get', help='Get the value of an export')
+    get_parser.add_argument('key', type=str, help='The key to get')
+
+    args = parser.parse_args()
+
+    if args.command == 'list':
+        list_exports()
+    elif args.command == 'add':
+        add_export(args.key, args.value)
+    elif args.command == 'delete':
+        delete_export(args.key)
+    elif args.command == 'get':
+        get_export(args.key)
+    elif args.command == 'reload':
+        reload_exports()
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()

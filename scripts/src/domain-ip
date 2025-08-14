@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Check if domain argument is provided
+if [ -z "$1" ]; then
+    echo "Usage: $(basename "$0") <domain>"
+    exit 1
+fi
+
+# Get IP address of the domain
+ip=$(dig +short "$1" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+
+# Check if IP address was found
+if [ -n "$ip" ]; then
+    echo "$ip"
+else
+    echo "No IP address found for $1."
+    exit 1
+fi

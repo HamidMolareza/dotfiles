@@ -1,0 +1,68 @@
+#!/bin/python3
+
+import subprocess
+import sys
+from moviepy.editor import VideoFileClip
+
+# Function to get video resolution, duration, and frame rate
+def get_video_info(input_video):
+    clip = VideoFileClip(input_video)
+    resolution = (clip.w, clip.h)  # width, height
+    duration = clip.duration        # in seconds
+    frame_rate = clip.fps           # frames per second
+    return resolution, duration, frame_rate
+
+# Function to calculate optimal bitrate based on resolution and duration
+def calculate_bitrate(resolution, duration):
+    width, height = resolution
+    # Simple heuristic to calculate bitrate: higher resolution = higher bitrate
+    base_bitrate = 500   # start with a base value
+    scale_factor = (width * height) / (640 * 360)  # scale based on resolution compared to 360p
+    bitrate = base_bitrate * scale_factor
+    # Adjust bitrate for video duration (longer videos get a slightly lower bitrate)
+    if duration > 600:  # More than 10 minutes
+        bitrate *= 0.75
+    return int(bitrate)
+
+# Function to calculate new resolution (lowering it for high-res videos)
+def calculate_resolution(resolution):
+    width, height = resolution
+    if width > 1920:  # if it's 1080p or more, reduce it to 720p
+        return (1280, 720)
+    elif width > 1280:  # if it's 720p, reduce it to 480p
+        return (854, 480)
+    else:  # if it's smaller than 720p, keep it as is
+        return resolution
+
+# Function to run ffmpeg compression with calculated bitrate and resolution
+def compress_video(input_video, output_video, bitrate, resolution):
+    width, height = resolution
+    cmd = [
+        'ffmpeg', '-i', input_video, 
+        '-c:v', 'libx265', '-b:v', f'{bitrate}k',
+        '-vf', f'scale={width}:{height}',
+        '-c:a', 'aac', '-b:a', '128k', 
+        output_video
+    ]
+    subprocess.run(cmd)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print(f"Usage: {sys.argv[0]} input_video output_video")
+        sys.exit(1)
+
+    input_video = sys.argv[1]
+    output_video = sys.argv[2]
+
+    # Get video information
+    resolution, duration, frame_rate = get_video_info(input_video)
+    print(f"Original Resolution: {resolution}, Duration: {duration}s, Frame Rate: {frame_rate}fps")
+
+    # Calculate optimal settings
+    bitrate = calculate_bitrate(resolution, duration)
+    new_resolution = calculate_resolution(resolution)
+    print(f"Calculated Bitrate: {bitrate}k, New Resolution: {new_resolution}")
+
+    # Compress the video using the calculated settings
+    compress_video(input_video, output_video, bitrate, new_resolution)
+    print(f"Video compressed and saved to: {output_video}")

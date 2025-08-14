@@ -1,0 +1,161 @@
+#!/bin/python3
+
+import sys
+import os
+from markdown import markdown
+
+# Define the CSS styles
+CSS_STYLES = """
+<style>
+    body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  margin: 2rem;
+  background-color: #1a1a1a;
+    }
+    h1, h2, h3, h4, h5, h6 {
+        color: #2c3e50;
+    }
+    a {
+        color: #3498db;
+        text-decoration: none;
+    }
+    a:hover {
+        text-decoration: underline;
+    }
+    code {
+        font-family: Consolas, "Courier New", monospace;
+        background-color: #f9f9f9;
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        padding: 2px 4px;
+    }
+    pre {
+        background-color: #f9f9f9;
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        padding: 10px;
+        overflow-x: auto;
+    }
+    
+    table {
+        border-spacing: 1;
+        border-collapse: collapse;
+        background: white;
+        border-radius: 10px;
+        overflow: hidden;
+        width: 100%;
+        margin: 0 auto;
+        position: relative;
+    }
+    table * {
+        position: relative;
+    }
+    table td, table th {
+        padding-left: 16px;
+        padding-right: 16px;
+    }
+    table thead tr {
+        height: 65px;
+        background: #36304a;
+        color: white;
+    }
+    table tbody tr {
+        height: 90px;
+    }
+    table tbody tr:last-child {
+        border: 0;
+    }
+    table td, table th {
+        text-align: left;
+    }
+    table td.l, table th.l {
+        text-align: right;
+    }
+    table td.c, table th.c {
+        text-align: center;
+    }
+    table td.r, table th.r {
+        text-align: center;
+    }
+    
+    .table th{
+        font-family: OpenSans-Regular;
+        font-size: 18px;
+        color: #fff;
+        line-height: 1.2;
+        font-weight: unset;
+    }
+
+    tbody tr:nth-child(even) {
+        background-color: #f5f5f5;
+    }
+
+    tbody tr {
+        font-family: OpenSans-Regular;
+        font-size: 15px;
+        color: #595959;
+        line-height: 1.2;
+        font-weight: unset;
+    }
+    
+    tbody tr:hover {
+        color: #282828;
+    }
+
+    
+</style>
+"""
+
+def convert_markdown_to_html(input_file, output_file=None):
+    # Ensure the input file exists
+    if not os.path.isfile(input_file):
+        print(f"Error: File '{input_file}' not found.")
+        return
+
+    # Set default output file name if not provided
+    if output_file is None:
+        output_file = os.path.splitext(input_file)[0] + ".html"
+
+    try:
+        # Read the markdown file
+        with open(input_file, "r", encoding="utf-8") as md_file:
+            markdown_content = md_file.read()
+
+        # Convert markdown to HTML
+        html_content = markdown(
+            markdown_content, extensions=["extra", "tables", "toc"]
+        )
+
+        # Embed the CSS styles into the HTML
+        full_html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{os.path.basename(input_file)}</title>
+    {CSS_STYLES}
+</head>
+<body>
+{html_content}
+</body>
+</html>
+"""
+
+        # Write the HTML content to the output file
+        with open(output_file, "w", encoding="utf-8") as html_file:
+            html_file.write(full_html)
+
+        print(f"HTML file generated with styling: {output_file}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python md_to_html_with_css.py <input_markdown_file> [output_html_file]")
+        sys.exit(1)
+
+    input_md = sys.argv[1]
+    output_html = sys.argv[2] if len(sys.argv) > 2 else None
+    convert_markdown_to_html(input_md, output_html)

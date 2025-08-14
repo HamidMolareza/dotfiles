@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Function to display usage information
+usage() {
+  print-message "Usage:\t$(basename "$0") \"command\" [max_retries] [delay_on_error]"
+  print-message "\tExample: $(basename "$0") \"echo hello\" 5 3"
+}
+
+# Check for at least one argument
+if [ -z "$1" ]; then
+  usage
+  exit 1
+fi
+
+# Assign parameters with defaults if not provided
+input_command="$1"
+max_retries="${2:-3}"
+delay_on_error="${3:-3}"
+
+# Validate that max_retries is a positive integer
+if ! [[ "$max_retries" =~ ^[0-9]+$ ]] || [ "$max_retries" -le 0 ]; then
+  print-message "Invalid value for max_retries. It must be a positive integer." red
+  exit 1
+fi
+
+# Validate that delay_on_error is a non-negative integer
+if ! [[ "$delay_on_error" =~ ^[0-9]+$ ]]; then
+  print-message "Invalid value for delay_on_error. It must be a non-negative integer." red
+  exit 1
+fi
+
+# Initialize a counter for retries
+retries=0
+
+# Loop until successful or max retries reached
+while true; do
+  # Execute the command
+  eval "$input_command"
+  exit_code=$?
+
+  if [ $exit_code -eq 0 ]; then
+    exit 0
+  else
+    retries=$((retries + 1))
+    print-message "Error encountered (exit code: $exit_code). Attempt $retries of $max_retries." red
+
+    # Check if we've reached the maximum number of retries
+    if [ "$retries" -ge "$max_retries" ]; then
+      print-message "Maximum retries reached. Exiting." red
+      exit $exit_code
+    fi
+
+    echo ""
+    print-message "Retrying in $delay_on_error seconds..." blue
+    sleep "$delay_on_error"
+  fi
+done

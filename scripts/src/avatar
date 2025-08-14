@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# Function to print usage instructions
+print_usage() {
+    echo "Usage: $0 [email]"
+    exit 1
+}
+
+# Check if email is passed as an argument or prompt user
+email="$1"
+if [ -z "$email" ]; then
+    if [ -t 0 ]; then
+        # Prompt the user for their email address in interactive mode
+        read -rp "Enter your email address: " email
+    else
+        print_usage
+    fi
+fi
+
+# Sanitize the email: trim spaces and convert to lowercase
+email=$(echo -n "$email" | tr -d ' ' | tr 'A-Z' 'a-z')
+
+# Generate an MD5 hash of the email address
+email_hash=$(echo -n "$email" | md5sum | awk '{print $1}')
+
+# Define the Gravatar URL with a default parameter to check for a custom image
+gravatar_url="https://www.gravatar.com/avatar/$email_hash?d=404"
+
+# Check if the Gravatar URL returns a custom image
+http_status=$(curl --silent --head --write-out "%{http_code}" --output /dev/null "$gravatar_url")
+
+# If the status code is 200, it's a custom Gravatar, otherwise it's the default
+if [ "$http_status" -eq 200 ]; then
+    echo "Custom Gravatar found: $gravatar_url"
+else
+    echo "No custom Gravatar found for this email."
+fi

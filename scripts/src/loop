@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Ensure at least 2 inputs are provided
+if [ "$#" -lt 2 ]; then
+  echo "Error: You must provide at least a command and one string."
+  echo "Usage: $(basename "$0") <command> <string1> [string2 ...]"
+  exit 1
+fi
+
+user_command="$1"
+shift
+
+string_list=("$@")
+
+# Iterate over the list and execute the command for each item
+for item in "${string_list[@]}"; do
+  # Execute the user command with the item as an argument
+  eval "$user_command '$item'"
+done

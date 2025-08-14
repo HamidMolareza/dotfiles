@@ -1,0 +1,17 @@
+#!/bin/bash
+
+input="$1"
+output="$2"
+
+if [ $# -ne 2 ]; then
+    echo "Error! Input and Output are required."
+    echo "You can use the 'lsblk' command to list your block devices and identify the DVD drive. It is usually named something like '/dev/sr0'."
+    echo "Example: iso /dev/sr0 output.iso"
+    exit 1
+fi
+
+if [[ ! $output == *.iso ]]; then
+    output="$output.iso"
+fi
+
+sudo dd if=/dev/sr0 of=/path/to/output.iso bs=2048

@@ -1,0 +1,20 @@
+#!/bin/bash
+
+usage() {
+    echo "Example Usage: echo 'Hello' | $(basename "$0")"
+    echo "Example Usage: $(basename "$0") 'Hello'"
+}
+
+# Check if there is input from the pipeline
+if [ -t 0 ]; then
+    input="$1"
+else
+    # Read input from standard input
+    input=$(cat)
+fi
+
+# Calculate the SHA-256 hash of the input
+hash=$(echo -n "$input" | openssl dgst -sha256)
+
+# Print the hash
+echo "$hash"

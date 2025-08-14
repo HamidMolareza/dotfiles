@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Check if instaloader is installed
+if ! command-exists instaloader; then
+    echo "Instaloader is not installed. Please install it using 'pip install instaloader'."
+    exit 1
+fi
+
+# Check if a profile username was provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <instagram_username>"
+    exit 1
+fi
+
+USERNAME=$1
+OUTPUT_DIR="instagram_profiles"
+
+# Create the output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
+
+# Download the profile with high quality using instaloader
+instaloader --dirname-pattern="${OUTPUT_DIR}/{profile}" --no-pictures --no-videos --no-captions --no-posts --no-profile-pic --no-compress-json --no-captions "$USERNAME"
+
+echo "Download complete! Files are saved in: ${OUTPUT_DIR}/${USERNAME}"

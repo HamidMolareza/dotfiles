@@ -1,0 +1,71 @@
+#!/bin/bash
+
+if ! command-exists curl; then
+    echo "Error: curl is not installed. Please install it before running this script."
+    exit 1
+fi
+if ! command-exists xclip; then
+    echo "Error: xclip is not installed. Please install it before running this script."
+    exit 1
+fi
+
+help() {
+    echo "Usage: $(basename "$0") <url> <title?>"
+}
+
+copy_to_clipboard() {
+    local content="$1"
+
+    local name="$2"
+    if [ -z "$name" ]; then
+        name="The content"
+    fi
+
+    clipboard "$content"
+    echo "$name copied to clipboard."
+}
+
+if [ -z "$1" ]; then
+    help
+    exit 1
+fi
+
+url="$1"
+title="${2:-$url}" # Use the provided title or default to the URL
+
+api_key="$YUN_API_KEY"
+
+if [ -z "$api_key" ]; then
+    echo "Error: API key not set. Set the YUN_API_KEY environment variable."
+    exit 1
+fi
+
+# Use associative array for headers
+declare -A headers=(
+    ["Content-Type"]="application/json"
+    ["X-API-Key"]="$api_key"
+)
+
+data="{\"title\": \"$title\", \"url\": \"$url\"}"
+
+# Use mapfile to capture the output of the curl command
+mapfile -t result < <(curl -X POST -d "$data" -H "Content-Type: ${headers[Content - Type]}" -H "X-API-Key: ${headers[X - API - Key]}" https://yun.ir/api/v1/urls)
+
+# Extracting values from the JSON response using jq
+id=$(jq -r '.doc.id' <<<"${result[@]}")
+short_url=$(jq -r '.doc.url' <<<"${result[@]}")
+stats_url=$(jq -r '.doc.statsUrl' <<<"${result[@]}")
+update_url=$(jq -r '.doc.updateUrl' <<<"${result[@]}")
+
+# Displaying the result
+echo "id: $id"
+echo "short_url: $short_url"
+echo "stats_url: $stats_url"
+echo "update_url: $update_url"
+
+if [ "$id" = "null" ]; then
+    echo "${result[@]}"
+else
+    # Copy short_url to the clipboard
+    copy_to_clipboard "$short_url" "Short URL"
+fi

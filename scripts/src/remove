@@ -1,0 +1,57 @@
+#!/bin/bash
+
+app_name=$(basename "$0")
+
+# Check if at least one argument is provided
+if [ $# -lt 1 ]; then
+    echo "No file or folder names provided. Usage: $app_name [-d depth] name1 [name2 ... nameN]"
+    exit 1
+fi
+
+# Initialize depth variable
+depth=""
+
+# Check if depth parameter is provided
+while getopts ":d:" opt; do
+    case $opt in
+        d)
+            depth="-maxdepth $OPTARG"
+            shift 2
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            exit 1
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Check if there are remaining arguments after processing options
+if [ $# -eq 0 ]; then
+    echo "No file or folder names provided. Usage: $app_name [-d depth] name1 [name2 ... nameN]"
+    exit 1
+fi
+
+# Display the list of files and folders to be deleted
+echo "The following files and folders will be deleted:"
+for name in "$@"; do
+    echo "- $name"
+done
+
+# Ask for user confirmation
+read -rp "Are you sure you want to delete these files and folders? (y/n): " confirm
+if [[ $confirm != [yY] ]]; then
+    echo "Deletion aborted."
+    exit 0
+fi
+
+# Iterate over each argument
+for name in "$@"; do
+    # Find and remove files and directories with the specified name
+    find . $depth -name "$name" -exec rm -rf {} +
+done
+
+echo "Specified files and folders have been removed."

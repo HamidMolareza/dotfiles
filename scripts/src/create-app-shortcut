@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Check if required arguments are provided
+if [ $# -lt 3 ]; then
+  echo "Usage: $(basename "$0") <app-name> <execute-command> <icon-path> <category1;category2;>"
+  echo "Example: $(basename "$0") google-translate \"xdg-open https://translate.google.com\" $HOME/.icons/google-translate.png Utility;Internet"
+  exit 1
+fi
+
+# Input variables
+APP_NAME="$1"
+APP_COMMAND="$2"
+ICON_PATH="$3"
+CATEGORIES="$4"
+
+if [ ! -f "$ICON_PATH" ]; then
+    echo "The icon path is not exists: $ICON_PATH"
+    exit 1
+fi
+
+# Ensure the .desktop entry directory exists
+DESKTOP_ENTRY_DIR="$HOME/.local/share/applications"
+mkdir -p "$DESKTOP_ENTRY_DIR"
+
+# Create the .desktop file path
+DESKTOP_FILE="$DESKTOP_ENTRY_DIR/$APP_NAME.desktop"
+if [ -f "$DESKTOP_FILE" ]; then
+    echo "A shortcut with this name is exist: $DESKTOP_FILE"
+    exit 1
+fi
+
+# Write the desktop entry content
+cat > "$DESKTOP_FILE" <<EOL
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Exec=$APP_COMMAND
+Icon=$ICON_PATH
+Terminal=false
+Type=Application
+Categories=$CATEGORIES;
+EOL
+
+# Make the desktop file executable
+chmod +x "$DESKTOP_FILE"
+
+# Add to favorites (pin to the dock)
+gsettings set org.gnome.shell favorite-apps \
+"$(gsettings get org.gnome.shell favorite-apps | sed -e 's/]$/, '"'${APP_NAME}.desktop'"']/')"
+
+echo "$APP_NAME shortcut created and added to favorites!"
+echo "The file path: $DESKTOP_FILE"

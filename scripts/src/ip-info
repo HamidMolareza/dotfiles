@@ -1,0 +1,23 @@
+#!/bin/bash
+
+if ! command-exists curl; then
+    echo "Error: curl is not installed. Please install it before running this script."
+    exit 1
+fi
+
+# If an IP address is provided as a command-line argument, use it; otherwise, read from the pipeline
+if [ $# -eq 1 ]; then
+    ip_address="$1"
+elif [ ! -t 0 ]; then
+    # Check if data is being piped in
+    read -r ip_address
+else
+    echo "Usage: $(basename "$0") <ip_address>"
+    exit 1
+fi
+
+# Make a request to ip-api.com with the specified IP address
+response=$(curl -s "http://ip-api.com/json/${ip_address}")
+
+# Pretty print the entire JSON response using jq
+echo "$response" | jq .

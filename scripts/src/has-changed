@@ -1,0 +1,50 @@
+#!/bin/bash
+
+usage() {
+    echo "Example Usage: echo 'Hello' | $(basename "$0") 'command-name'"
+}
+
+# Check if there is input from the pipeline
+if [ -t 0 ]; then
+    echo "Error: This script should be used as a pipeline."
+    usage
+    exit 1
+fi
+
+file_name="$1"
+if [ -z "$file_name" ]; then
+    echo "Error: Choose a name for this command. We use this name to check changes."
+    usage
+    exit 1
+fi
+
+dir_path="$HOME/.has-changed-files/"
+if [ ! -d "$dir_path" ]; then
+    mkdir -p "$dir_path"
+fi
+
+# Read input from standard input
+prev_input=$(cat)
+
+file_path="$dir_path/$file_name"
+
+# Check if the file exists
+if [ -f "$file_path" ]; then
+    # Read the content of the file into a variable
+    file_content=$(cat "$file_path")
+
+    # Compare the string with the file content
+    if [ "$prev_input" != "$file_content" ]; then
+        # Strings are different, so echo "true" and replace the file content
+        echo "true"
+        echo "$prev_input" >"$file_path"
+    else
+        # Strings are the same, so echo "false"
+        echo "false"
+    fi
+else
+    # File does not exist
+    echo "$prev_input" >"$file_path"
+    echo "This is the first time."
+    echo "We save the data for later. (file path: $file_path)"
+fi

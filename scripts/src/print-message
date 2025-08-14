@@ -1,0 +1,15 @@
+#!/bin/bash
+
+message="$1"
+color="$2"
+
+case $color in
+    "red") color_code="\e[31m" ;;
+    "green") color_code="\e[32m" ;;
+    "yellow") color_code="\e[33m" ;;
+    "blue") color_code="\e[34m" ;;
+    "reset") color_code="\e[0m" ;;
+    *) color_code="\e[0m" ;; # Default to no color
+esac
+
+echo -e "${color_code}${message}${color_code}"

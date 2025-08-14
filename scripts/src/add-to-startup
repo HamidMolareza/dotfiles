@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# Function to find the path of a command using `where`
+find_command_path() {
+    local command_name="$1"
+
+    # Check if the command_name is not empty
+    if [[ -z "$command_name" ]]; then
+        return 1
+    fi
+
+    # Use `where` to find the command path
+    local command_path
+    command_path=$(which "$command_name" 2>/dev/null)
+
+    # Check if `where` was successful
+    if [[ $? -ne 0 || -z "$command_path" ]]; then
+        return 1
+    fi
+
+    # Return the command path
+    echo "$command_path"
+    return 0
+}
+
+# Autostart directory
+AUTOSTART_DIR="$HOME/.config/autostart"
+
+# Prompt the user for the program name
+PROGRAM_NAME="$1"
+if [ -z "$PROGRAM_NAME" ]; then
+    read -rp "Enter the program name: " PROGRAM_NAME
+fi
+
+# Desktop entry file path
+DESKTOP_ENTRY="$AUTOSTART_DIR/$PROGRAM_NAME.desktop"
+# Create autostart directory if it doesn't exist
+mkdir -p "$AUTOSTART_DIR"
+
+if [ -f "$DESKTOP_ENTRY" ]; then
+    echo "Error! An app with this name ($DESKTOP_ENTRY) is exists."
+    cat "$DESKTOP_ENTRY"
+    exit 1
+fi
+
+# Prompt the user for the command to run the program
+COMMAND="$2"
+if [ -z "$COMMAND" ]; then
+    if find_command_path "$PROGRAM_NAME" >/dev/null; then
+        COMMAND=$(find_command_path "$PROGRAM_NAME")
+    else
+        read -rp "Enter the command to run the program: " COMMAND
+    fi
+fi
+
+# Show the final result to the user
+echo "Program Name: $PROGRAM_NAME"
+echo "Command: $COMMAND"
+
+# Confirm with the user before saving
+read -rp "Do you want to save this startup entry? (y/n): " CONFIRM
+echo ""
+
+if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+    # Create desktop entry file
+    cat <<EOL >"$DESKTOP_ENTRY"
+[Desktop Entry]
+Type=Application
+Exec=$COMMAND
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Name=$PROGRAM_NAME
+Icon=$PROGRAM_NAME
+Comment=Starts $PROGRAM_NAME at login
+EOL
+
+    echo "Program $PROGRAM_NAME has been added to the startup list."
+    echo "File path: $DESKTOP_ENTRY"
+else
+    echo "Operation cancelled. No changes were made."
+fi

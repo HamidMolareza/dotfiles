@@ -1,0 +1,30 @@
+#!/bin/bash
+
+SCRIPTS_DIR="$HOME/scripts"
+SRC_DIR="$SCRIPTS_DIR/src"
+export LIBS_DIR="$SCRIPTS_DIR/libs"
+
+add_to_path_if_missing() {
+    case ":$PATH:" in
+        *":$1:"*) ;; # already in PATH, do nothing
+        *) PATH="$PATH:$1" ;;
+    esac
+}
+
+# Script folders
+add_to_path_if_missing "$SRC_DIR"
+add_to_path_if_missing "$SRC_DIR/file"
+add_to_path_if_missing "$SRC_DIR/dotnet"
+add_to_path_if_missing "$SRC_DIR/bale"
+add_to_path_if_missing "$SRC_DIR/docker"
+add_to_path_if_missing "$SRC_DIR/git"
+add_to_path_if_missing "$SRC_DIR/media"
+add_to_path_if_missing "$SRC_DIR/proxy"
+add_to_path_if_missing "$SRC_DIR/s3"
+add_to_path_if_missing "$SRC_DIR/tor"
+add_to_path_if_missing "$SRC_DIR/translate"
+add_to_path_if_missing "$SRC_DIR/gh"
+add_to_path_if_missing "$SRC_DIR/backups"
+add_to_path_if_missing "$SRC_DIR/ssh"
+
+export PATH

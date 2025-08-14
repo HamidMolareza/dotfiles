@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# List all running workflows and cancel them
+gh run list --status in_progress --json databaseId -q '.[].databaseId' | while read -r run_id; do
+    echo "Canceling run with ID: $run_id"
+    gh run cancel "$run_id"
+done

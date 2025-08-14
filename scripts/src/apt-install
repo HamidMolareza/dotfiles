@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# Function to display usage instructions
+usage() {
+    echo "Usage: $0 path_to_deb_file or package_name"
+    exit 1
+}
+
+# Check if the file path is provided
+if [ -z "$1" ]; then
+    echo "Error: No file path provided."
+    usage
+fi
+
+input="$1"
+
+echo "Installing $input..."
+if [ -f "$input" ]; then
+    sudo dpkg -i "$input"
+    sudo apt-get install -f
+else
+    sudo apt install "$input"
+fi
+
+
+# Check if the installation was successful
+if [ $? -eq 0 ]; then
+    echo "Installation successful."
+else
+    echo "Installation failed."
+fi

@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Dotnet Add Package - Database
+
+if ! command-exists dotnet; then
+    echo "Error: dotnet is not installed. Please install it before running this script."
+    exit 1
+fi
+
+# List of ASP packages you want to add
+packages=(
+    Microsoft.EntityFrameworkCore
+    Microsoft.EntityFrameworkCore.SqlServer
+    Microsoft.EntityFrameworkCore.Design
+)
+
+# Loop through the packages and add them using `dotnet add package`
+for package in "${packages[@]}"
+do
+    dotnet add package "$package"
+done
+
+echo "ASP packages added successfully."

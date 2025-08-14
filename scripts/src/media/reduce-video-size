@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# Check if the correct number of arguments is provided
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    echo "Usage: $(basename "$0") <input_file> <compression_level (h/m/l)> [output_file]"
+    exit 1
+fi
+
+input_file="$1"
+compression_level="$2"
+output_file="$3"
+
+# Get the current date in YYYY-MM-DD format
+current_date=$(date +%F)
+
+# Extract the filename without the extension and the file extension
+filename=$(basename "$input_file")
+extension="${filename##*.}"
+basename="${filename%.*}"
+
+# If the output_file is not provided, use the default format
+if [ -z "$output_file" ]; then
+    output_file="${basename}_smaller_${current_date}.${extension}"
+fi
+
+# Set ffmpeg compression options based on the compression level
+case "$compression_level" in
+    h)  # High compression (smaller size, lower quality, reduces resolution significantly)
+        ffmpeg_options="-vcodec libx264 -crf 36 -preset veryslow -vf scale='floor(iw/2)*2:floor(ih/2)*2'"
+        ;;
+    m)  # Medium compression (balance between size and quality, slight resolution reduction)
+        ffmpeg_options="-vcodec libx264 -crf 28 -preset medium -vf scale='floor(iw*0.75/2)*2:floor(ih*0.75/2)*2'"
+        ;;
+    l)  # Low compression (better quality, larger size, maintain original resolution)
+        ffmpeg_options="-vcodec libx264 -crf 22 -preset faster"
+        ;;
+    *)  # Invalid option
+        echo "Invalid compression level: choose h (high), m (medium), or l (low)"
+        exit 1
+        ;;
+esac
+
+# Run ffmpeg to compress the video
+ffmpeg -i "$input_file" $ffmpeg_options "$output_file"
+
+echo "Video compressed successfully! Output file: $output_file"

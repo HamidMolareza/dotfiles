@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# Get the script name for help message
+script_name=$(basename "$0")
+
+# Function to display help
+show_help() {
+    echo "Usage: $script_name"
+    echo "This script reverts all changes in the Git repository, including:"
+    echo "  - Unstaged changes"
+    echo "  - Staged changes"
+    echo "  - Untracked files"
+    echo
+    echo "Warning: This action is destructive and cannot be undone!"
+    echo
+}
+
+# Check if inside a git repository
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "Error: This script must be run inside a Git repository."
+    exit 1
+fi
+
+# Check for changes
+if [[ -z $(git status --porcelain) ]]; then
+    echo "No changes to revert. The working directory is clean."
+    exit 0
+fi
+
+# Display files that will be reverted
+echo "The following changes will be reverted:"
+echo
+git status --short   # Show the status of all files with short format
+echo
+
+# Confirm with the user before proceeding
+read -p "Are you sure you want to discard all these changes? (y/N): " -n 1 -r
+echo
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Operation cancelled."
+    exit 1
+fi
+
+# Discard all changes
+git reset --hard         # Discard staged and unstaged changes
+git clean -fd            # Remove untracked files and directories
+
+echo "All changes have been reverted."

@@ -1,0 +1,29 @@
+#!/bin/bash
+
+show_help() {
+  echo "Usage: $(basename "$0") <input>"
+  echo "Provide exactly one argument to translate."
+  echo "Example: $(basename "$0") 'hello world'"
+  exit 1
+}
+
+if ! command-exists trans; then
+    echo "Error: 'trans' command not found. Please install 'translate-shell'."
+    echo "To install it, run: sudo apt install translate-shell"
+    exit 1
+fi
+
+lang="$1"
+shift
+
+# Concatenate all arguments into a single string
+input="$*"
+
+# Check if the input contains multiple words or is a single word
+if [[ "$input" == *" "* ]]; then
+  # Multi-word string
+  trans -b ":$lang" "$input"
+else
+  # Single word
+  trans -d ":$lang" "$input"
+fi

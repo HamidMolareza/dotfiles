@@ -1,0 +1,73 @@
+#!/bin/bash
+
+if ! command-exists docker; then
+    echo "Error: docker is not installed. Please install it before running this script."
+    exit 1
+fi
+
+# Default values
+local_port=3000
+app_port=3000
+csproj=""
+
+# Help message
+help_message() {
+    echo "Usage: $(basename "$0") [options]"
+    echo "Options:"
+    echo "  -l, --local-port <port>    Local port to bind (default: 3000)"
+    echo "  -a, --app-port <port>      Application port inside the container (default: 3000)"
+    echo "  -p, --project <project>    Path to the .csproj file (default: '')"
+    echo "  -h, --help                 Show this help message"
+    exit 1
+}
+
+# Validate input as a number
+is_number() {
+    if ! [[ $1 =~ ^[0-9]+$ ]]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+# Parse command line arguments
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -l|--local-port)
+            if is_number "$2"; then
+                local_port="$2"
+            else
+                echo "Error: Local port must be a number."
+                help_message
+            fi
+            shift 2
+            ;;
+        -a|--app-port)
+            if is_number "$2"; then
+                app_port="$2"
+            else
+                echo "Error: Application port must be a number."
+                help_message
+            fi
+            shift 2
+            ;;
+        -p|--project)
+            if [[ -f "$2" && "$2" == *.csproj ]]; then
+                csproj="$2"
+            else
+                echo "Error: Project file must exist and end with '.csproj'."
+                help_message
+            fi
+            shift 2
+            ;;
+        -h|--help) help_message;;
+        *) echo "Invalid option: $1"; help_message;;
+    esac
+done
+
+if [ -z "$csproj" ]; then
+    help_message
+fi
+
+# Run the Docker command
+docker run --rm -v "$(pwd)":/src -p "$local_port:$app_port" --network host mcr.microsoft.com/dotnet/sdk:6.0 dotnet run --project "src/$csproj" --urls "http://localhost:$app_port"

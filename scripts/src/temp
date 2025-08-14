@@ -1,0 +1,12 @@
+#!/bin/bash
+
+name="$1"
+if [ -z "$name" ]; then
+    name="temp"
+fi
+
+current_date="$(date +%Y%m%d-%H%M%S)"
+filename="$name-$current_date.txt"
+
+gnome-text-editor --new-window "$filename"
+echo "$filename"

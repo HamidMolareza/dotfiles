@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Usage: trim <input_file> [<from_time>] [<to_time>] [<output_file>]
+
+# Function to display help message
+display_help() {
+  echo "Usage: $(basename "$0") <input_file> [<from_time>] [<to_time>] [<output_file>]"
+  echo "   <input_file>: Path to the input video file"
+  echo "   [<from_time>]: Optional start time for trimming (format: HH:MM:SS)"
+  echo "   [<to_time>]:   Optional end time for trimming (format: HH:MM:SS)"
+  echo "   [<output_file>]: Optional output file name. If not provided, a timestamp will be used."
+}
+
+if ! command-exists ffmpeg; then
+    echo "Error: ffmpeg is not installed. Please install it before running this script."
+    exit 1
+fi
+
+# Check if the script has at least one argument
+if [ $# -eq 0 ]; then
+  display_help
+  exit 1
+fi
+
+# Check if the first argument is "help" and display help message
+if [ "$1" == "help" ]; then
+  display_help
+  exit 0
+fi
+
+filename="$1"
+from="$2"
+to="$3"
+output_name="$4"
+
+# Check if the input file exists
+if [ ! -f "$filename" ]; then
+  echo "$filename does not exist."
+  display_help
+  exit 1
+fi
+
+# If no output name is provided, generate one with the current date and time
+if [ -z "$output_name" ]; then
+  date_time=$(date +'%Y%m%d-%H%M%S')
+  output_name="$date_time-$filename"
+fi
+
+# Set the initial query with common options
+query="-hide_banner -loglevel error"
+
+# Check and set start time if provided
+if [ ! -z "$from" ]; then
+  query="$query -ss $from"
+else
+  from="begin"
+fi
+
+# Check and set end time if provided
+if [ ! -z "$to" ]; then
+  query="$query -to $to"
+else
+  to="end"
+fi
+
+echo "Trim from $from to $to..."
+
+# Use consistent quoting and include necessary flags for video and audio codec copy
+ffmpeg $query -i "$filename" -c:v copy -c:a copy "$output_name"
+
+# Check the exit status of the ffmpeg command
+if [ $? == 0 ]; then
+  printf "\nOutput: $output_name\n"
+else
+  echo "Error! Operation failed."
+fi

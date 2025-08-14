@@ -1,0 +1,7 @@
+#!/bin/bash
+
+gsettings set org.gnome.system.proxy mode 'manual'
+
+export HTTP_PROXY="socks5://127.0.0.1:9050"
+export HTTPS_PROXY="socks5://127.0.0.1:9050"
+export no_proxy="localhost,127.0.0.1"

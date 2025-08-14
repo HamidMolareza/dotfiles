@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# Check if a path is provided
+if [[ -z "$1" ]]; then
+  echo "Usage: $(basename "$0") <file_or_directory_path>"
+  exit 1
+fi
+
+# Assign the path argument to a variable
+path="$1"
+
+# Check if the path exists
+if [[ ! -e "$path" ]]; then
+  echo "Error: The path '$path' does not exist."
+  exit 1
+fi
+
+# Function to format a single file
+format_file() {
+  local file="$1"
+  echo "Formatting $file"
+  shfmt -w "$file"
+}
+
+# If the path is a file, format it directly
+if [[ -f "$path" ]]; then
+  format_file "$path"
+  exit 0
+fi
+
+# If the path is a directory, find and format all shell script files within
+if [[ ! -d "$path" ]]; then
+  echo "Error: '$path' is neither a file nor a directory."
+  exit 1
+fi
+
+# Find all .sh files and files with a bash shebang, then format them
+find "$path" -type f \( -name "*.sh" -o -exec grep -l "^#!/bin/bash" {} + \) |
+  while IFS= read -r file; do
+    format_file "$file"
+  done
+
+echo "Formatting complete."

@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# Function to display help information
+show_help() {
+  echo "Usage:"
+  echo "  $(basename "$0") [OPTIONS] FILE"
+  echo "  pipeline_command | $(basename "$0") [OPTIONS]"
+  echo "Reads lines from a file based on the specified filter."
+  echo ""
+  echo "Options:"
+  echo "  +N      Display the first N lines of the file"
+  echo "  -N      Display the last N lines of the file"
+  echo "  M-N     Display lines M through N of the file"
+  echo "  M-     Display lines from M to end of the file"
+  echo ""
+  echo "If no filter is provided, the entire file will be displayed."
+  echo ""
+  echo "Examples:"
+  echo "  $(basename "$0") file.txt          # Display entire file"
+  echo "  $(basename "$0") +10 file.txt      # Display first 10 lines"
+  echo "  $(basename "$0") -20 file.txt      # Display last 20 lines"
+  echo "  $(basename "$0") 5-15 file.txt     # Display lines 5 through 15"
+  echo "  $(basename "$0") 15- file.txt     # Display lines 15-end"
+  echo "  ls -lah | $(basename "$0") +5"
+  echo ""
+  exit 0
+}
+
+# Function to run a command, either with a file or piped content
+run_command() {
+  local is_pipe=$1
+  local file_or_content="$2"
+  local command="$3"
+
+  if [ "$is_pipe" = false ]; then
+    # Run the command with file content
+    $command "$file_or_content"
+  else
+    # Run the command with piped content
+    echo "$file_or_content" | $command
+  fi
+}
+
+# Function to read lines based on user input
+read_lines() {
+  local is_pipe=$1
+  local file_or_content="$2"
+  local filter="$3"
+
+  if [ "$is_pipe" = false ]; then
+    # If not piped input, check if the file is provided
+    if [ -z "$file_or_content" ]; then
+      show_help
+    fi
+    # Check if file exists
+    if [ ! -f "$file_or_content" ]; then
+      echo "Error! The file ($file_or_content) does not exist."
+      show_help
+    fi
+  fi
+
+  # Check filter conditions and apply the appropriate command
+  if [ -z "$filter" ]; then
+    run_command "$is_pipe" "$file_or_content" "less"
+  elif [[ $filter =~ ^[+]?([0-9]+)$ ]]; then
+    parsed_number="${BASH_REMATCH[1]}"
+    run_command "$is_pipe" "$file_or_content" "head -n $parsed_number"
+  elif [[ $filter =~ ^-([0-9]+) ]]; then
+    parsed_number="${BASH_REMATCH[1]}"
+    run_command "$is_pipe" "$file_or_content" "tail -n $parsed_number"
+  elif [[ $filter =~ ([0-9]+)-([0-9]+)? ]]; then
+    start_number="${BASH_REMATCH[1]}"
+    end_number="${BASH_REMATCH[2]:-$}"
+
+    run_command "$is_pipe" "$file_or_content" "sed -n ${start_number},${end_number}p"
+  else
+    # Display help if no valid options are provided
+    show_help
+  fi
+}
+
+# Check if input is piped
+if [ -p /dev/stdin ]; then
+  is_pipe=true
+  content=$(cat)
+  read_lines $is_pipe "$content" "$@"
+else
+  is_pipe=false
+  # Check the number of arguments and call read_lines accordingly
+  if [ $# = 1 ]; then
+    read_lines $is_pipe "$1"
+  elif [ $# = 2 ]; then
+    read_lines $is_pipe "$2" "$1"
+  else
+    show_help
+  fi
+fi

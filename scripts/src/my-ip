@@ -1,0 +1,10 @@
+#!/bin/bash
+
+if ! command-exists curl; then
+    echo "Error: curl is not installed. Please install it before running this script."
+    exit 1
+fi
+
+curl https://ident.me/
+
+echo ""

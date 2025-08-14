@@ -1,0 +1,31 @@
+#!/bin/python3
+
+import argparse
+import re
+
+def main():
+    parser = argparse.ArgumentParser(description='Command-line calculator.')
+    parser.add_argument('expression', type=str, help='The mathematical expression to evaluate.')
+    args = parser.parse_args()
+    
+    # Retrieve the expression from the arguments
+    expression = args.expression
+    
+    # Remove spaces from the expression
+    expression = re.sub(r'\s+', '', expression)
+    
+    # Validate the expression to only allow numbers and basic operators
+    if re.match(r'^[\d\+\-\*\/\^\(\)]+$', expression):
+        try:
+            # Replace '^' with '**' for exponentiation
+            expression = expression.replace('^', '**')
+            # Evaluate the expression
+            result = eval(expression)
+            print(f'Result: {result}')
+        except Exception as e:
+            print(f'Error evaluating expression: {e}')
+    else:
+        print('Invalid expression. Only numbers and +, -, *, /, ^ operators are allowed.')
+
+if __name__ == '__main__':
+    main()

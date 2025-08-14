@@ -1,0 +1,29 @@
+#!/bin/bash
+
+case "$SHELL" in
+    */bash)
+        if [[ -f "$HOME/.bashrc" ]]; then
+            echo "$HOME/.bashrc"
+        elif [[ -f "$HOME/.bash_profile" ]]; then
+            echo "$HOME/.bash_profile"
+        fi
+        ;;
+    */zsh)
+        if [[ -f "$HOME/.zshrc" ]]; then
+            echo "$HOME/.zshrc"
+        fi
+        ;;
+    */ksh)
+        if [[ -f "$HOME/.kshrc" ]]; then
+            echo "$HOME/.kshrc"
+        fi
+        ;;
+    */fish)
+        if [[ -f "$HOME/.config/fish/config.fish" ]]; then
+            echo "$HOME/.config/fish/config.fish"
+        fi
+        ;;
+    *)
+        echo "Unsupported shell or configuration file not found"
+        ;;
+esac

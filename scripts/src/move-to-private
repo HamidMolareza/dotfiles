@@ -1,0 +1,16 @@
+#!/bin/bash
+
+if [[ -z "$1" ]]; then
+  program_name=$(basename "$0")
+  echo "Usage: $program_name file_or_folder_path"
+  exit 1
+fi
+
+# Get the absolute path of the file or folder
+path=$(readlink -f "$1")
+
+# Move the file or folder to the encrypted private directory
+mv "$path" ~/Private/
+
+# Create a symbolic link to the file or folder in the original location
+ln -s ~/Private/"$(basename "$path")" "$path"

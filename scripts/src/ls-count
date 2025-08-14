@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# Default values
+path="."
+maxdepth=1
+type=""
+
+show_help() {
+    echo "Usage: $(basename "$0") [options]"
+    echo ""
+    echo "Options:"
+    echo "  -p, --path    Specify the path to search (default: current directory)"
+    echo "  -d, --depth   Specify the maximum depth for the search (default: 1)"
+    echo "  -t, --type    Specify the type of file to search (f for files, d for directories)"
+    echo "  -h, --help    Show this help message and exit"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0") -p /path/to/dir -d 2 -t f"
+    echo "  $(basename "$0") --path /path/to/dir --depth 3 --type d"
+    exit 0
+}
+
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -p | --path) path="$2"; shift 2;;
+        -d | --depth) maxdepth="$2"; shift 2;;
+        -t | --type) type="$2"; shift 2;;
+        -h | --help) show_help;;
+        *) echo "Unknown option: $1"; show_help;;
+    esac
+done
+
+# Check if path is valid
+if [ ! -d "$path" ]; then
+    echo "Error: The specified path ($path) does not exist."
+    show_help
+fi
+
+# Run the find command and count the results
+if [ -z "$type" ]; then
+    result=$(find "$path" -maxdepth "$maxdepth" | wc -l)
+else
+    result=$(find "$path" -maxdepth "$maxdepth" -type "$type" | wc -l)
+fi
+
+echo "$result"

@@ -1,0 +1,18 @@
+#!/bin/bash
+
+release="$1"
+
+# Function to show help message
+show_help() {
+    echo "Usage: $(basename "$0") <release-version>"
+    echo "Example: $(basename "$0") 1.0.0"
+    exit 1
+}
+
+# Check if release argument is provided
+if [ -z "$release" ]; then
+    show_help
+fi
+
+# Commit the release version
+git commit --allow-empty -m "chore: release $release" -m "Release-As: $release"

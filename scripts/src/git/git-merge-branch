@@ -1,0 +1,112 @@
+#!/bin/bash
+
+# Display usage information
+show_usage() {
+  echo "Usage: $(basename "$0") <target-branch>"
+  echo "Merges the current branch into the specified <target-branch>."
+}
+
+# Validate target branch is specified
+validate_target_branch() {
+  if [ -z "$1" ]; then
+    echo "Error: No target branch specified."
+    show_usage
+    exit 1
+  fi
+}
+
+# Check if target branch exists locally or remotely
+check_branch_exists() {
+  local branch="$1"
+  if ! git show-ref --verify --quiet "refs/heads/$branch" && \
+     ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    echo "Error: Branch '$branch' does not exist."
+    echo "Valid branches are:"
+    git branch -a --format="%(refname:short)" | grep -v 'HEAD'
+    exit 1
+  fi
+}
+
+# Get the current branch name
+get_current_branch() {
+  git rev-parse --abbrev-ref HEAD
+}
+
+# Switch to the target branch
+switch_to_target_branch() {
+  local branch="$1"
+  if ! git checkout "$branch"; then
+    echo "Error: Failed to switch to branch '$branch'."
+    echo "Possible solution: Check if you have uncommitted changes or stash them."
+    exit 1
+  fi
+}
+
+# Perform merge of current branch into target branch
+perform_merge() {
+  local current_branch="$1"
+  if ! git merge "$current_branch"; then
+    echo "Error: Merge failed."
+    echo "Possible solution: Resolve conflicts manually, then use:"
+    echo "  git add <resolved-files>"
+    echo "  git merge --continue"
+    exit 1
+  fi
+  echo "Successfully merged '$current_branch' into '$target_branch'."
+}
+
+# Delete the local branch
+delete_local_branch() {
+  local branch="$1"
+  if ! git branch -d "$branch"; then
+    read -rp "Branch deletion failed. Force delete? (y/N) " force_delete
+    if [[ "$force_delete" == "y" || "$force_delete" == "Y" ]]; then
+      git branch -D "$branch" || { echo "Force deletion failed."; exit 1; }
+    else
+      exit 1
+    fi
+  fi
+  echo "Branch '$branch' deleted locally."
+}
+
+# Delete the remote branch if it exists
+delete_remote_branch() {
+  local branch="$1"
+  if git ls-remote --exit-code --heads origin "$branch" &>/dev/null; then
+    read -rp "Do you want to delete the remote branch as well? (y/N) " remote_answer
+    if [[ "$remote_answer" == "y" || "$remote_answer" == "Y" ]]; then
+      git push origin --delete "$branch" || { echo "Failed to delete remote branch."; exit 1; }
+      echo "Remote branch '$branch' deleted."
+    fi
+  else
+    echo "Remote branch '$branch' does not exist."
+  fi
+}
+
+# Main logic
+main() {
+  validate_target_branch "$1"
+  target_branch="$1"
+
+  check_branch_exists "$target_branch"
+  current_branch=$(get_current_branch)
+
+  if [ "$current_branch" = "$target_branch" ]; then
+    echo "Error: You are already on the target branch '$target_branch'."
+    exit 1
+  fi
+
+  switch_to_target_branch "$target_branch"
+  perform_merge "$current_branch"
+
+  read -rp "Do you want to delete the '$current_branch' branch? (y/N) " answer
+  if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+    delete_local_branch "$current_branch"
+    delete_remote_branch "$current_branch"
+  else
+    echo "Operation cancelled."
+  fi
+}
+
+# Execute main function with arguments
+main "$@"

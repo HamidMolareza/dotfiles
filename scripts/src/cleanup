@@ -1,0 +1,56 @@
+#!/bin/bash
+
+if ! command-exists trash-empty; then
+    echo " is not installed. Installing trash-empty..."
+    sudo apt update
+    sudo apt install trash-cli
+fi
+
+delete_large_files() {
+    # Specify the minimum size (in MB) for log files to be deleted
+    local SEARCH_PATH="$1"
+    local MIN_SIZE_MB=$2
+
+    # Convert MIN_SIZE_MB to bytes
+    local MIN_SIZE_BYTES=$((MIN_SIZE_MB * 1024 * 1024))
+
+    # Find log files larger than MIN_SIZE_BYTES in the home directory
+    # Store the list of files in an array
+    local log_files
+    log_files=$(find "$SEARCH_PATH" -type f -name "*log*" -size +${MIN_SIZE_BYTES}c 2>/dev/null)
+
+    # Loop through each file and prompt the user for confirmation before deleting
+    for file in $log_files; do
+        du -sh "$file"
+        read -rp "Do you want to delete the file? (y/n)" response
+        if [[ $response == "y" || $response == "Y" ]]; then
+            rm -f "$file" 2>/dev/null
+        fi
+        echo ""
+    done
+}
+
+delete_large_files "/var/log" 50
+delete_large_files "/home" 50
+
+# Clean up APT cache
+sudo apt clean
+
+# Empty the trash
+sudo rm -rf ~/.local/share/Trash/*
+
+sudo apt autoremove
+sudo apt clean && sudo apt autoclean
+
+# Needs: sudo apt install trash-cli
+trash-empty 1 -f
+
+# Clear bash history
+>"$HOME/.bash_history"
+
+# Display the amount of freed-up space
+echo ""
+df -h
+
+# Optionally, you can add more directories or specific file types to remove
+# Example: find /path/to/other/directory -type f -name "*.tmp" -exec rm -f {} \;

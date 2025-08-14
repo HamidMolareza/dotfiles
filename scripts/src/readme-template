@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# Check if the gh command is installed
+if ! command -v gh &> /dev/null
+then
+    echo "Error: gh command not found. Please install GitHub CLI (gh) first."
+    exit 1
+fi
+
+# Define variables
+TEMPLATE_REPO="payadel/readme"
+TEMP_DIR=$(mktemp -d)
+
+# Function to handle cleanup on exit
+cleanup() {
+    echo "Cleaning up..."
+    rm -rf "$TEMP_DIR"
+}
+
+# Trap signals to ensure cleanup is performed
+trap cleanup EXIT
+
+# Clone the repository into a temporary directory
+echo "Cloning $TEMPLATE_REPO into temporary directory..."
+gh repo clone "$TEMPLATE_REPO" "$TEMP_DIR"
+
+# Check if cloning was successful
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to clone the repository."
+    exit 1
+fi
+
+# Remove the .git folder from the cloned repository
+if [ -d "$TEMP_DIR/.git" ]; then
+    echo "Removing .git folder from the cloned repository..."
+    rm -rf "$TEMP_DIR/.git"
+fi
+
+# Copy all files from the cloned repository to the current directory, overwriting existing files
+echo "Copying files to the current directory..."
+# Enable dotglob to include hidden files (e.g., .env) in pathname expansions
+shopt -s dotglob
+cp -rf "$TEMP_DIR"/* .
+
+echo "Template setup completed successfully."

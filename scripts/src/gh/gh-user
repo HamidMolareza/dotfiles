@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Help message function
+show_help() {
+    echo "Usage: $(basename "$0") <username>"
+    echo
+    echo "Fetch GitHub user details using GitHub CLI (gh)."
+    echo
+    echo "Arguments:"
+    echo "  username     GitHub username to fetch details for."
+    echo
+}
+
+# Check if the gh command exists
+if ! command -v gh &> /dev/null; then
+    echo "Error: The GitHub CLI (gh) is required but not installed."
+    echo "Please install it from https://cli.github.com/ and try again."
+    exit 1
+fi
+
+# Check if username argument is provided
+if [ -z "$1" ]; then
+    echo "Error: No username provided."
+    show_help
+    exit 1
+fi
+
+username="$1"
+
+# Fetch user details from GitHub API
+response=$(gh api -X GET "users/$username")
+
+# Check if the API call was successful
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to fetch user details. Please check your username and internet connection."
+    exit 1
+fi
+
+# Output the response
+echo "User details for '$username':"
+echo "$response"

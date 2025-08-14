@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# Check if ffmpeg is installed
+if ! command-exists ffmpeg; then
+    echo "Error: ffmpeg is not installed. Please install it and try again."
+    exit 1
+fi
+
+# Check if at least one argument (video file) is provided
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 <video files>"
+    exit 1
+fi
+
+# Loop through all the provided video files
+for video in "$@"; do
+    # Check if the file exists
+    if [ ! -f "$video" ]; then
+        echo "File $video does not exist."
+        continue
+    fi
+
+    # Extract file name without extension
+    filename=$(basename -- "$video")
+    name="${filename%.*}"
+
+    # Use ffmpeg to extract the audio
+    ffmpeg -hide_banner -loglevel error -i "$video" -vn -acodec copy "$name.audio.m4a"
+
+    echo "Audio extracted: $name.audio.m4a"
+done

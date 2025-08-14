@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Source common shell functions
+if [ -f $LIBS_DIR/common_functions.sh ]; then
+    . $LIBS_DIR/common_functions.sh
+else
+    echo "Error: common_functions.sh not found in '$LIBS_DIR'" >&2
+    exit 1
+fi
+
+if ! command-exists xclip; then
+    echo_error "Error: xclip is not installed. Please install it before running this script."
+    exit 1
+fi
+
+_copy_to_clipboard() {
+    local content="$1"
+
+    local name="$2"
+    if [ -z "$name" ]; then
+        name="The content"
+    fi
+
+    clipboard "$content"
+    echo_info "$name copied to clipboard."
+}
+
+apk_id="$1"
+if [ -z "$apk_id" ]; then
+    read -rp "App id in Google Play: " apk_id
+fi
+
+echo_info "apkpure.com"
+download_url="https://d.apkpure.net/b/XAPK/$apk_id?version=latest"
+printf "\tDownload: %s\n" "$download_url"
+printf "\tSearch: %s\n" "https://apkpure.net/search?q=$apk_id"
+
+echo_info "apkcombo.com"
+printf "\tSearch: %s\n" "https://apkcombo.com/search/$apk_id"
+
+echo ""
+_copy_to_clipboard "$download_url" "The apkpure.com download link"

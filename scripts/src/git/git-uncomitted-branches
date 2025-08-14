@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# ============================== Functions ==============================
+# Function to check if a branch has uncommitted changes
+has_uncommitted_changes() {
+    # Check if 'git status --porcelain' returns any output (uncommitted changes)
+    if [[ -n $(git status --porcelain) ]]; then
+        return 0  # True: There are uncommitted changes
+    else
+        return 1  # False: No uncommitted changes
+    fi
+}
+
+# ============================== Main ==============================
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+if has_uncommitted_changes; then
+    echo "The current branch ($current_branch) has uncommitted changes."
+    exit 0
+fi
+
+# Get all local branches
+branches=$(git branch --format="%(refname:short)")
+
+# Iterate through each branch
+for branch in $branches; do
+    # Switch to the branch
+    git checkout "$branch" &> /dev/null
+
+    # Check for uncommitted changes using the function
+    if has_uncommitted_changes; then
+        echo "Branch '$branch' has uncommitted changes."
+    else
+        echo "Branch '$branch' is clean."
+    fi
+done
+
+# Switch back to the original branch
+git checkout "$current_branch" > /dev/null 2>&1

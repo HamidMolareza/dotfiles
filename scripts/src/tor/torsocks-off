@@ -1,0 +1,4 @@
+#!/bin/bash
+
+source torsocks off
+wget -qO - https://api.ipify.org; echo

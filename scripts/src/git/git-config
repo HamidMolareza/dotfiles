@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Display help message
+display_help() {
+    echo "Usage: $(basename $0)"
+    echo "This script sets up basic configurations for Git."
+    echo "Options:"
+    echo "  -h, --help     Display this help message"
+    exit 1
+}
+
+# Check for help option
+if [[ $1 == "-h" || $1 == "--help" ]]; then
+    display_help
+fi
+
+# Set user information
+printf "Setting up Git user information...\n\n"
+
+default_username=$(git config --global user.name)
+if [[ -z $default_username ]]; then
+    read -p "Enter your name: " username
+else
+    echo "Default user.name is set to: $default_username"
+    read -p "Enter your name (press Enter to use the default): " username
+    username=${username:-$default_username}
+fi
+
+echo "" # Empty line for formatting
+
+# Check if user.email is already set
+default_email=$(git config --global user.email)
+if [[ -z $default_email ]]; then
+    read -p "Enter your email: " email
+else
+    echo "Default user.email is set to: $default_email"
+    read -p "Enter your email (press Enter to use the default): " email
+    email=${email:-$default_email}
+fi
+
+git config --global user.name "$username"
+git config --global user.email "$email"
+
+# Set default text editor
+git config --global core.editor nano
+
+# Set colorization of Git output
+git config --global color.ui auto
+
+# Set default branch name
+git config --global init.defaultBranch main
+
+git config --global fetch.prune true
+
+# Display the current configuration for verification
+echo -e "\nGit configuration set. Here is the current configuration:"
+git config --list

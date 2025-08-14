@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# Get the current branch name
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+# Check if we are in a Git repository
+if [[ -z "$current_branch" ]]; then
+    echo "Not in a Git repository."
+    exit 1
+fi
+
+# Output the current branch name
+echo "$current_branch"

@@ -1,0 +1,29 @@
+#!/bin/python3
+
+from datetime import datetime
+from persiantools.jdatetime import JalaliDate
+
+# Persian month names in Latin
+PERSIAN_MONTHS_LATIN = [
+    "Farvardin", "Ordibehesht", "Khordad", "Tir", "Mordad", "Shahrivar",
+    "Mehr", "Aban", "Azar", "Dey", "Bahman", "Esfand"
+]
+
+def format_persian_date(persian_date: JalaliDate) -> str:
+    """Formats a Persian date in 'day month year' format."""
+    return f"{persian_date.day} {PERSIAN_MONTHS_LATIN[persian_date.month - 1]} {persian_date.year}"
+
+def main():
+    # Get the current dates
+    gregorian_date = datetime.now()
+    persian_date = JalaliDate.today()
+
+    # Define date format
+    date_format = "%Y/%m/%d"
+
+    # Print dates in both Gregorian and Persian formats
+    print(f"Persian  : {persian_date.strftime(date_format)} - {format_persian_date(persian_date)}")
+    print(f"Gregorian: {gregorian_date.strftime(date_format)}")
+
+if __name__ == "__main__":
+    main()

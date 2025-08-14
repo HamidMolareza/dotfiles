@@ -1,0 +1,50 @@
+#!/bin/python3.12
+
+import dns.resolver
+import os
+import sys
+
+
+def get_dns_records(domain):
+    record_types = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'SRV']
+
+    for record_type in record_types:
+        try:
+            result = dns.resolver.resolve(domain, record_type)
+            print(f"{record_type} records for {domain}:")
+
+            if record_type == 'MX':
+                for mx in result:
+                    print(f"  {mx.exchange} (Priority: {mx.preference})")
+            elif record_type == 'SOA':
+                soa = result[0]
+                print(f"  Primary Name Server: {soa.mname}")
+                print(f"  Responsible Mail Address: {soa.rname}")
+                print(f"  Serial Number: {soa.serial}")
+                print(f"  Refresh Time: {soa.refresh}")
+                print(f"  Retry Time: {soa.retry}")
+                print(f"  Expire Time: {soa.expire}")
+                print(f"  Minimum TTL: {soa.minimum}")
+            else:
+                for record in result:
+                    print(f"  {record}")
+
+        except dns.exception.DNSException as e:
+            print(f"Error ({record_type} records): {e}")
+
+
+def print_help():
+    script_name = os.path.basename(sys.argv[0])
+    print(f"Usage: {script_name} <domain>")
+    print(f"Example: {script_name} example.com")
+    print("Supported record types: A, AAAA, CNAME, MX, NS, TXT, SOA, SRV")
+
+
+# Check if the correct number of command-line arguments is provided
+if len(sys.argv) != 2:
+    print("Invalid number of arguments.")
+    print_help()
+else:
+    # Retrieve the domain from the command-line arguments
+    user_domain = sys.argv[1]
+    get_dns_records(user_domain)

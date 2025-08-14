@@ -1,0 +1,34 @@
+#!/bin/bash
+
+if ! command-exists gh; then
+    echo "Error: GitHub cli (gh) is not installed. Please install it before running this script."
+    exit 1
+fi
+
+source "$HOME/my-files/scripts/src/try"
+
+# Function to create a slug from a text
+slugify() {
+  echo "$1" | iconv -t ascii//TRANSLIT | sed -r 's/[^a-zA-Z0-9]+/-/g' | sed -r 's/^-+\|-+$//g' | tr A-Z a-z
+}
+
+# Initialize a counter
+cnt=0
+
+# Get date time
+current_datetime=$(date "+%Y-%m-%d-%H-%M-%S")
+
+# Set directory
+base_dir="gist-$current_datetime"
+# Create directory
+mkdir "$base_dir"
+
+# List every gist in reverse order, then clone all of them
+gh gist list --limit 1000 | cut -f1,2 | tac | while read id name; do
+  ((cnt++))
+  slug=$(slugify "$name")
+  dir="$base_dir/$cnt-$slug"
+
+  try "gh gist clone $id $dir" 5 4
+  echo ""
+done

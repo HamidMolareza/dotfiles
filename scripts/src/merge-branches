@@ -1,0 +1,120 @@
+#!/bin/bash
+
+# Function to check if git is installed and can be used
+check_git() {
+    command -v git >/dev/null 2>&1 || {
+        echo >&2 "Git is not installed. Please install git before running this script."
+        exit 1
+    }
+    git --version >/dev/null 2>&1 || {
+        echo >&2 "Git commands are not working. Please check your git installation."
+        exit 1
+    }
+
+    # Check if the current directory is a Git repository
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        echo >&2 "The current directory is not a Git repository."
+        exit 1
+    }
+}
+
+# Function to check if branches exist
+check_branches_exist() {
+    local source_branch=$1
+    local target_branch=$2
+
+    git show-ref --verify --quiet "refs/heads/$source_branch" || {
+        echo >&2 "Source branch '$source_branch' does not exist."
+        exit 1
+    }
+    git show-ref --verify --quiet "refs/heads/$target_branch" || {
+        echo >&2 "Target branch '$target_branch' does not exist."
+        exit 1
+    }
+}
+
+# Function to prompt user for branch merge confirmation
+prompt_merge() {
+    local source_branch=$1
+    local target_branch=$2
+
+    read -p "Do you want to merge $source_branch into $target_branch? (yes/no): " answer
+    case $answer in
+    [Yy] | [Yy][Ee][Ss]) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+# Function to merge branches and delete old branch
+merge_branches() {
+    local source_branch=$1
+    local target_branch=$2
+
+    # Check if branches exist
+    git show-ref --verify --quiet "refs/heads/$source_branch" || {
+        echo >&2 "Source branch '$source_branch' does not exist."
+        exit 1
+    }
+    git show-ref --verify --quiet "refs/heads/$target_branch" || {
+        echo >&2 "Target branch '$target_branch' does not exist."
+        exit 1
+    }
+
+    # Merge branches
+    git checkout "$target_branch"
+    git merge --no-ff "$source_branch"
+
+    # Check if merge was successful or not
+    if [ $? -ne 0 ]; then
+        echo >&2 "Merge failed. Please resolve conflicts and try again."
+        exit 1
+    fi
+
+    read -p "Branches merged successfully. Do you want to delete the old branch '$source_branch'? (yes/no): " delete_answer
+    case $delete_answer in
+    [Yy] | [Yy][Ee][Ss])
+        git branch -d "$source_branch"
+        echo "Old branch '$source_branch' deleted."
+        ;;
+    *) echo "Old branch '$source_branch' not deleted." ;;
+    esac
+}
+
+# Function to push the target branch to the remote repository
+git_push() {
+    local target_branch=$1
+
+    read -p "Do you want to push the '$target_branch'? (yes/no): " push_answer
+    case $push_answer in
+    [Yy] | [Yy][Ee][Ss])
+        git push origin "$target_branch"
+        echo "Branch '$target_branch' pushed to the remote repository."
+        ;;
+    *) echo "push canceled." ;;
+    esac
+}
+
+# ===============================================================================
+# Main script execution starts here
+
+# Check if git is installed and can be used
+check_git
+
+# Get branch names from command-line
+source_branch=${1:-$(git rev-parse --abbrev-ref HEAD)} # Default to current branch
+target_branch="$2"
+
+# Check if branches exist
+check_branches_exist "$source_branch" "$target_branch"
+
+# Prompt user for branch merge confirmation
+prompt_merge "$source_branch" "$target_branch" || {
+    echo "Branch merge canceled."
+    exit 0
+}
+
+# Merge branches and delete old branch
+merge_branches "$source_branch" "$target_branch"
+
+# Push the target branch
+git_push "$target_branch"
