@@ -1,0 +1,8 @@
+# Ignore everything
+*
+
+# But not this files/folders
+!.gitignore
+
+!autostart
+!autostart/**
