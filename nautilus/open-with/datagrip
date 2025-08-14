@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Check if 'webstorm' exists
+if command -v datagrip >/dev/null 2>&1; then
+    datagrip "$1"
+elif command -v datagrip.sh >/dev/null 2>&1; then
+    datagrip.sh "$1"
+else
+    zenity --error --text="Neither 'datagrip' nor 'datagrip.sh' commands exist."
+    echo 
+fi

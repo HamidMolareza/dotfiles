@@ -1,0 +1,49 @@
+#!/bin/bash
+
+process(){
+  local arg="$1"
+
+  if [ -f "$arg" ]; then
+    process_file "$arg"
+  elif [ -d "$arg" ]; then
+    process_directory "$arg"
+  else
+    return 1
+  fi
+
+  return $?
+}
+
+# Function to process a single file
+process_file() {
+  local file="$1"
+  ffmpeg -i "$file" -ss 00:00:01.000 -vframes 1 "${file%.*}.png"
+}
+
+# Function to recursively process directories
+process_directory() {
+  local dir="$1"
+  find "$dir" -type f -print0 | while IFS= read -r -d '' file; do
+    process_file "$file"
+  done
+}
+
+# Check if ffmpeg is installed
+if ! command -v ffmpeg &> /dev/null; then
+    zenity --error --text="ffmpeg could not be found. Please install it to use this script."
+    exit 1
+fi
+
+# Process each argument
+error=false
+for arg in "$@"; do
+  if ! process "$arg"; then
+    error=true
+  fi
+done
+
+if [[ "$error" = "false" ]]; then
+  notify-send "Generate Thumbnails" "Thumbnails have been generated for selected videos"
+else
+  zenity --error --text="At least one or more errors occured."
+fi

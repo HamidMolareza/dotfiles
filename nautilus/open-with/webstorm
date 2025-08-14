@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Check if 'webstorm' exists
+if command -v webstorm >/dev/null 2>&1; then
+    webstorm "$1"
+elif command -v webstorm.sh >/dev/null 2>&1; then
+    webstorm.sh "$1"
+else
+    zenity --error --text="Neither 'webstorm' nor 'webstorm.sh' commands exist."
+    echo 
+fi

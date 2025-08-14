@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Function to process a single file
+process_file() {
+  local file="$1"
+  ffmpeg -i "$file" -q:a 0 -map a "${file%.*}.mp3"
+}
+
+# Function to recursively process directories
+process_directory() {
+  local dir="$1"
+  find "$dir" -type f -print0 | while IFS= read -r -d '' file; do
+    process_file "$file"
+  done
+}
+
+# Check if ffmpeg is installed
+if ! command -v ffmpeg &> /dev/null; then
+    zenity --error --text="ffmpeg could not be found. Please install it to use this script."
+    exit 1
+fi
+
+# Process each argument
+for arg in "$@"; do
+  if [ -f "$arg" ]; then
+    process_file "$arg"
+  elif [ -d "$arg" ]; then
+    process_directory "$arg"
+  else
+    zenity --error --text="Invalid input: $arg"
+  fi
+done
+
+notify-send "Audio Extraction" "Audio has been extracted from selected video(s)"

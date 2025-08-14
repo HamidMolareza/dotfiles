@@ -1,0 +1,14 @@
+#!/bin/bash
+
+if [[ -z "$1" ]]; then
+    echo "Please provide a (file or folder) path as an argument."
+    exit 1
+fi
+
+filename=$(basename "$1")
+
+file_path="$HOME/Desktop/$filename"
+
+ln -sf "$1" "$file_path"
+
+echo "Shortcut created for $1 at $file_path"

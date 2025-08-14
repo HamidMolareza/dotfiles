@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Check if 'webstorm' exists
+if command -v pycharm >/dev/null 2>&1; then
+    pycharm "$1"
+elif command -v pycharm.sh >/dev/null 2>&1; then
+    pycharm.sh "$1"
+else
+    zenity --error --text="Neither 'pycharm' nor 'pycharm.sh' commands exist."
+    echo 
+fi

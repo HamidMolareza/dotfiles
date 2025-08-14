@@ -1,0 +1,44 @@
+#!/bin/bash
+
+if ! command -v zenity &>/dev/null; then
+    zenity --error --text="zenity could not be found. Please install it to use this script."
+    exit 1
+fi
+
+# Check for no arguments
+if [ "$#" -eq 0 ]; then
+    zenity --error --text="No files or directories specified."
+    exit 1
+fi
+
+# Bookmarks file path
+BOOKMARKS_FILE=~/.config/gtk-3.0/bookmarks
+
+# Function to add a single target to bookmarks
+add_to_bookmarks() {
+    local TARGET="$1"
+    
+    # Ensure TARGET is not empty
+    if [ -z "$TARGET" ]; then
+        return
+    fi
+
+    # Normalize the target path to the absolute path
+    TARGET=$(realpath "$TARGET")
+
+    # Check if the target already exists in the bookmarks
+    if ! grep -Fxq "file://$TARGET" "$BOOKMARKS_FILE"; then
+        # If not, add it to the bookmarks
+        echo "file://$TARGET" >> "$BOOKMARKS_FILE"
+        echo "$TARGET has been added to your bookmarks."
+    else
+        echo "$TARGET is already in your bookmarks."
+    fi
+}
+
+# Iterate through all selected files/folders
+for TARGET in "$@"; do
+    add_to_bookmarks "$TARGET"
+done
+
+notify-send "Add to Favorite" "Operation completed successfully"

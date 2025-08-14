@@ -1,0 +1,45 @@
+#!/bin/bash
+
+calc_hash(){
+    local filename="$1"
+    sha1sum "$filename" | awk '{ print $1 }'
+}
+
+compress() {
+    local temp_dir
+    temp_dir=$(mktemp -d)
+
+    local output="$temp_dir/files.tar.gz"
+    tar -czf "$output" "$@"
+
+    echo "$output"
+}
+
+# Check if sha1 is installed
+if ! command -v sha1sum &> /dev/null; then
+    zenity --error --text="sha1sum could not be found. Please install it to use this script."
+    exit 1
+fi
+# Check if xclip is installed
+if ! command -v xclip &> /dev/null; then
+    zenity --error --text="xclip could not be found. Please install it to use this script."
+    exit 1
+fi
+
+# Check for no arguments
+if [ "$#" -eq 0 ]; then
+    zenity --error --text="No files or directories specified."
+    exit 1
+fi
+
+if [ "$#" -gt 1 ] || [ -d "$1" ]; then
+    compress_file=$(compress "$@")
+    hash=$(calc_hash "$compress_file")
+
+    rm -r "$(dirname "$compress_file")"
+else
+    hash=$(calc_hash "$1")
+fi
+
+echo "$hash" | xclip -selection clipboard
+notify-send "SHA1 Checksum" "SHA1 ($hash) copied to clipboard"

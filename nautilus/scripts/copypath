@@ -1,0 +1,30 @@
+#!/bin/bash
+# This script copies the paths of selected files/folders to the clipboard, each on a new line.
+
+# Check if xclip is installed
+if ! command -v xclip &> /dev/null; then
+    zenity --error --text="xclip could not be found. Please install it to use this script."
+    exit 1
+fi
+
+# Initialize variable to store file paths
+file_paths=""
+
+# Loop through each provided filename
+for file in "$@"; do
+  # Find full path
+  full_path=$(realpath "$file" 2>/dev/null)
+
+  # Check if file exists and add to variable
+  if [ -e "$full_path" ]; then
+    file_paths+="$full_path"$'\n'
+  else
+    zenity --warning --text="Warning: File '$file' not found."
+  fi
+done
+
+# Remove trailing newlines
+file_paths=$(echo "$file_paths" | sed '/^$/d')
+
+# Copy to clipboard using xclip
+echo "$file_paths" | xclip -selection clipboard

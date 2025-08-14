@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Check if 'webstorm' exists
+if command -v rider >/dev/null 2>&1; then
+    rider "$1"
+elif command -v rider.sh >/dev/null 2>&1; then
+    rider.sh "$1"
+else
+    zenity --error --text="Neither 'rider' nor 'rider.sh' commands exist."
+    echo 
+fi

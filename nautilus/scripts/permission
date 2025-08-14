@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Function to check if the permission code is valid
+is_valid_permission() {
+    local perm=$1
+    if [[ $perm =~ ^[0-7]{3}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check if zenity is installed
+if ! command -v zenity &> /dev/null; then
+    zenity --error --text="Zenity could not be found. Please install it to use this script."
+    exit 1
+fi
+
+# Get permission code from user using zenity
+perm_code=$(zenity --entry --title="Enter Permission Code" --text="Please enter a three-digit Linux permission code (e.g., 755):")
+
+# Check if the user pressed cancel
+if [[ $? -ne 0 ]]; then
+    exit 0
+fi
+
+# Validate the permission code
+if is_valid_permission "$perm_code"; then
+    for file in "$@"; do
+    if [ -d "$file" ]; then
+        if zenity --question --text="Do you want to do operation recursive?"; then
+            chmod -R "$perm_code" "$file"
+        else
+            chmod "$perm_code" "$file"
+        fi
+    else
+        chmod "$perm_code" "$file"
+    fi
+    done
+    notify-send "Set Permissions" "Permissions have been set to $perm_code for selected files"
+else
+    zenity --error --text="Invalid permission code. Please enter a valid three-digit number where each digit is between 0 and 7."
+    exit 1
+fi
