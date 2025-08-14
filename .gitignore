@@ -1,5 +1,10 @@
+# Ignore all environment files
+# except for the sample file
+# This is to ensure that sensitive information is not committed to the repository.
+# The sample file can be used as a template for creating actual environment files.
 .env*
 !.env.sample
 
+# Ignore IDE files
 .vscode
 .idea
