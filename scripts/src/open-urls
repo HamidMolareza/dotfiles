@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# get clipboard text (Wayland or X11)
+if command -v wl-paste >/dev/null 2>&1; then
+    clipboard="$(wl-paste)"
+elif command -v xclip >/dev/null 2>&1; then
+    clipboard="$(xclip -o -selection clipboard)"
+else
+    echo "❌ Neither wl-paste nor xclip found." >&2
+    return 1
+fi
+
+# process each line
+while IFS= read -r line; do
+    if [[ "$line" =~ ^https?:// ]]; then
+        echo "🌐 Opening: $line"
+        nohup xdg-open "$line" >/dev/null 2>&1 &
+        sleep 2
+    elif [[ -n "$line" ]]; then
+        echo "⚠️ Skipped (not a valid URL): $line" >&2
+    fi
+done <<<"$clipboard"

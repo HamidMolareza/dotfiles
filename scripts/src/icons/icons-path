@@ -1,0 +1,24 @@
+#!/bin/bash
+
+show_help() {
+    echo "Usage: $0 <icon-name>"
+    echo ""
+    echo "Find all icon files for a given icon name in different sizes."
+}
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+ICON_NAME="$1"
+if [[ -z "$ICON_NAME" ]]; then
+    echo "Error: Icon name is required."
+    show_help
+    exit 1
+fi
+
+ICON_THEME=$(gsettings get org.gnome.desktop.interface icon-theme | tr -d \')
+
+find /usr/share/icons/$ICON_THEME -type f \( -name "${ICON_NAME}.svg" -o -name "${ICON_NAME}.png" \) \
+    | sort

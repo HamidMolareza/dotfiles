@@ -1,0 +1,21 @@
+#!/bin/bash
+
+show_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help    Show this help message"
+}
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+ICON_THEME=$(gsettings get org.gnome.desktop.interface icon-theme | tr -d \')
+
+# List unique icon names without extensions
+find /usr/share/icons/$ICON_THEME -type f \( -name "*.svg" -o -name "*.png" \) \
+    | sed -E 's!.*/!!' \
+    | sed -E 's/\.(svg|png)$//' \
+    | sort -u

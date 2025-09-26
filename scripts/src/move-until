@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# move_until.sh
+# Usage: ./move_until.sh "Screenshot from 2025-08-01 06-42-05.png" /path/to/destination
+
+set -euo pipefail
+
+if [ $# -ne 2 ]; then
+  echo "Usage: $0 <target_filename> <destination_directory>"
+  exit 1
+fi
+
+target="$1"
+dest="$2"
+
+if [ ! -f "$target" ]; then
+  echo "Error: target file '$target' does not exist in current directory."
+  exit 1
+fi
+
+if [ ! -d "$dest" ]; then
+  echo "Error: destination directory '$dest' does not exist."
+  exit 1
+fi
+
+# Iterate through sorted files safely (handles spaces/newlines)
+find . -maxdepth 1 -type f -printf "%f\0" | sort -z | \
+while IFS= read -r -d '' f; do
+  mv -- "$f" "$dest/"
+  [ "$f" = "$target" ] && break
+done
+

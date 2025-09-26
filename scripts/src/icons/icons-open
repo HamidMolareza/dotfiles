@@ -1,0 +1,38 @@
+#!/bin/bash
+
+show_help() {
+    echo "Usage: $0 <icon-name>"
+    echo ""
+    echo "Open the biggest available icon for the given icon name."
+}
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+ICON_NAME="$1"
+if [[ -z "$ICON_NAME" ]]; then
+    echo "Error: Icon name is required."
+    show_help
+    exit 1
+fi
+
+ICON_THEME=$(gsettings get org.gnome.desktop.interface icon-theme | tr -d \')
+
+# Find all icons, sort by resolution if possible (extract numbers from path)
+ICON_FILE=$(find /usr/share/icons/$ICON_THEME -type f \( -name "${ICON_NAME}.svg" -o -name "${ICON_NAME}.png" \) \
+    | awk -F'/' '{for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/) size=$i}} END{print $0}' \
+    | sort -V | tail -n1)
+
+# Fallback if no numeric folder found, pick last sorted file
+if [[ -z "$ICON_FILE" ]]; then
+    ICON_FILE=$(find /usr/share/icons/$ICON_THEME -type f \( -name "${ICON_NAME}.svg" -o -name "${ICON_NAME}.png" \) | sort | tail -n1)
+fi
+
+if [[ -f "$ICON_FILE" ]]; then
+    xdg-open "$ICON_FILE"
+else
+    echo "Icon not found."
+    exit 1
+fi
