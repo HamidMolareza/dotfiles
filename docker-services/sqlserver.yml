@@ -11,3 +11,10 @@ services:
     volumes:
       - './data/mssql/data:/var/opt/mssql/data'
       - './data/mssql/log:/var/opt/mssql/log'
+    networks:
+      - dbnet
+
+networks:
+  dbnet:
+    external: true
+    name: database_shared_network
