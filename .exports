@@ -6,3 +6,5 @@ export PATH=$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH
 export NODE_PATH=$(npm root -g)
 
 source "$HOME/scripts/exports"
+
+export GPG_TTY=$(tty)
