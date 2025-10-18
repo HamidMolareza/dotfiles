@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Copy selected file types from a source tree to a destination, preserving structure.
+# Default: unlimited depth. Only limit depth when --max-depth N is provided.
+# Skips unreadable dirs quietly and supports pruning directories.
+#
+# Requires: bash 4+, GNU find, rsync (Ubuntu has them).
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") -s SRC -d DEST [options]
+
+Options:
+  -s, --src PATH           Source directory (required)
+  -d, --dest PATH          Destination directory (required)
+  -e, --ext "LIST"         Comma-separated extensions (default:
+                           "png,jpg,jpeg,gif,bmp,webp,tif,tiff,heic,svg,pdf,txt")
+      --dry-run            Show what would be copied; don't modify anything
+      --follow-symlinks    Follow symlinks (uses 'find -L')
+      --max-depth N        Limit directory descent to N (default: unlimited)
+      --prune "LIST"       Comma-separated dirs (relative to SRC) to skip,
+                           e.g. "lost+found,.git,node_modules"
+      --no-quiet-errors    Show find errors (default is to hide them)
+  -v, --verbose            Verbose rsync output
+  -h, --help               Show this help
+
+Notes:
+  * GNU find counts starting points as depth 0:
+      --max-depth 0  => only the SRC directory itself
+      --max-depth 1  => SRC + its direct entries (no subdirs of subdirs)
+EOF
+}
+
+SRC=""; DEST=""
+EXT_LIST="png,jpg,jpeg,gif,bmp,webp,tif,tiff,heic,svg,pdf,txt,md"
+DRY_RUN=false; FOLLOW_SYMLINKS=false
+MAX_DEPTH=""     # empty => unlimited
+PRUNE_LIST=""; QUIET_ERRORS=true; VERBOSE=false
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--src)           SRC="${2:-}"; shift 2 ;;
+    -d|--dest)          DEST="${2:-}"; shift 2 ;;
+    -e|--ext)           EXT_LIST="${2:-}"; shift 2 ;;
+    --dry-run)          DRY_RUN=true; shift ;;
+    --follow-symlinks)  FOLLOW_SYMLINKS=true; shift ;;
+    --max-depth)
+      [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]] || { echo "Error: --max-depth requires a non-negative integer." >&2; exit 1; }
+      MAX_DEPTH="$2"; shift 2 ;;
+    --prune)            PRUNE_LIST="${2:-}"; shift 2 ;;
+    --no-quiet-errors)  QUIET_ERRORS=false; shift ;;
+    -v|--verbose)       VERBOSE=true; shift ;;
+    -h|--help)          usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+[[ -z "${SRC}" || -z "${DEST}" ]] && { echo "Error: --src and --dest are required." >&2; usage; exit 1; }
+[[ ! -d "${SRC}" ]] && { echo "Error: source does not exist: ${SRC}" >&2; exit 1; }
+
+SRC_ABS="$(readlink -f -- "${SRC}")"
+DEST_ABS="$(mkdir -p -- "${DEST}" && readlink -f -- "${DEST}")"
+
+# If DEST is inside SRC, prune it to avoid recursion
+PRUNE_PATHS=()
+if [[ "${DEST_ABS}" == "${SRC_ABS}"* ]]; then
+  REL_DEST="${DEST_ABS#${SRC_ABS}/}"
+  [[ -n "${REL_DEST}" ]] && PRUNE_PATHS+=("./${REL_DEST}")
+fi
+
+# User-specified prunes
+if [[ -n "${PRUNE_LIST}" ]]; then
+  IFS=',' read -r -a _prunes <<< "${PRUNE_LIST}"
+  for p in "${_prunes[@]}"; do
+    p="${p#/}"; p="${p#./}"
+    [[ -n "$p" ]] && PRUNE_PATHS+=("./${p}")
+  done
+fi
+
+# Normalize extension list
+IFS=',' read -r -a _exts <<< "${EXT_LIST}"
+exts_norm=()
+for e in "${_exts[@]}"; do
+  e="${e#.}"; e="${e,,}"
+  [[ -n "$e" ]] && exts_norm+=("$e")
+done
+[[ ${#exts_norm[@]} -eq 0 ]] && { echo "Error: empty extension list." >&2; exit 1; }
+
+# find flavor
+if $FOLLOW_SYMLINKS; then FIND_BIN=(find -L); else FIND_BIN=(find); fi
+
+cd -- "${SRC_ABS}"
+
+# Build the -iname clauses like: \( -false -o -iname '*.png' -o ... \)
+NAME_CLAUSES=( \( -false )
+for e in "${exts_norm[@]}"; do
+  NAME_CLAUSES+=( -o -iname "*.${e}" )
+done
+NAME_CLAUSES+=( \) )
+
+# Build full find args, with optional prunes and optional max-depth
+FIND_ARGS=( . )
+if [[ -n "${MAX_DEPTH}" ]]; then
+  FIND_ARGS+=( -maxdepth "${MAX_DEPTH}" )
+fi
+
+if (( ${#PRUNE_PATHS[@]} )); then
+  FIND_ARGS+=( \( )
+  for pat in "${PRUNE_PATHS[@]}"; do
+    FIND_ARGS+=( -path "${pat}" -prune -o )
+  done
+  FIND_ARGS+=( -type f "${NAME_CLAUSES[@]}" -print0 \) )
+else
+  FIND_ARGS+=( -type f "${NAME_CLAUSES[@]}" -print0 )
+fi
+
+# rsync args
+RSYNC_ARGS=(-a --from0 --files-from=- ./ "${DEST_ABS}/")
+$VERBOSE && RSYNC_ARGS=(-v "${RSYNC_ARGS[@]}")
+$DRY_RUN && RSYNC_ARGS=(-n "${RSYNC_ARGS[@]}")
+
+echo "Selecting extensions: ${EXT_LIST}"
+echo "Depth: $([[ -n "${MAX_DEPTH}" ]] && echo "max ${MAX_DEPTH}" || echo "unlimited")"
+[[ -n "${PRUNE_LIST}" ]] && echo "Pruning: ${PRUNE_LIST}"
+$DRY_RUN && echo "[Dry run] Nothing will be copied."
+
+# Run find → rsync, optionally silencing permission errors.
+if $QUIET_ERRORS; then
+  { "${FIND_BIN[@]}" "${FIND_ARGS[@]}" 2>/dev/null || true; } | rsync "${RSYNC_ARGS[@]}"
+else
+  { "${FIND_BIN[@]}" "${FIND_ARGS[@]}" || true; } | rsync "${RSYNC_ARGS[@]}"
+fi
+
+echo "Done."
