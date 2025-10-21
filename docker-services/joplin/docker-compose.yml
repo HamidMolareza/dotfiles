@@ -23,7 +23,7 @@ services:
             - POSTGRES_DATABASE=joplin
             - POSTGRES_PORT=5432
             - POSTGRES_HOST=db
-            - APP_BASE_URL=http://192.168.1.42:22300
+            - APP_BASE_URL=http://192.168.1.44:22300
             - MAILER_ENABLED=1
             - MAILER_HOST=${MAILER_HOST}
             - MAILER_PORT=${MAILER_PORT}
