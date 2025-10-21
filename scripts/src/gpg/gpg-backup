@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+KEY="${1:-}"                # May be empty; we'll guide you interactively.
+ARCHIVE_IN="${2:-}"         # May be a file or a directory.
+
+# --- sensible default archive path (prefer ~/Private if it exists) ---
+pick_default_archive() {
+  local base="$HOME/Private"
+  if [[ -d "$base" && -w "$base" ]]; then
+    printf '%s\n' "$base/gpg-backup-$(date +%F).tgz.gpg"
+  else
+    printf '%s\n' "$HOME/gpg-backup-$(date +%F).tgz.gpg"
+  fi
+}
+
+# If user passed a directory as ARCHIVE_IN, turn it into a dated file inside it
+compute_archive_path() {
+  local path="$1"
+  if [[ -z "$path" ]]; then
+    path="$(pick_default_archive)"
+  elif [[ -d "$path" ]]; then
+    path="$path/gpg-backup-$(date +%F).tgz.gpg"
+  fi
+  # Avoid accidental overwrite: if the file already exists, add a time suffix
+  if [[ -e "$path" ]]; then
+    path="${path%.tgz.gpg}-$(date +%H%M%S).tgz.gpg"
+  fi
+  printf '%s\n' "$path"
+}
+
+ARCHIVE="$(compute_archive_path "$ARCHIVE_IN")"
+mkdir -p -- "$(dirname -- "$ARCHIVE")"
+echo "Backing up GPG key to: $ARCHIVE"
+
+umask 077
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# --- if no fingerprint given, list secret keys and let user choose ---
+if [[ -z "$KEY" ]]; then
+  echo "No fingerprint provided."
+  echo "Discovering your secret keys…"
+  mapfile -t CHOICES < <(
+    gpg --list-secret-keys --with-colons \
+    | awk -F: '
+        $1=="sec" {sec=1; next}
+        sec && $1=="fpr" && f=="" {f=$10; next}
+        sec && $1=="uid" && u=="" {u=$10; gsub(/\\x3a/,":",u); print f"|"u; sec=0; f=""; u=""}
+      '
+  )
+
+  if (( ${#CHOICES[@]} == 0 )); then
+    echo "No secret keys found. Create one with:  gpg --full-generate-key" >&2
+    exit 1
+  fi
+
+  echo "Pick a key by number, or paste a fingerprint:"
+  for i in "${!CHOICES[@]}"; do
+    IFS='|' read -r fpr uid <<<"${CHOICES[$i]}"
+    printf "%2d) %s  %s\n" "$((i+1))" "$fpr" "$uid"
+  done
+  printf "Selection: "
+  read -r sel
+
+  if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#CHOICES[@]} )); then
+    IFS='|' read -r KEY _ <<<"${CHOICES[$((sel-1))]}"
+  elif [[ -n "$sel" ]]; then
+    KEY="$sel"
+  else
+    echo "Aborted." >&2
+    exit 1
+  fi
+fi
+
+# Sanity-check: does this key exist?
+if ! gpg --list-secret-keys --with-colons "$KEY" >/dev/null 2>&1; then
+  echo "Could not find a secret key matching: $KEY" >&2
+  exit 1
+fi
+
+# --- export materials into a secure temp dir ---
+echo "Exporting key material for: $KEY"
+gpg --armor --export "$KEY" > "$tmp/public.asc"
+gpg --armor --export-secret-keys "$KEY" > "$tmp/secret_full.asc"
+gpg --armor --export-secret-subkeys "$KEY" > "$tmp/secret_subkeys.asc"
+gpg --export-ownertrust > "$tmp/ownertrust.txt"
+gpg --armor --gen-revoke "$KEY" > "$tmp/revocation-cert.asc" || true
+gpg --list-secret-keys --with-fingerprint --with-subkey-fingerprint "$KEY" > "$tmp/fingerprints.txt"
+
+# --- package + encrypt symmetrically ---
+tar -C "$tmp" -czf - . \
+| gpg --symmetric --cipher-algo AES256 -o "$ARCHIVE"
+
+echo "✅ Encrypted backup written to:"
+echo "   $ARCHIVE"
+echo "Tip: keep an offline copy (e.g., encrypted USB)."

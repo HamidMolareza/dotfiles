@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ARCHIVE_IN="${1:-}"
+
+# Find a reasonable default if none provided
+auto_find_archive() {
+  local dir
+  for dir in "$HOME/Private" "$HOME"; do
+    [[ -d "$dir" ]] || continue
+    local latest
+    latest="$(ls -t "$dir"/gpg-backup-*.tgz.gpg 2>/dev/null | head -n1 || true)"
+    if [[ -n "$latest" ]]; then
+      printf '%s\n' "$latest"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ -z "$ARCHIVE_IN" ]]; then
+  if ! ARCHIVE_IN="$(auto_find_archive)"; then
+    echo "No archive path provided and no backups found in ~/Private or ~" >&2
+    echo "Usage: $0 </path/to/gpg-backup-YYYY-MM-DD.tgz.gpg>" >&2
+    exit 1
+  fi
+fi
+# If user passed a directory, use the newest backup in it
+if [[ -d "$ARCHIVE_IN" ]]; then
+  ARCHIVE_IN="$(ls -t "$ARCHIVE_IN"/gpg-backup-*.tgz.gpg 2>/dev/null | head -n1 || true)"
+  [[ -n "$ARCHIVE_IN" ]] || { echo "No backups found in directory." >&2; exit 1; }
+fi
+
+umask 077
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+echo "Decrypting: $ARCHIVE_IN"
+gpg --decrypt "$ARCHIVE_IN" | tar -xz -C "$tmp"
+
+echo
+printf "Import (F)ull secret or (S)ubkeys only? [F/s]: "
+read -r choice || true
+choice="${choice,,}"
+
+gpg --import "$tmp/public.asc" || true
+if [[ "$choice" == "s" ]]; then
+  gpg --import "$tmp/secret_subkeys.asc" || true
+else
+  gpg --import "$tmp/secret_full.asc" || true
+fi
+gpg --import-ownertrust "$tmp/ownertrust.txt" || true
+
+echo
+echo "=== Keys now present ==="
+gpg --list-secret-keys --with-fingerprint --with-subkey-fingerprint
+echo
+echo "If your model keeps the primary offline, run 'gpg --edit-key <FPR>' then 'keytocard' to move subkeys back to your token."

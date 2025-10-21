@@ -27,5 +27,6 @@ add_to_path_if_missing "$SRC_DIR/gh"
 add_to_path_if_missing "$SRC_DIR/backups"
 add_to_path_if_missing "$SRC_DIR/ssh"
 add_to_path_if_missing "$SRC_DIR/icons"
+add_to_path_if_missing "$SRC_DIR/gpg"
 
 export PATH
