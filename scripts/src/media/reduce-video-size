@@ -1,46 +1,114 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Check if the correct number of arguments is provided
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-    echo "Usage: $(basename "$0") <input_file> <compression_level (h/m/l)> [output_file]"
-    exit 1
+# -------------------------------------------------------------------
+# Usage: script <input_file> <compression_level: h|m|l> [output_file]
+# Levels:
+#   l = low compression  (best quality, modest size drop)
+#   m = medium           (good balance; slight downscale)
+#   h = high             (smaller file; noticeable downscale)
+#
+# Notes:
+# - Requires: ffmpeg (and ffprobe optional).
+# - Adds +faststart for better web playback.
+# - Ensures even dimensions and yuv420p for compatibility.
+# - Won't overwrite existing files; auto-increments name if needed.
+# -------------------------------------------------------------------
+
+# ---- helpers -------------------------------------------------------
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not found."; }
+
+unique_path() {
+  # yields a non-clobbering output path if the proposed one exists
+  local path="$1"
+  local dir base ext n
+  dir=$(dirname -- "$path")
+  base=$(basename -- "$path")
+  ext="${base##*.}"
+  base="${base%.*}"
+  n=1
+  while [[ -e "$dir/$base.$ext" ]]; do
+    base="${base%_*}_$n"
+    ((n++))
+  done
+  printf '%s/%s.%s' "$dir" "$base" "$ext"
+}
+
+# ---- args ----------------------------------------------------------
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "Usage: $(basename "$0") <input_file> <compression_level (h/m/l)> [output_file]"
+  exit 1
 fi
 
-input_file="$1"
-compression_level="$2"
-output_file="$3"
+input_file=$1
+compression_level=$2
+output_file=${3-}
 
-# Get the current date in YYYY-MM-DD format
+# ---- preflight -----------------------------------------------------
+
+need ffmpeg
+[[ -r "$input_file" ]] || die "Cannot read input file: $input_file"
+
 current_date=$(date +%F)
 
-# Extract the filename without the extension and the file extension
-filename=$(basename "$input_file")
+filename=$(basename -- "$input_file")
 extension="${filename##*.}"
-basename="${filename%.*}"
+base="${filename%.*}"
 
-# If the output_file is not provided, use the default format
-if [ -z "$output_file" ]; then
-    output_file="${basename}_smaller_${current_date}.${extension}"
+# default output name if not supplied
+if [[ -z "${output_file}" ]]; then
+  output_file="${base}_smaller_${current_date}.${extension}"
 fi
 
-# Set ffmpeg compression options based on the compression level
+# ensure we don't overwrite
+output_file=$(unique_path "$output_file")
+
+# ---- presets -------------------------------------------------------
+# All modes:
+# - Use H.264 (libx264)
+# - yuv420p for broad device compatibility
+# - +faststart to move moov atom front (streaming-friendly)
+# - copy audio (no quality loss, quick). If you want extra savings,
+#   you can replace "-c:a copy" with "-c:a aac -b:a 128k".
+common="-c:v libx264 -pix_fmt yuv420p -movflags +faststart -c:a copy"
+
+# Scaling helpers (always return even dimensions)
+#   FACTOR is a float like 0.85 or 0.70
+scale_by() {
+  local factor="$1"
+  echo "scale=floor(iw*${factor}/2)*2:floor(ih*${factor}/2)*2:flags=lanczos"
+}
+
 case "$compression_level" in
-    h)  # High compression (smaller size, lower quality, reduces resolution significantly)
-        ffmpeg_options="-vcodec libx264 -crf 36 -preset veryslow -vf scale='floor(iw/2)*2:floor(ih/2)*2'"
-        ;;
-    m)  # Medium compression (balance between size and quality, slight resolution reduction)
-        ffmpeg_options="-vcodec libx264 -crf 28 -preset medium -vf scale='floor(iw*0.75/2)*2:floor(ih*0.75/2)*2'"
-        ;;
-    l)  # Low compression (better quality, larger size, maintain original resolution)
-        ffmpeg_options="-vcodec libx264 -crf 22 -preset faster"
-        ;;
-    *)  # Invalid option
-        echo "Invalid compression level: choose h (high), m (medium), or l (low)"
-        exit 1
-        ;;
+  l)  # Low compression (keep resolution, gentle CRF)
+      # Good default for "make it a bit smaller without seeing it"
+      ffmpeg_opts="-crf 23 -preset slow"
+      vf=""  # no scaling
+      ;;
+
+  m)  # Medium compression (slight downscale + higher CRF)
+      ffmpeg_opts="-crf 26 -preset slow"
+      vf="-vf $(scale_by 0.85)"
+      ;;
+
+  h)  # High compression (noticeable downscale + stronger CRF)
+      # (FIX) your original 'floor(iw/2)*2' didn't actually halve size; it only rounded to even.
+      ffmpeg_opts="-crf 30 -preset veryslow"
+      vf="-vf $(scale_by 0.70)"
+      ;;
+
+  *)
+      die "Invalid compression level: choose h (high), m (medium), or l (low)"
+      ;;
 esac
 
-# Run ffmpeg to compress the video
-ffmpeg -i "$input_file" $ffmpeg_options "$output_file"
+# ---- run -----------------------------------------------------------
 
-echo "Video compressed successfully! Output file: $output_file"
+# -stats for progress; -hide_banner for cleaner logs; warnings only
+ffmpeg -hide_banner -v warning -stats -i "$input_file" $common $vf $ffmpeg_opts "$output_file"
+
+echo "✅ Done: $output_file"
