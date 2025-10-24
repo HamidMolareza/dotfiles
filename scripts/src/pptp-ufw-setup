@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# pptp-ufw-setup.sh — Configure UFW for PPTP on Ubuntu 24.04
+# - Opens TCP 1723 and GRE
+# - Enables IP forwarding
+# - Adds NAT (MASQUERADE) on WAN interface
+# - Attaches PPTP conntrack helper in raw table
+# - Persists across reboots
+set -euo pipefail
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "Please run as root (sudo $0)" >&2
+    exit 1
+  fi
+}
+
+detect_wan() {
+  local guessed
+  guessed="$(ip -4 route list default 2>/dev/null | awk '{print $5}' | head -n1 || true)"
+  WAN_IF="${WAN_IF:-$guessed}"
+  if [[ -z "${WAN_IF:-}" ]]; then
+    echo "Could not auto-detect WAN interface. Set WAN_IF=eth0 (or your iface) and re-run." >&2
+    exit 1
+  fi
+}
+
+ensure_pkg() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y ufw
+  fi
+}
+
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "$f.bak-$(date +%F-%H%M%S)"
+  fi
+}
+
+enable_kernel_bits() {
+  # Load modules now
+  modprobe ip_gre || true
+  modprobe nf_conntrack_pptp || true
+  modprobe nf_nat_pptp || true
+
+  # Persist module loading at boot
+  cat >/etc/modules-load.d/pptp.conf <<'EOF'
+ip_gre
+nf_conntrack_pptp
+nf_nat_pptp
+EOF
+
+  # Persist sysctls + apply now
+  cat >/etc/sysctl.d/99-pptp.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.netfilter.nf_conntrack_helper=1
+EOF
+  sysctl --system >/dev/null
+}
+
+ufw_allow_tcp_1723() {
+  # Allow PPTP control channel (TCP/1723)
+  ufw allow 1723/tcp >/dev/null || true
+}
+
+insert_gre_and_forward_rules() {
+  local f="/etc/ufw/before.rules"
+  backup_file "$f"
+  # Create file if missing (very rare)
+  touch "$f"
+
+  # Ensure GRE accept in INPUT
+  if ! grep -qE '^-A ufw-before-input -p gre -j ACCEPT$' "$f"; then
+    # Insert after "# End required lines" to stay within *filter table's custom area
+    awk '
+      {print}
+      /^# End required lines/ && !ins1 {print "-A ufw-before-input -p gre -j ACCEPT"; ins1=1}
+    ' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+  fi
+
+  # Ensure FORWARD rules for ppp+ <-> WAN
+  if ! grep -qE "^-A ufw-before-forward -i ppp\+ -o ${WAN_IF} -j ACCEPT$" "$f"; then
+    awk -v wan="${WAN_IF}" '
+      {print}
+      /^# End required lines/ && !ins2 {
+        print "-A ufw-before-forward -i ppp+ -o " wan " -j ACCEPT"
+        print "-A ufw-before-forward -i " wan " -o ppp+ -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        ins2=1
+      }
+    ' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+  fi
+}
+
+insert_nat_masquerade() {
+  local f="/etc/ufw/before.rules"
+  backup_file "$f"
+
+  # If *nat exists, add MASQUERADE before its COMMIT; else append a new *nat table.
+  if grep -q '^\*nat' "$f"; then
+    # Only add if not present
+    if ! grep -qE "^-A POSTROUTING -o ${WAN_IF} -j MASQUERADE$" "$f"; then
+      awk -v wan="${WAN_IF}" '
+        BEGIN{in_nat=0}
+        {
+          if ($0 ~ /^\*nat/) in_nat=1
+          if (in_nat && $0 ~ /^COMMIT/ && !added) { print " -A POSTROUTING -o " wan " -j MASQUERADE"; added=1 }
+          print
+          if (in_nat && $0 ~ /^COMMIT/) in_nat=0
+        }
+      ' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+    fi
+  else
+    cat >>"$f" <<EOF
+
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -o ${WAN_IF} -j MASQUERADE
+COMMIT
+EOF
+  fi
+}
+
+attach_pptp_helper_raw() {
+  local f="/etc/ufw/before.raw"
+  backup_file "$f"
+  if [[ ! -f "$f" ]]; then
+    cat >"$f" <<'EOF'
+*raw
+:ufw-before-prerouting - [0:0]
+-A ufw-before-prerouting -p tcp --dport 1723 -j CT --helper pptp
+COMMIT
+EOF
+  else
+    # Ensure there is a *raw table and our rule is present
+    if ! grep -q '^\*raw' "$f"; then
+      # Prepend a *raw block with our rule
+      tmp=$(mktemp)
+      cat >"$tmp" <<'EOF'
+*raw
+:ufw-before-prerouting - [0:0]
+-A ufw-before-prerouting -p tcp --dport 1723 -j CT --helper pptp
+COMMIT
+EOF
+      cat "$f" >>"$tmp"
+      mv "$tmp" "$f"
+    elif ! grep -qE '^-A ufw-before-prerouting -p tcp --dport 1723 -j CT --helper pptp$' "$f"; then
+      # Insert before COMMIT in raw table
+      awk '
+        BEGIN{in_raw=0}
+        {
+          if ($0 ~ /^\*raw/) in_raw=1
+          if (in_raw && $0 ~ /^COMMIT/ && !added) { print "-A ufw-before-prerouting -p tcp --dport 1723 -j CT --helper pptp"; added=1 }
+          print
+          if (in_raw && $0 ~ /^COMMIT/) in_raw=0
+        }
+      ' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+    fi
+  fi
+}
+
+enable_reload_ufw() {
+  # Enable UFW if inactive (non-interactive)
+  if ufw status | grep -qi inactive; then
+    ufw --force enable
+  fi
+  ufw reload
+}
+
+show_summary() {
+  echo
+  echo "=== PPTP/UFW setup summary ==="
+  echo "WAN interface: ${WAN_IF}"
+  echo "- TCP 1723 allowed (UFW)"
+  echo "- GRE allowed (UFW before.rules)"
+  echo "- NAT MASQUERADE on ${WAN_IF} (UFW before.rules)"
+  echo "- PPTP conntrack helper attached in raw table"
+  echo "- IP forwarding enabled (sysctl)"
+  echo
+  echo "Verify:"
+  echo "  ufw status verbose"
+  echo "  grep -E 'gre|ppp\\+|POSTROUTING' /etc/ufw/before.rules"
+  echo "  ss -tnlp | grep ':1723'    # your pptp server should be listening"
+}
+
+main() {
+  require_root
+  detect_wan
+  ensure_pkg
+  enable_kernel_bits
+  ufw_allow_tcp_1723
+  insert_gre_and_forward_rules
+  insert_nat_masquerade
+  attach_pptp_helper_raw
+  enable_reload_ufw
+  show_summary
+}
+
+main "$@"
