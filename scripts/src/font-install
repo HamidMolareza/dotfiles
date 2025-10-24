@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+show_help() {
+  cat <<EOF
+Install a font file or a folder of fonts (Linux/macOS).
+
+Usage:
+  $(basename "$0") [--system] <FILE|DIR>
+
+Options:
+  --system   Install system-wide (requires permission/sudo).
+  -h, --help Show this help.
+
+Supported font extensions: .ttf .otf .ttc .otc
+EOF
+}
+
+SCOPE="user"
+SRC=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --system) SCOPE="system"; shift ;;
+    -h|--help) show_help; exit 0 ;;
+    *) SRC="$1"; shift ;;
+  esac
+done
+
+[[ -n "${SRC:-}" ]] || { echo "Error: missing FILE or DIR."; show_help; exit 1; }
+[[ -e "$SRC" ]] || { echo "Error: '$SRC' not found."; exit 1; }
+
+OS="$(uname -s)"
+case "$OS" in
+  Darwin)
+    if [[ "$SCOPE" == "system" ]]; then DEST="/Library/Fonts"; else DEST="$HOME/Library/Fonts"; fi
+    update_cache() { :; } # macOS usually auto-detects; apps may need restart
+    ;;
+  Linux)
+    if [[ "$SCOPE" == "system" ]]; then
+      DEST="/usr/local/share/fonts"
+    else
+      # Respect XDG_DATA_HOME if set; otherwise ~/.local/share/fonts
+      DEST="${XDG_DATA_HOME:-$HOME/.local/share}/fonts"
+    fi
+    update_cache() {
+      if command -v fc-cache >/dev/null 2>&1; then
+        # full refresh helps with stale caches/sandbox quirks
+        fc-cache -f >/dev/null || true
+      else
+        echo "Note: fc-cache not found; skipping font cache refresh."
+      fi
+    }
+    ;;
+  *)
+    echo "Unsupported OS: $OS"
+    exit 1
+    ;;
+esac
+
+ensure_dest() {
+  if [[ -d "$DEST" && -w "$DEST" ]]; then return; fi
+  if [[ "$SCOPE" == "system" ]]; then
+    if [[ -d "$DEST" ]]; then
+      sudo mkdir -p "$DEST" 2>/dev/null || true
+      sudo chmod u+w "$DEST" 2>/dev/null || true
+    else
+      sudo mkdir -p "$DEST"
+    fi
+  else
+    mkdir -p "$DEST"
+  fi
+}
+
+copy_one() {
+  local f="$1"
+  local base dst="$DEST/$(basename "$f")"
+  if [[ "$SCOPE" == "system" ]]; then
+    if [[ -w "$DEST" ]]; then cp -f "$f" "$dst"; else sudo cp -f "$f" "$dst"; fi
+    # ensure world-readable perms for system fonts
+    if [[ -w "$DEST" ]]; then chmod 0644 "$dst" || true; else sudo chmod 0644 "$dst" || true; fi
+  else
+    cp -f "$f" "$dst"
+    chmod 0644 "$dst" || true
+  fi
+}
+
+is_font_file() {
+  case "${1,,}" in
+    *.ttf|*.otf|*.ttc|*.otc) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+main() {
+  ensure_dest
+
+  # For user installs on Linux, add a legacy ~/.fonts symlink (helps some setups)
+  if [[ "$OS" == "Linux" && "$SCOPE" == "user" ]]; then
+    LEGACY="$HOME/.fonts"
+    if [[ ! -e "$LEGACY" ]]; then ln -s "$DEST" "$LEGACY" 2>/dev/null || true; fi
+  fi
+
+  mapfile -t files < <(
+    if [[ -d "$SRC" ]]; then
+      find "$SRC" -type f \( -iname "*.ttf" -o -iname "*.otf" -o -iname "*.ttc" -o -iname "*.otc" \)
+    else
+      if is_font_file "$SRC"; then printf '%s\n' "$SRC"; fi
+    fi
+  )
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "No font files found in '$SRC'. Supported: .ttf .otf .ttc .otc"
+    exit 1
+  fi
+
+  echo "Installing ${#files[@]} font(s) to: $DEST"
+  for f in "${files[@]}"; do
+    echo "  -> $(basename "$f")"
+    copy_one "$f"
+  done
+
+  update_cache
+
+  if command -v fc-list >/dev/null 2>&1; then
+    echo "Font count in '$DEST': $(fc-list | grep -ci "$(printf '%q' "$DEST")" || true)"
+  fi
+
+  echo "Done."
+  if [[ "$OS" == "Darwin" ]]; then
+    echo "Tip (macOS): apps may need a restart to see new fonts."
+  else
+    echo "Tip: if an app still doesn't see the fonts, try a system-wide install: sudo $(basename "$0") --system \"$SRC\""
+  fi
+}
+
+main
