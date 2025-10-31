@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: convert-to-gif [options] <input> [output]
+
+Options:
+  --fps <n>     Frames per second (default: 12)
+  --width <px>  Scale width in pixels; height keeps aspect ratio (default: 480)
+  --help        Show this help message
+
+Examples:
+  convert-to-gif clip.mov
+  convert-to-gif --fps 10 --width 640 clip.mov fun.gif
+EOF
+}
+
+need_tool() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Error: required tool '$1' not found in PATH." >&2
+    exit 1
+  fi
+}
+
+fps=12
+width=480
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fps)
+      [[ $# -ge 2 ]] || { echo "Error: --fps requires a value." >&2; exit 1; }
+      fps="$2"
+      shift 2
+      ;;
+    --width)
+      [[ $# -ge 2 ]] || { echo "Error: --width requires a value." >&2; exit 1; }
+      width="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Error: unknown option '$1'." >&2
+      usage
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[[ $# -ge 1 ]] || { usage >&2; exit 1; }
+
+input=$1
+output=${2:-}
+
+[[ -f "$input" ]] || { echo "Error: input file '$input' not found." >&2; exit 1; }
+
+if [[ -z "$output" ]]; then
+  basename=${input##*/}
+  without_ext=${basename%.*}
+  output="${without_ext}.gif"
+fi
+
+palette=$(mktemp "${TMPDIR:-/tmp}/palette.XXXXXX.png")
+cleanup() {
+  rm -f "$palette"
+}
+trap cleanup EXIT
+
+need_tool ffmpeg
+
+# Separate palette step keeps colors accurate in the final GIF.
+ffmpeg -v error -y -i "$input" -vf "fps=${fps},scale=${width}:-1:flags=lanczos,palettegen" "$palette"
+ffmpeg -v error -y -i "$input" -i "$palette" -lavfi "fps=${fps},scale=${width}:-1:flags=lanczos[p];[p][1:v]paletteuse" "$output"
+
+echo "GIF created at: $output"
