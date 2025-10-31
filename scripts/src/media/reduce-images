@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# shrink-images.sh — batch-reduce images with ImageMagick
+# Requires: ImageMagick (magick or convert/identify)
+# Supports input types: JPG/JPEG, PNG, WEBP, HEIC, TIFF (others that IM reads usually work too)
+
+set -euo pipefail
+
+MAX_DIM=1920          # max width/height in pixels
+QUALITY=82            # JPEG quality (1-100). ~82 is a good balance
+OUT_DIR="reduced"     # output base dir
+KEEP_EXIF=0           # 1 to keep metadata
+TO_JPG=0              # 1 to force output as .jpg
+TARGET_SIZE=""        # e.g. 500kb (uses -define jpeg:extent=)
+declare -a PATHS=()
+
+usage() {
+  cat <<EOF
+Usage: $0 [options] <files-or-directories...>
+
+Options:
+  -w, --max <px>        Max width/height (default: ${MAX_DIM})
+  -q, --quality <n>     JPEG quality 1-100 (default: ${QUALITY})
+  -o, --out <dir>       Output directory root (default: ${OUT_DIR})
+      --keep-exif       Keep metadata (default: strip)
+      --to-jpg          Convert all outputs to JPEG
+      --size <extent>   Target max JPEG size, e.g. 500kb or 1MB (uses jpeg:extent)
+  -h, --help            Show this help
+
+Examples:
+  $0 photos/                             # reduce all images under photos/ to 1920px, quality 82
+  $0 -w 1280 -q 75 images/               # smaller dimensions + stronger compression
+  $0 --to-jpg --size 500kb album/        # convert to JPEG and try to cap each file to ~500KB
+  $0 img1.png img2.heic -o out/          # specific files
+
+Notes:
+- Requires ImageMagick. Install: macOS: 'brew install imagemagick' | Ubuntu: 'sudo apt-get install imagemagick'
+- HEIC support needs ImageMagick built with HEIF/HEIC codecs.
+EOF
+}
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--max)      MAX_DIM="$2"; shift 2 ;;
+    -q|--quality)  QUALITY="$2"; shift 2 ;;
+    -o|--out)      OUT_DIR="$2"; shift 2 ;;
+    --keep-exif)   KEEP_EXIF=1; shift ;;
+    --to-jpg)      TO_JPG=1; shift ;;
+    --size)        TARGET_SIZE="$2"; shift 2 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    *)             PATHS+=("$1"); shift ;;
+  esac
+done
+
+# Default to current directory if none provided
+if [[ ${#PATHS[@]} -eq 0 ]]; then
+  PATHS=(".")
+fi
+
+# --- Detect ImageMagick ---
+if command -v magick >/dev/null 2>&1; then
+  IDENTIFY="magick identify"
+  CONVERT="magick convert"
+elif command -v identify >/dev/null 2>&1 && command -v convert >/dev/null 2>&1; then
+  IDENTIFY="identify"
+  CONVERT="convert"
+else
+  echo "Error: ImageMagick not found. Install it and try again." >&2
+  exit 1
+fi
+
+# --- Helpers ---
+is_image() {
+  # returns 0 if ImageMagick can identify it
+  $IDENTIFY -quiet -format "%m" "$1" >/dev/null 2>&1
+}
+
+process_one() {
+  local src="$1" base="$2"
+
+  # Skip non-images safely
+  if ! is_image "$src"; then
+    echo "Skipping (not an image): $src"
+    return 0
+  fi
+
+  # Relative path under base; place into OUT_DIR keeping structure
+  local rel="${src#$base/}"
+  [[ "$rel" == "$src" ]] && rel="$(basename "$src")"
+  local dest_dir
+  dest_dir="${OUT_DIR}/$(dirname "$rel")"
+  mkdir -p "$dest_dir"
+
+  # Determine output path and format
+  local dest="$dest_dir/$(basename "$rel")"
+  if (( TO_JPG )); then
+    dest="${dest%.*}.jpg"
+  fi
+
+  # Build conversion args
+  local strip_args=()
+  (( KEEP_EXIF == 0 )) && strip_args=(-strip)
+
+  local resize_arg=("-resize" "${MAX_DIM}x${MAX_DIM}>")   # '>' prevents upscaling
+  local quality_arg=("-quality" "${QUALITY}")
+  local size_arg=()
+  [[ -n "$TARGET_SIZE" ]] && size_arg=("-define" "jpeg:extent=${TARGET_SIZE}")
+
+  # If converting to JPEG, flatten transparency to white & ensure sRGB
+  local alpha_args=()
+  if (( TO_JPG )); then
+    alpha_args=(-background "white" -alpha remove -alpha off -colorspace sRGB)
+  fi
+
+  # Extra PNG compression when keeping PNG
+  local png_defs=()
+  if (( TO_JPG == 0 )) && [[ "${src,,}" =~ \.png$ ]]; then
+    png_defs=(-define png:compression-level=9 -define png:compression-strategy=1)
+  fi
+
+  # Perform conversion
+  # -auto-orient respects EXIF orientation before (optionally) stripping metadata
+  if $CONVERT "$src" -auto-orient "${strip_args[@]}" "${resize_arg[@]}" "${alpha_args[@]}" \
+      "${png_defs[@]}" "${size_arg[@]}" "${quality_arg[@]}" "$dest"; then
+    echo "✓ $src -> $dest"
+  else
+    echo "✗ Failed: $src" >&2
+  fi
+}
+
+# --- Walk inputs ---
+shopt -s nullglob
+total=0
+for p in "${PATHS[@]}"; do
+  if [[ -d "$p" ]]; then
+    # Common image extensions (case-insensitive). ImageMagick can handle more; this keeps find fast.
+    while IFS= read -r -d '' f; do
+      process_one "$f" "$p"
+      ((total++))
+    done < <(find "$p" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.heic" -o -iname "*.tif" -o -iname "*.tiff" \) -print0)
+  elif [[ -f "$p" ]]; then
+    process_one "$p" "$(dirname "$p")"
+    ((total++))
+  else
+    echo "Warning: not found: $p" >&2
+  fi
+done
+echo "Done. Processed ${total} file(s). Output in: ${OUT_DIR}"
+
