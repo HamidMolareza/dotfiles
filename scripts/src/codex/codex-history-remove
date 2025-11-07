@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CODEX_DIR="${CODEX_DIR:-"$HOME/.codex"}"
+AUTH_FILE="${CODEX_AUTH_FILE:-"$CODEX_DIR/auth.json"}"
+
+if [ ! -d "$CODEX_DIR" ]; then
+    echo "Codex data directory not found: $CODEX_DIR" >&2
+    exit 1
+fi
+
+if [ ! -f "$AUTH_FILE" ]; then
+    echo "Warning: auth data not found at $AUTH_FILE; nothing to preserve." >&2
+fi
+
+echo "This will remove Codex history data under $CODEX_DIR but keep auth stored at $AUTH_FILE."
+read -r -p "Proceed? [y/N]: " confirm
+case "${confirm:-}" in
+    [yY]|[yY][eE][sS]) ;;
+    *)
+        echo "Aborted by user."
+        exit 0
+        ;;
+esac
+
+history_targets=(
+    "$CODEX_DIR/history.jsonl"
+    "$CODEX_DIR/history.json"
+    "$CODEX_DIR/sessions"
+    "$CODEX_DIR/archived_sessions"
+    "$CODEX_DIR/log"
+    "$CODEX_DIR/logs"
+)
+
+removed_any=0
+for target in "${history_targets[@]}"; do
+    if [ -e "$target" ]; then
+        rm -rf "$target"
+        echo "Removed: $target"
+        removed_any=1
+    fi
+done
+
+if [ $removed_any -eq 0 ]; then
+    echo "No Codex history artifacts found to remove."
+else
+    : > "$CODEX_DIR/history.jsonl"
+    echo "Codex history cleared. Auth data at $AUTH_FILE left untouched."
+fi
