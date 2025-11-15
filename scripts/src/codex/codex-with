@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-with <AGENTS.md|profile-dir> [project-dir] [-- codex-args...]
+
+Temporarily symlinks the provided AGENTS.md into the target project directory,
+runs codex there, then removes the symlink on exit.
+
+Examples:
+  codex-with ~/profiles/memory/AGENTS.md
+  codex-with ~/profiles/memory ~/my/project
+  codex-with ~/profiles/memory/AGENTS.md . -- -v
+
+Notes:
+- If the target directory already has AGENTS.md, it is left as-is.
+- Set CODEX_BIN to override the codex binary (default: codex).
+EOF
+}
+
+if [[ ${1-} == "-h" || ${1-} == "--help" || $# -lt 1 ]]; then
+  usage
+  exit 0
+fi
+
+AGENTS_INPUT=$1; shift || true
+
+# Optional project directory (defaults to current dir)
+TARGET_DIR="${1-}"
+if [[ -n "${TARGET_DIR}" && "${TARGET_DIR}" != "--" ]]; then
+  shift || true
+else
+  TARGET_DIR="."
+fi
+
+# Remaining args (optionally after --) are passed to codex
+CODEX_ARGS=()
+if [[ ${1-} == "--" ]]; then
+  shift
+  CODEX_ARGS=("$@")
+else
+  CODEX_ARGS=("$@")
+fi
+
+# Resolve AGENTS.md path (allow directory containing AGENTS.md)
+AGENTS_PATH="$AGENTS_INPUT"
+if [[ -d "$AGENTS_INPUT" ]]; then
+  if [[ -f "$AGENTS_INPUT/AGENTS.md" ]]; then
+    AGENTS_PATH="$AGENTS_INPUT/AGENTS.md"
+  else
+    echo "Error: Directory '$AGENTS_INPUT' does not contain AGENTS.md" >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -f "$AGENTS_PATH" ]]; then
+  echo "Error: AGENTS.md not found at '$AGENTS_PATH'" >&2
+  exit 1
+fi
+
+# Canonicalize AGENTS.md to an absolute path for a robust symlink
+AGENTS_ABS=""
+if command -v realpath >/dev/null 2>&1; then
+  AGENTS_ABS="$(realpath "$AGENTS_PATH")"
+elif command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+  AGENTS_ABS="$(readlink -f "$AGENTS_PATH")"
+else
+  # Fallback manual absolute path resolution
+  case "$AGENTS_PATH" in
+    /*) AGENTS_ABS="$AGENTS_PATH" ;;
+    *) AGENTS_ABS="$(cd "$(dirname "$AGENTS_PATH")" && pwd)/$(basename "$AGENTS_PATH")" ;;
+  esac
+fi
+
+# Validate target directory
+if [[ ! -d "$TARGET_DIR" ]]; then
+  echo "Error: Target directory '$TARGET_DIR' does not exist" >&2
+  exit 1
+fi
+
+CODEX_BIN="${CODEX_BIN:-codex}"
+if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
+  echo "Error: '$CODEX_BIN' not found in PATH. Set CODEX_BIN to override." >&2
+  exit 1
+fi
+
+(
+  set -euo pipefail
+  cd "$TARGET_DIR"
+
+  created_symlink=""
+  cleanup() {
+    if [[ -n "$created_symlink" && -L "AGENTS.md" ]]; then
+      rm -f "AGENTS.md"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if [[ -e "AGENTS.md" ]]; then
+    # Respect existing AGENTS.md
+    "$CODEX_BIN" "${CODEX_ARGS[@]}"
+  else
+    ln -s "$AGENTS_ABS" "AGENTS.md"
+    created_symlink=1
+    "$CODEX_BIN" "${CODEX_ARGS[@]}"
+  fi
+)
+
