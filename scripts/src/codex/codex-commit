@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""
+codex-commit: Generate a Conventional Commit message for git changes.
+
+Examples:
+  codex-commit | clipboard
+  codex-commit file1 file2 file3 | clipboard
+  codex-commit *.md | clipboard
+  codex-commit --staged src/foo.py | clipboard
+  codex-commit --worktree docs/ | clipboard
+
+STDOUT: commit message only
+STDERR: errors (and optional verbose progress)
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import tempfile
+from pathlib import Path
+from typing import Iterable
+
+
+INSTRUCTION = r"""
+Conventional Commits style
+<type>(<scope>): <subject>
+
+<body>
+
+<breaking-changes-section>
+
+<footer>
+
+1. Type
+
+Choose exactly one <type> from this list, based on what changed:
+
+* feat  – new user-facing feature or behavior
+* fix   – bug fix
+* docs  – documentation only
+* style – formatting only; no logic changes (whitespace, commas, etc.)
+* refactor – code change that neither fixes a bug nor adds a feature (restructure, cleanup)
+* perf  – performance improvement
+* test  – test-only changes (add or update tests)
+* build – build system, tooling, dependencies
+* ci    – CI config or scripts
+* chore – maintenance, minor tasks that do not affect src/test behavior (e.g. bumps, renames)
+* revert – reverts a previous commit
+
+Pick the most appropriate one based on the actual code diff.
+
+2. Scope
+
+<scope> describes the main area affected (for example: api, auth, login, ui, config, deps).
+
+Derive the scope from file paths, modules, or the main feature touched.
+
+Use a short, lowercase identifier with no spaces.
+
+If a clear scope is not obvious, omit the parentheses and just use:
+
+<type>: <subject>
+
+Examples:
+feat(auth): add token refresh endpoint
+fix: handle null user id in session
+
+3. Subject
+
+The <subject> is a short, imperative description of the main change.
+
+Rules for the subject:
+
+* Use present tense: “add”, “fix”, “update”, “remove” (not “added”, “fixed”, “adding”).
+* Keep it concise but meaningful (around 72 characters or less).
+* Do not end with a period.
+
+4. Body
+
+The body is optional, but recommended for non-trivial changes.
+
+Use one or more short paragraphs or bullet points that:
+
+* Explain the reason for the change.
+* Summarize the main technical changes.
+* Mention any important side effects or follow-ups.
+
+Wrap lines at roughly 72 characters where reasonable.
+
+5. Breaking changes
+
+If the diff introduces a breaking change, add:
+
+BREAKING CHANGE: <clear description of what broke and how to migrate>
+
+Only include this section when there is an actual breaking change.
+
+6. Footer (optional)
+
+Use the footer for metadata such as issue references, links, or co-authors.
+
+Metadata information may be on the branch name. For example:
+- feature/123-auth-token
+- fix/456-null-pointer
+- AuthorName/234-some-description
+
+Only include a footer if it is relevant. Otherwise omit it.
+
+7. Output format
+
+* Output only the commit message text, ready to paste into “git commit”.
+* Do not add explanations, comments, extra text, or code fences.
+""".strip()
+
+
+def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def git(repo_root: str, args: list[str]) -> tuple[str, int]:
+    p = run(["git", *args], cwd=repo_root, check=False)
+    return p.stdout, p.returncode
+
+
+def find_codex_bin() -> str:
+    # Prefer CODEX_BIN if set; otherwise try codex then codex1 (some installs alias).
+    env = os.environ.get("CODEX_BIN")
+    if env and shutil.which(env):
+        return env
+    for cand in ("codex", "codex1"):
+        if shutil.which(cand):
+            return cand
+    raise FileNotFoundError("Could not find Codex CLI. Install it and ensure `codex` is on PATH.")
+
+
+def expand_file_args(raw_args: list[str]) -> list[str]:
+    """Expand quoted globs ourselves; if shell already expanded, this is harmless."""
+    out: list[str] = []
+    for a in raw_args:
+        # If it looks like a glob and doesn't exist literally, try expanding.
+        if any(ch in a for ch in "*?[]") and not Path(a).exists():
+            matches = glob.glob(a, recursive=True)
+            if matches:
+                out.extend(matches)
+            else:
+                out.append(a)
+        else:
+            out.append(a)
+    return out
+
+
+def to_repo_rel(repo_root: Path, p: str) -> str:
+    """Convert a path (file/dir) to repo-relative POSIX path if possible; otherwise return as-is."""
+    path = Path(p)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    try:
+        rel = path.relative_to(repo_root.resolve())
+        return rel.as_posix()
+    except Exception:
+        return p  # likely a git pathspec/pattern
+
+
+def normalize_pathspecs(repo_root: Path, raw_files: list[str]) -> list[str]:
+    expanded = expand_file_args(raw_files)
+    specs = [to_repo_rel(repo_root, f) for f in expanded]
+    # drop empty strings
+    return [s for s in specs if s.strip()]
+
+
+def has_any_diff(repo_root: str, args: list[str]) -> bool:
+    # git diff --quiet returns 1 if differences, 0 if none
+    p = run(["git", *args], cwd=repo_root, check=False)
+    return p.returncode == 1
+
+
+def name_only(repo_root: str, args: list[str]) -> list[str]:
+    out, _ = git(repo_root, args)
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def filter_untracked(untracked: list[str], repo_root: Path, specs: list[str]) -> list[str]:
+    """Best-effort filter: include if untracked path matches any spec (file, dir, or glob)."""
+    if not specs:
+        return untracked
+
+    # Precompute "dir specs" (existing dirs) and "file specs" (existing files)
+    file_specs: set[str] = set()
+    dir_specs: set[str] = set()
+    glob_specs: list[str] = []
+
+    for s in specs:
+        # If it's a glob-like pattern, treat as such
+        if any(ch in s for ch in "*?[]"):
+            glob_specs.append(s)
+            continue
+
+        abs_p = (repo_root / s)
+        if abs_p.is_dir():
+            dir_specs.add(s.rstrip("/") + "/")
+        elif abs_p.is_file():
+            file_specs.add(s)
+        else:
+            # Unknown (could be pathspec); treat as glob-ish fallback
+            glob_specs.append(s)
+
+    kept: list[str] = []
+    for u in untracked:
+        if u in file_specs:
+            kept.append(u)
+            continue
+        if any(u.startswith(d) for d in dir_specs):
+            kept.append(u)
+            continue
+        # glob/pathspec-ish fallback
+        up = Path(u)
+        if any(up.match(g) for g in glob_specs):
+            kept.append(u)
+            continue
+    return kept
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("-v", "--verbose", action="store_true", help="Show script progress on stderr")
+    ap.add_argument("--staged", action="store_true", help="Use staged changes only")
+    ap.add_argument("--worktree", action="store_true", help="Use working-tree changes (incl. untracked)")
+    ap.add_argument("--model", default=None, help="Override Codex model (otherwise use CLI config)")
+    ap.add_argument(
+        "-c",
+        "--config",
+        action="append",
+        default=[],
+        help='Pass through Codex config overrides (repeatable), e.g. -c model_reasoning_effort="medium"',
+    )
+    ap.add_argument("--max-chars", type=int, default=200_000, help="Max characters of diff payload")
+    ap.add_argument("files", nargs="*", help="Optional file paths / globs to limit the diff")
+    args = ap.parse_args()
+
+    def progress(msg: str) -> None:
+        if args.verbose:
+            sys.stderr.write(f"[codex-commit] {msg}\n")
+            sys.stderr.flush()
+
+    if args.staged and args.worktree:
+        sys.stderr.write("Choose only one: --staged or --worktree\n")
+        return 2
+
+    # Repo root
+    p = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if p.returncode != 0:
+        sys.stderr.write("Not a git repository.\n")
+        return 2
+    repo_root = p.stdout.strip()
+    repo_root_p = Path(repo_root)
+
+    # Normalize file filters
+    specs = normalize_pathspecs(repo_root_p, args.files)
+
+    # Determine mode
+    if args.staged:
+        mode = "staged"
+    elif args.worktree:
+        mode = "worktree"
+    else:
+        # Auto: staged if selected files have staged changes; else worktree if selected files have worktree changes.
+        staged_name_args = ["diff", "--cached", "--name-only"]
+        worktree_name_args = ["diff", "--name-only"]
+        if specs:
+            staged_name_args += ["--", *specs]
+            worktree_name_args += ["--", *specs]
+
+        staged_files = name_only(repo_root, staged_name_args)
+        if staged_files:
+            mode = "staged"
+        else:
+            worktree_files = name_only(repo_root, worktree_name_args)
+            mode = "worktree" if worktree_files else "staged"  # fallback
+
+    progress(f"mode={mode} specs={specs or '(all)'}")
+
+    # Collect metadata
+    branch = (git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])[0].strip() or "HEAD")
+    status_text, _ = git(repo_root, ["status", "--porcelain=v1", "-b"])
+
+    # Collect diffs
+    base_diff_args = ["diff", "--no-ext-diff", "--patch", "--unified=3", "--no-color"]
+    base_stat_args = ["diff", "--stat", "--no-color"]
+
+    if mode == "staged":
+        diff_args = ["diff", "--cached", "--no-ext-diff", "--patch", "--unified=3", "--no-color"]
+        stat_args = ["diff", "--cached", "--stat", "--no-color"]
+    else:
+        diff_args = base_diff_args
+        stat_args = base_stat_args
+
+    if specs:
+        diff_args += ["--", *specs]
+        stat_args += ["--", *specs]
+
+    stat_text, _ = git(repo_root, stat_args)
+    diff_text, _ = git(repo_root, diff_args)
+
+    # Include untracked diffs (worktree mode only)
+    extra_untracked_diffs: list[str] = []
+    if mode == "worktree":
+        untracked_text, _ = git(repo_root, ["ls-files", "--others", "--exclude-standard"])
+        untracked = [ln.strip() for ln in untracked_text.splitlines() if ln.strip()]
+        untracked = filter_untracked(untracked, repo_root_p, specs)
+        for f in untracked:
+            path = repo_root_p / f
+            if not path.is_file():
+                continue
+            # show as a diff from /dev/null
+            d, _ = git(repo_root, ["diff", "--no-index", "--no-color", "--", "/dev/null", f])
+            if d.strip():
+                extra_untracked_diffs.append(d)
+
+    if not diff_text.strip() and not extra_untracked_diffs:
+        sys.stdout.write("chore: no changes\n")
+        return 0
+
+    # Prepare payload (truncate)
+    full_diff = diff_text.strip()
+    if extra_untracked_diffs:
+        full_diff = (full_diff + "\n\n" + "\n\n".join(extra_untracked_diffs)).strip()
+    full_diff += "\n"
+
+    if len(full_diff) > args.max_chars:
+        full_diff = full_diff[: args.max_chars] + "\n\n[...diff truncated...]\n"
+
+    payload = (
+        f"# branch: {branch}\n"
+        f"# mode: {mode}\n"
+        f"# files: {' '.join(specs) if specs else '(all)'}\n\n"
+        f"# git status (porcelain)\n{status_text}\n\n"
+        f"# git diff --stat\n{stat_text}\n\n"
+        f"# unified diff\n{full_diff}\n"
+    )
+
+    # Temp workspace inside repo so Codex can read it
+    codex_bin = ""
+    try:
+        codex_bin = find_codex_bin()
+    except FileNotFoundError as e:
+        sys.stderr.write(str(e) + "\n")
+        return 127
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "Commit message text ONLY (no code fences, no extra commentary).",
+            }
+        },
+        "required": ["message"],
+        "additionalProperties": False,
+    }
+
+    with tempfile.TemporaryDirectory(dir=repo_root, prefix=".codex-commit-") as td:
+        td_p = Path(td)
+        diff_path = td_p / "diff.txt"
+        schema_path = td_p / "schema.json"
+        diff_path.write_text(payload, encoding="utf-8", errors="replace")
+        schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+
+        prompt = textwrap.dedent(
+            f"""
+            You are generating a single Git commit message based STRICTLY on the provided diff file.
+            Do not invent changes not present.
+
+            Follow these instructions exactly:
+            {INSTRUCTION}
+
+            Output requirements (MANDATORY):
+            - Respond with valid JSON matching the schema file.
+            - JSON must be exactly: {{"message":"..."}}
+            - The "message" value must contain ONLY the commit message text.
+
+            Context:
+            - Branch: {branch}
+            - Mode: {mode}
+            - Files: {" ".join(specs) if specs else "(all)"}
+
+            Read this diff file from disk: {diff_path.relative_to(repo_root_p).as_posix()}
+            """
+        ).strip()
+
+        cmd = [codex_bin, "exec", "--sandbox", "read-only"]
+        if args.model:
+            cmd += ["--model", args.model]
+        for c in args.config:
+            cmd += ["-c", c]
+        cmd += ["--output-schema", str(schema_path), prompt]
+
+        progress("running codex exec…")
+        proc = run(cmd, cwd=repo_root, check=False)
+        if proc.returncode != 0:
+            # Keep stdout clean; errors go to stderr.
+            sys.stderr.write(proc.stderr or "")
+            if proc.stdout.strip():
+                sys.stderr.write(proc.stdout)
+            return proc.returncode
+
+        out = proc.stdout.strip()
+
+        # Defensive: strip accidental code fences
+        if out.startswith("```"):
+            out = out.strip().strip("`").strip()
+
+        try:
+            obj = json.loads(out)
+        except json.JSONDecodeError:
+            # If something goes wrong, surface it to stderr (keep stdout clean)
+            sys.stderr.write("Codex did not return valid JSON.\n")
+            sys.stderr.write(out + "\n")
+            return 3
+
+        msg = (obj.get("message") or "").rstrip("\n")
+        if not msg.strip():
+            sys.stderr.write("Codex returned an empty message.\n")
+            return 3
+
+        sys.stdout.write(msg + "\n")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
