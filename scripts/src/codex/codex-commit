@@ -6,6 +6,7 @@ Examples:
   codex-commit | clipboard
   codex-commit file1 file2 file3 | clipboard
   codex-commit *.md | clipboard
+  codex-commit docs/ | clipboard
   codex-commit --staged src/foo.py | clipboard
   codex-commit --worktree docs/ | clipboard
 
@@ -25,7 +26,8 @@ import subprocess
 import sys
 import textwrap
 import tempfile
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 
@@ -39,86 +41,67 @@ Conventional Commits style
 
 <footer>
 
-1. Type
+Type must be exactly one of:
+feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
 
-Choose exactly one <type> from this list, based on what changed:
+Scope:
+- derive from file paths/modules if obvious (short, lowercase, no spaces)
+- otherwise omit scope entirely: "<type>: <subject>"
 
-* feat  – new user-facing feature or behavior
-* fix   – bug fix
-* docs  – documentation only
-* style – formatting only; no logic changes (whitespace, commas, etc.)
-* refactor – code change that neither fixes a bug nor adds a feature (restructure, cleanup)
-* perf  – performance improvement
-* test  – test-only changes (add or update tests)
-* build – build system, tooling, dependencies
-* ci    – CI config or scripts
-* chore – maintenance, minor tasks that do not affect src/test behavior (e.g. bumps, renames)
-* revert – reverts a previous commit
+Subject:
+- imperative mood ("add", "fix", "update", "remove")
+- <= 72 chars
+- no trailing period
 
-Pick the most appropriate one based on the actual code diff.
+Body:
+- only if non-trivial
+- use short bullets or short paragraphs
+- wrap ~72 chars where reasonable
 
-2. Scope
+Breaking changes:
+- include only if truly breaking
+- format exactly: "BREAKING CHANGE: ..."
 
-<scope> describes the main area affected (for example: api, auth, login, ui, config, deps).
+Footer:
+- include only if relevant
+- If branch name contains an issue number like "feature/123-..." or "fix/456-...",
+  add a footer like "Refs #123" (or "Closes #456" if clearly a fix).
 
-Derive the scope from file paths, modules, or the main feature touched.
-
-Use a short, lowercase identifier with no spaces.
-
-If a clear scope is not obvious, omit the parentheses and just use:
-
-<type>: <subject>
-
-Examples:
-feat(auth): add token refresh endpoint
-fix: handle null user id in session
-
-3. Subject
-
-The <subject> is a short, imperative description of the main change.
-
-Rules for the subject:
-
-* Use present tense: “add”, “fix”, “update”, “remove” (not “added”, “fixed”, “adding”).
-* Keep it concise but meaningful (around 72 characters or less).
-* Do not end with a period.
-
-4. Body
-
-The body is optional, but recommended for non-trivial changes.
-
-Use one or more short paragraphs or bullet points that:
-
-* Explain the reason for the change.
-* Summarize the main technical changes.
-* Mention any important side effects or follow-ups.
-
-Wrap lines at roughly 72 characters where reasonable.
-
-5. Breaking changes
-
-If the diff introduces a breaking change, add:
-
-BREAKING CHANGE: <clear description of what broke and how to migrate>
-
-Only include this section when there is an actual breaking change.
-
-6. Footer (optional)
-
-Use the footer for metadata such as issue references, links, or co-authors.
-
-Metadata information may be on the branch name. For example:
-- feature/123-auth-token
-- fix/456-null-pointer
-- AuthorName/234-some-description
-
-Only include a footer if it is relevant. Otherwise omit it.
-
-7. Output format
-
-* Output only the commit message text, ready to paste into “git commit”.
-* Do not add explanations, comments, extra text, or code fences.
+Output format:
+- Output only the commit message text, ready to paste into “git commit”.
+- Do not add explanations, comments, extra text, or code fences.
 """.strip()
+
+# Default "noise" excludes (can be disabled via --no-default-excludes)
+DEFAULT_EXCLUDE_GLOBS = [
+    "**/package-lock.json",
+    "**/yarn.lock",
+    "**/pnpm-lock.yaml",
+    "**/bun.lockb",
+]
+
+# Default "sensitive content" file globs: do not include patch content for these by default.
+DEFAULT_SENSITIVE_GLOBS = [
+    "**/.env",
+    "**/.env.*",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/id_rsa",
+    "**/id_rsa.*",
+    "**/id_ed25519",
+    "**/id_ed25519.*",
+]
+
+
+@dataclass(frozen=True)
+class FileChange:
+    path: str               # repo-relative posix path
+    kind: str               # "tracked" | "untracked"
+    added: int | None       # None for binary/unknown
+    deleted: int | None
+    score: int              # used to pick most informative patches first
 
 
 def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -138,7 +121,6 @@ def git(repo_root: str, args: list[str]) -> tuple[str, int]:
 
 
 def find_codex_bin() -> str:
-    # Prefer CODEX_BIN if set; otherwise try codex then codex1 (some installs alias).
     env = os.environ.get("CODEX_BIN")
     if env and shutil.which(env):
         return env
@@ -149,23 +131,19 @@ def find_codex_bin() -> str:
 
 
 def expand_file_args(raw_args: list[str]) -> list[str]:
-    """Expand quoted globs ourselves; if shell already expanded, this is harmless."""
+    """Expand globs ourselves (helps if user quotes globs); harmless if shell already expanded."""
     out: list[str] = []
     for a in raw_args:
-        # If it looks like a glob and doesn't exist literally, try expanding.
         if any(ch in a for ch in "*?[]") and not Path(a).exists():
             matches = glob.glob(a, recursive=True)
-            if matches:
-                out.extend(matches)
-            else:
-                out.append(a)
+            out.extend(matches if matches else [a])
         else:
             out.append(a)
     return out
 
 
 def to_repo_rel(repo_root: Path, p: str) -> str:
-    """Convert a path (file/dir) to repo-relative POSIX path if possible; otherwise return as-is."""
+    """Convert a path to repo-relative POSIX path when possible."""
     path = Path(p)
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
@@ -173,71 +151,133 @@ def to_repo_rel(repo_root: Path, p: str) -> str:
         rel = path.relative_to(repo_root.resolve())
         return rel.as_posix()
     except Exception:
-        return p  # likely a git pathspec/pattern
+        # If it's not a real filesystem path (e.g. git pathspec), keep as-is.
+        return p
 
 
 def normalize_pathspecs(repo_root: Path, raw_files: list[str]) -> list[str]:
     expanded = expand_file_args(raw_files)
     specs = [to_repo_rel(repo_root, f) for f in expanded]
-    # drop empty strings
     return [s for s in specs if s.strip()]
 
 
-def has_any_diff(repo_root: str, args: list[str]) -> bool:
-    # git diff --quiet returns 1 if differences, 0 if none
-    p = run(["git", *args], cwd=repo_root, check=False)
-    return p.returncode == 1
+def matches_any_glob(path_posix: str, globs_: Iterable[str]) -> bool:
+    p = PurePosixPath(path_posix)
+    for g in globs_:
+        try:
+            if p.match(g):
+                return True
+        except Exception:
+            # If a glob is weird, just ignore it.
+            continue
+    return False
 
 
-def name_only(repo_root: str, args: list[str]) -> list[str]:
+def filter_untracked_by_specs(repo_root: str, specs: list[str]) -> list[str]:
+    # Prefer git's pathspec filtering (works well for directories and files)
+    args = ["ls-files", "--others", "--exclude-standard"]
+    if specs:
+        args += ["--", *specs]
     out, _ = git(repo_root, args)
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
-def filter_untracked(untracked: list[str], repo_root: Path, specs: list[str]) -> list[str]:
-    """Best-effort filter: include if untracked path matches any spec (file, dir, or glob)."""
-    if not specs:
-        return untracked
-
-    # Precompute "dir specs" (existing dirs) and "file specs" (existing files)
-    file_specs: set[str] = set()
-    dir_specs: set[str] = set()
-    glob_specs: list[str] = []
-
-    for s in specs:
-        # If it's a glob-like pattern, treat as such
-        if any(ch in s for ch in "*?[]"):
-            glob_specs.append(s)
+def parse_numstat(numstat_text: str) -> dict[str, tuple[int | None, int | None]]:
+    """
+    Parse `git diff --numstat` output:
+      added<TAB>deleted<TAB>path
+    Binary files can show '-' for added/deleted.
+    """
+    m: dict[str, tuple[int | None, int | None]] = {}
+    for line in numstat_text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
             continue
+        a, d, path = parts[0], parts[1], parts[2]
+        added = int(a) if a.isdigit() else None
+        deleted = int(d) if d.isdigit() else None
+        m[path.strip()] = (added, deleted)
+    return m
 
-        abs_p = (repo_root / s)
-        if abs_p.is_dir():
-            dir_specs.add(s.rstrip("/") + "/")
-        elif abs_p.is_file():
-            file_specs.add(s)
-        else:
-            # Unknown (could be pathspec); treat as glob-ish fallback
-            glob_specs.append(s)
 
-    kept: list[str] = []
-    for u in untracked:
-        if u in file_specs:
-            kept.append(u)
-            continue
-        if any(u.startswith(d) for d in dir_specs):
-            kept.append(u)
-            continue
-        # glob/pathspec-ish fallback
-        up = Path(u)
-        if any(up.match(g) for g in glob_specs):
-            kept.append(u)
-            continue
-    return kept
+def has_staged_diff(repo_root: str, specs: list[str]) -> bool:
+    args = ["diff", "--cached", "--quiet"]
+    if specs:
+        args += ["--", *specs]
+    p = run(["git", *args], cwd=repo_root, check=False)
+    return p.returncode == 1
+
+
+def redact_secrets(text: str) -> str:
+    """
+    Best-effort redaction. This does not guarantee catching all secrets,
+    but it significantly reduces accidental leakage.
+    """
+    # Private key blocks
+    text = re.sub(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        "-----BEGIN PRIVATE KEY-----\n<REDACTED>\n-----END PRIVATE KEY-----",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Common tokens/keys
+    patterns = [
+        (r"\bAKIA[0-9A-Z]{16}\b", "<REDACTED_AWS_ACCESS_KEY_ID>"),
+        (r"\bASIA[0-9A-Z]{16}\b", "<REDACTED_AWS_TEMP_ACCESS_KEY_ID>"),
+        (r"\bAIza[0-9A-Za-z\-_]{35}\b", "<REDACTED_GOOGLE_API_KEY>"),
+        (r"\bghp_[A-Za-z0-9]{36}\b", "<REDACTED_GITHUB_TOKEN>"),
+        (r"\bgithub_pat_[A-Za-z0-9_]{50,}\b", "<REDACTED_GITHUB_PAT>"),
+        (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "<REDACTED_SLACK_TOKEN>"),
+        (r"\bsk_live_[A-Za-z0-9]{20,}\b", "<REDACTED_STRIPE_SECRET_KEY>"),
+        (r"\brk_live_[A-Za-z0-9]{20,}\b", "<REDACTED_STRIPE_RESTRICTED_KEY>"),
+    ]
+    for pat, repl in patterns:
+        text = re.sub(pat, repl, text)
+
+    # Redact env-style secrets: KEY=VALUE (only in added/removed lines to limit false positives)
+    text = re.sub(
+        r"(?m)^([+-]\s*)([A-Za-z_][A-Za-z0-9_]*(?:PASS|PASSWORD|SECRET|TOKEN|API_KEY|KEY)[A-Za-z0-9_]*)=(.+)$",
+        r"\1\2=<REDACTED>",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Redact JSON/YAML-ish "password": "value"
+    text = re.sub(
+        r'(?i)("?(?:password|passwd|secret|token|api[_-]?key)"?\s*[:=]\s*)(".*?"|\'.*?\'|\S+)',
+        r"\1<REDACTED>",
+        text,
+    )
+
+    # Redact Authorization: Bearer ...
+    text = re.sub(
+        r"(?i)(Authorization:\s*Bearer\s+)([A-Za-z0-9\-\._~\+/]+=*)",
+        r"\1<REDACTED>",
+        text,
+    )
+
+    return text
+
+
+def get_patch(repo_root: str, mode: str, path: str) -> str:
+    # -M -C for rename/copy detection
+    base = ["diff", "-M", "-C", "--no-ext-diff", "--patch", "--unified=3", "--no-color"]
+    if mode == "staged":
+        base.insert(1, "--cached")
+    base += ["--", path]
+    out, _ = git(repo_root, base)
+    return out
+
+
+def get_untracked_patch(repo_root: str, path: str) -> str:
+    out, _ = git(repo_root, ["diff", "--no-index", "--no-color", "--", "/dev/null", path])
+    return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("-v", "--verbose", action="store_true", help="Show script progress on stderr")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Show progress on stderr")
     ap.add_argument("--staged", action="store_true", help="Use staged changes only")
     ap.add_argument("--worktree", action="store_true", help="Use working-tree changes (incl. untracked)")
     ap.add_argument("--model", default=None, help="Override Codex model (otherwise use CLI config)")
@@ -248,8 +288,13 @@ def main() -> int:
         default=[],
         help='Pass through Codex config overrides (repeatable), e.g. -c model_reasoning_effort="medium"',
     )
-    ap.add_argument("--max-chars", type=int, default=200_000, help="Max characters of diff payload")
-    ap.add_argument("files", nargs="*", help="Optional file paths / globs to limit the diff")
+    ap.add_argument("--max-chars", type=int, default=200_000, help="Max characters sent to Codex")
+    ap.add_argument("--max-files", type=int, default=25, help="Max files to include full patches for")
+    ap.add_argument("--no-default-excludes", action="store_true", help="Do not exclude lockfiles by default")
+    ap.add_argument("--exclude", action="append", default=[], help="Additional exclude glob (repeatable)")
+    ap.add_argument("--no-redact", action="store_true", help="Disable secret redaction (not recommended)")
+    ap.add_argument("--no-sensitive-skip", action="store_true", help="Include patches for sensitive files too")
+    ap.add_argument("files", nargs="*", help="Optional file paths / globs / directories to limit the diff")
     args = ap.parse_args()
 
     def progress(msg: str) -> None:
@@ -269,92 +314,189 @@ def main() -> int:
     repo_root = p.stdout.strip()
     repo_root_p = Path(repo_root)
 
-    # Normalize file filters
     specs = normalize_pathspecs(repo_root_p, args.files)
 
-    # Determine mode
+    # Mode selection (auto): staged if there are staged changes for the selected specs; else worktree.
     if args.staged:
         mode = "staged"
     elif args.worktree:
         mode = "worktree"
     else:
-        # Auto: staged if selected files have staged changes; else worktree if selected files have worktree changes.
-        staged_name_args = ["diff", "--cached", "--name-only"]
-        worktree_name_args = ["diff", "--name-only"]
-        if specs:
-            staged_name_args += ["--", *specs]
-            worktree_name_args += ["--", *specs]
+        mode = "staged" if has_staged_diff(repo_root, specs) else "worktree"
 
-        staged_files = name_only(repo_root, staged_name_args)
-        if staged_files:
-            mode = "staged"
-        else:
-            worktree_files = name_only(repo_root, worktree_name_args)
-            mode = "worktree" if worktree_files else "staged"  # fallback
-
-    progress(f"mode={mode} specs={specs or '(all)'}")
-
-    # Collect metadata
+    # Branch + status
     branch = (git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])[0].strip() or "HEAD")
     status_text, _ = git(repo_root, ["status", "--porcelain=v1", "-b"])
 
-    # Collect diffs
-    base_diff_args = ["diff", "--no-ext-diff", "--patch", "--unified=3", "--no-color"]
-    base_stat_args = ["diff", "--stat", "--no-color"]
+    # Build exclude globs
+    exclude_globs: list[str] = []
+    if not args.no_default_excludes:
+        exclude_globs.extend(DEFAULT_EXCLUDE_GLOBS)
+    exclude_globs.extend(args.exclude)
 
+    sensitive_globs = [] if args.no_sensitive_skip else list(DEFAULT_SENSITIVE_GLOBS)
+
+    progress(f"mode={mode} specs={specs or '(all)'}")
+
+    # Tracked changed files
+    diff_base = ["diff", "-M", "-C", "--name-only"]
     if mode == "staged":
-        diff_args = ["diff", "--cached", "--no-ext-diff", "--patch", "--unified=3", "--no-color"]
-        stat_args = ["diff", "--cached", "--stat", "--no-color"]
-    else:
-        diff_args = base_diff_args
-        stat_args = base_stat_args
-
+        diff_base.insert(1, "--cached")
     if specs:
-        diff_args += ["--", *specs]
-        stat_args += ["--", *specs]
+        diff_base += ["--", *specs]
+    name_only, _ = git(repo_root, diff_base)
+    tracked_files_all = [ln.strip() for ln in name_only.splitlines() if ln.strip()]
 
-    stat_text, _ = git(repo_root, stat_args)
-    diff_text, _ = git(repo_root, diff_args)
+    # Numstat for ranking
+    numstat_args = ["diff", "-M", "-C", "--numstat"]
+    if mode == "staged":
+        numstat_args.insert(1, "--cached")
+    if specs:
+        numstat_args += ["--", *specs]
+    numstat_text, _ = git(repo_root, numstat_args)
+    num_map = parse_numstat(numstat_text)
 
-    # Include untracked diffs (worktree mode only)
-    extra_untracked_diffs: list[str] = []
+    # Untracked (worktree mode only)
+    untracked_files_all: list[str] = []
     if mode == "worktree":
-        untracked_text, _ = git(repo_root, ["ls-files", "--others", "--exclude-standard"])
-        untracked = [ln.strip() for ln in untracked_text.splitlines() if ln.strip()]
-        untracked = filter_untracked(untracked, repo_root_p, specs)
-        for f in untracked:
-            path = repo_root_p / f
-            if not path.is_file():
+        untracked_files_all = filter_untracked_by_specs(repo_root, specs)
+
+    # Classify excludes and sensitive
+    def classify(paths: list[str]) -> tuple[list[str], list[str], list[str]]:
+        kept, excluded, sensitive = [], [], []
+        for f in paths:
+            if sensitive_globs and matches_any_glob(f, sensitive_globs):
+                sensitive.append(f)
                 continue
-            # show as a diff from /dev/null
-            d, _ = git(repo_root, ["diff", "--no-index", "--no-color", "--", "/dev/null", f])
-            if d.strip():
-                extra_untracked_diffs.append(d)
+            if exclude_globs and matches_any_glob(f, exclude_globs):
+                excluded.append(f)
+                continue
+            kept.append(f)
+        return kept, excluded, sensitive
 
-    if not diff_text.strip() and not extra_untracked_diffs:
-        sys.stdout.write("chore: no changes\n")
-        return 0
+    tracked_kept, tracked_excluded, tracked_sensitive = classify(tracked_files_all)
+    untracked_kept, untracked_excluded, untracked_sensitive = classify(untracked_files_all)
 
-    # Prepare payload (truncate)
-    full_diff = diff_text.strip()
-    if extra_untracked_diffs:
-        full_diff = (full_diff + "\n\n" + "\n\n".join(extra_untracked_diffs)).strip()
-    full_diff += "\n"
+    # If nothing left but we excluded everything, still proceed with a minimal message context.
+    if not tracked_kept and not untracked_kept and not tracked_sensitive and not untracked_sensitive:
+        sys.stderr.write("codex-commit: no changes found (or everything excluded).\n")
+        return 1
 
-    if len(full_diff) > args.max_chars:
-        full_diff = full_diff[: args.max_chars] + "\n\n[...diff truncated...]\n"
+    # Build FileChange list for ranking
+    changes: list[FileChange] = []
+    for f in tracked_kept:
+        a, d = num_map.get(f, (None, None))
+        score = (a or 0) + (d or 0)
+        if score == 0:
+            # fallback: small positive score so it can still be included
+            score = 1
+        changes.append(FileChange(path=f, kind="tracked", added=a, deleted=d, score=score))
 
-    payload = (
-        f"# branch: {branch}\n"
-        f"# mode: {mode}\n"
-        f"# files: {' '.join(specs) if specs else '(all)'}\n\n"
-        f"# git status (porcelain)\n{status_text}\n\n"
-        f"# git diff --stat\n{stat_text}\n\n"
-        f"# unified diff\n{full_diff}\n"
-    )
+    for f in untracked_kept:
+        # Score untracked by file size (roughly); cap at something sane
+        try:
+            size = (repo_root_p / f).stat().st_size
+        except Exception:
+            size = 0
+        score = max(1, min(20000, size // 200))  # heuristic
+        changes.append(FileChange(path=f, kind="untracked", added=None, deleted=None, score=score))
 
-    # Temp workspace inside repo so Codex can read it
-    codex_bin = ""
+    changes.sort(key=lambda c: (c.score, c.path), reverse=True)
+
+    # Summaries
+    def fmt_num(n: int | None) -> str:
+        return "-" if n is None else str(n)
+
+    summary_lines = []
+    for c in changes[:200]:
+        summary_lines.append(f"{fmt_num(c.added)}\t{fmt_num(c.deleted)}\t{c.kind}\t{c.path}")
+
+    if tracked_excluded or untracked_excluded:
+        ex_list = sorted(set(tracked_excluded + untracked_excluded))
+    else:
+        ex_list = []
+
+    sens_list = sorted(set(tracked_sensitive + untracked_sensitive))
+
+    header = textwrap.dedent(f"""
+    # branch: {branch}
+    # mode: {mode}
+    # pathspec: {" ".join(specs) if specs else "(all)"}
+
+    # git status (porcelain)
+    {status_text.strip()}
+
+    # changed files (added\tdeleted\tkind\tpath)
+    {("\n".join(summary_lines) if summary_lines else "(none)")}
+
+    # excluded by default/--exclude (noise)
+    {("\n".join(ex_list) if ex_list else "(none)")}
+
+    # sensitive files omitted from patch content
+    {("\n".join(sens_list) if sens_list else "(none)")}
+    """).strip() + "\n"
+
+    # Build payload with size robustness:
+    # include header + patches for top files until budget reached.
+    budget = args.max_chars
+    payload_parts: list[str] = [header]
+    used = len(header)
+
+    omitted_due_to_budget: list[str] = []
+    included_files: list[str] = []
+
+    # We'll include at most args.max_files patches.
+    for c in changes:
+        if len(included_files) >= args.max_files:
+            omitted_due_to_budget.append(c.path)
+            continue
+
+        if used >= budget:
+            omitted_due_to_budget.append(c.path)
+            continue
+
+        if c.kind == "tracked":
+            patch = get_patch(repo_root, mode, c.path)
+        else:
+            patch = get_untracked_patch(repo_root, c.path)
+
+        if not patch.strip():
+            continue
+
+        if not args.no_redact:
+            patch = redact_secrets(patch)
+
+        # Add a small separator (comment) so the model can see which file a patch belongs to.
+        block = f"\n# --- PATCH: {c.path} ({c.kind}) ---\n{patch.strip()}\n"
+        if used + len(block) <= budget:
+            payload_parts.append(block)
+            used += len(block)
+            included_files.append(c.path)
+        else:
+            # If we have not included any patches yet, include a truncated block
+            if not included_files:
+                remaining = max(0, budget - used)
+                if remaining > 2000:
+                    truncated = block[:remaining] + "\n\n# [...patch truncated to fit budget...]\n"
+                    payload_parts.append(truncated)
+                    used = budget
+                    included_files.append(c.path)
+                else:
+                    omitted_due_to_budget.append(c.path)
+            else:
+                omitted_due_to_budget.append(c.path)
+
+    if omitted_due_to_budget:
+        tail = "\n# omitted patches due to size/file limit\n" + "\n".join(omitted_due_to_budget) + "\n"
+        if used + len(tail) <= budget:
+            payload_parts.append(tail)
+            used += len(tail)
+
+    payload = "".join(payload_parts)
+    if len(payload) > budget:
+        payload = payload[:budget] + "\n# [...payload truncated hard cap...]\n"
+
+    # Run Codex (read-only)
     try:
         codex_bin = find_codex_bin()
     except FileNotFoundError as e:
@@ -364,10 +506,7 @@ def main() -> int:
     schema = {
         "type": "object",
         "properties": {
-            "message": {
-                "type": "string",
-                "description": "Commit message text ONLY (no code fences, no extra commentary).",
-            }
+            "message": {"type": "string"},
         },
         "required": ["message"],
         "additionalProperties": False,
@@ -380,54 +519,49 @@ def main() -> int:
         diff_path.write_text(payload, encoding="utf-8", errors="replace")
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
 
-        prompt = textwrap.dedent(
-            f"""
-            You are generating a single Git commit message based STRICTLY on the provided diff file.
-            Do not invent changes not present.
+        prompt = textwrap.dedent(f"""
+        You are generating a single Git commit message based STRICTLY on the provided diff file.
+        Do not invent changes not present.
 
-            Follow these instructions exactly:
-            {INSTRUCTION}
+        Follow these instructions exactly:
+        {INSTRUCTION}
 
-            Output requirements (MANDATORY):
-            - Respond with valid JSON matching the schema file.
-            - JSON must be exactly: {{"message":"..."}}
-            - The "message" value must contain ONLY the commit message text.
+        Output requirements (MANDATORY):
+        - Respond with valid JSON matching the schema file.
+        - JSON must be exactly: {{"message":"..."}}
+        - The "message" value must contain ONLY the commit message text.
 
-            Context:
-            - Branch: {branch}
-            - Mode: {mode}
-            - Files: {" ".join(specs) if specs else "(all)"}
+        Context:
+        - Branch: {branch}
+        - Mode: {mode}
+        - Pathspec: {" ".join(specs) if specs else "(all)"}
+        - Some files may be excluded (noise) or have patches omitted due to size.
+        - Sensitive files may be listed but their patch content is omitted.
 
-            Read this diff file from disk: {diff_path.relative_to(repo_root_p).as_posix()}
-            """
-        ).strip()
+        Read this diff file from disk: {diff_path.relative_to(repo_root_p).as_posix()}
+        """).strip()
 
-        cmd = [codex_bin, "exec", "--sandbox", "read-only"]
+        cmd = [codex_bin, "exec", "--sandbox", "read-only", "--color", "never"]
         if args.model:
             cmd += ["--model", args.model]
         for c in args.config:
             cmd += ["-c", c]
         cmd += ["--output-schema", str(schema_path), prompt]
 
-        progress("running codex exec…")
         proc = run(cmd, cwd=repo_root, check=False)
         if proc.returncode != 0:
-            # Keep stdout clean; errors go to stderr.
             sys.stderr.write(proc.stderr or "")
             if proc.stdout.strip():
                 sys.stderr.write(proc.stdout)
             return proc.returncode
 
         out = proc.stdout.strip()
-
-        # Defensive: strip accidental code fences
         if out.startswith("```"):
             out = out.strip().strip("`").strip()
 
         try:
             obj = json.loads(out)
         except json.JSONDecodeError:
-            # If something goes wrong, surface it to stderr (keep stdout clean)
             sys.stderr.write("Codex did not return valid JSON.\n")
             sys.stderr.write(out + "\n")
             return 3
@@ -437,6 +571,7 @@ def main() -> int:
             sys.stderr.write("Codex returned an empty message.\n")
             return 3
 
+        # Print ONLY the final message
         sys.stdout.write(msg + "\n")
         return 0
 
