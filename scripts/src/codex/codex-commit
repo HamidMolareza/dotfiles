@@ -124,7 +124,7 @@ def find_codex_bin() -> str:
     env = os.environ.get("CODEX_BIN")
     if env and shutil.which(env):
         return env
-    for cand in ("codex", "codex1"):
+    for cand in ("codex1", "codex2"):
         if shutil.which(cand):
             return cand
     raise FileNotFoundError("Could not find Codex CLI. Install it and ensure `codex` is on PATH.")
