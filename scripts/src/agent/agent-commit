@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-codex-commit: Generate a Conventional Commit message for git changes.
+agent-commit: Generate a Conventional Commit message for git changes.
 
 Examples:
-  codex-commit | clipboard
-  codex-commit file1 file2 file3 | clipboard
-  codex-commit *.md | clipboard
-  codex-commit docs/ | clipboard
-  codex-commit --staged src/foo.py | clipboard
-  codex-commit --worktree docs/ | clipboard
+  agent-commit | clipboard
+  agent-commit file1 file2 file3 | clipboard
+  agent-commit *.md | clipboard
+  agent-commit docs/ | clipboard
+  agent-commit --staged src/foo.py | clipboard
+  agent-commit --worktree docs/ | clipboard
+  agent-commit --interactive | clipboard
 
 STDOUT: commit message only
 STDERR: errors (and optional verbose progress)
@@ -17,6 +18,7 @@ STDERR: errors (and optional verbose progress)
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import glob
 import json
 import os
@@ -72,6 +74,11 @@ Output format:
 - Do not add explanations, comments, extra text, or code fences.
 """.strip()
 
+# AI CLI execution defaults for this script. Edit these in one place.
+DEFAULT_AI_BIN = "gapcode"
+DEFAULT_AI_MODEL = "gpt-5.3-codex"
+DEFAULT_AI_CONFIG_OVERRIDES = ['model_reasoning_effort="high"']
+
 # Default "noise" excludes (can be disabled via --no-default-excludes)
 DEFAULT_EXCLUDE_GLOBS = [
     "**/package-lock.json",
@@ -120,14 +127,30 @@ def git(repo_root: str, args: list[str]) -> tuple[str, int]:
     return p.stdout, p.returncode
 
 
-def find_codex_bin() -> str:
-    env = os.environ.get("CODEX_BIN")
-    if env and shutil.which(env):
-        return env
-    for cand in ("codex1", "codex2"):
-        if shutil.which(cand):
-            return cand
-    raise FileNotFoundError("Could not find Codex CLI. Install it and ensure `codex` is on PATH.")
+def run_with_input(
+    cmd: list[str],
+    cwd: str,
+    input_text: str,
+    interactive: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=False,
+        text=True,
+        input=input_text,
+        stdout=subprocess.PIPE,
+        stderr=None if interactive else subprocess.PIPE,
+    )
+
+
+def find_ai_bin(bin_name: str | None) -> str:
+    candidate = (bin_name or DEFAULT_AI_BIN).strip()
+    if candidate and shutil.which(candidate):
+        return candidate
+    raise FileNotFoundError(
+        f"Could not find AI CLI `{candidate}`. Install it and ensure it is on PATH."
+    )
 
 
 def expand_file_args(raw_args: list[str]) -> list[str]:
@@ -208,6 +231,232 @@ def has_staged_diff(repo_root: str, specs: list[str]) -> bool:
     return p.returncode == 1
 
 
+def has_worktree_changes(repo_root: str, specs: list[str]) -> bool:
+    # Unstaged tracked changes
+    args = ["diff", "--quiet"]
+    if specs:
+        args += ["--", *specs]
+    p = run(["git", *args], cwd=repo_root, check=False)
+    if p.returncode == 1:
+        return True
+    # Untracked files
+    return bool(filter_untracked_by_specs(repo_root, specs))
+
+
+def parse_status_z(status_z: str) -> dict[str, str]:
+    """
+    Parse `git status --porcelain=v1 -z` into {path: "XY"}.
+    For renames/copies, map the *new* path to the status.
+    """
+    out: dict[str, str] = {}
+    if not status_z:
+        return out
+    entries = status_z.split("\0")
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        if not entry:
+            i += 1
+            continue
+        if len(entry) < 3:
+            i += 1
+            continue
+        status = entry[:2]
+        path = entry[3:] if len(entry) > 3 else ""
+        if ("R" in status or "C" in status) and (i + 1) < len(entries):
+            new_path = entries[i + 1]
+            if new_path:
+                out[new_path] = status
+                i += 2
+                continue
+        if path:
+            out[path] = status
+        i += 1
+    return out
+
+
+def get_mtime(repo_root: str, repo_root_p: Path, path: str) -> int:
+    p = repo_root_p / path
+    try:
+        return int(p.stat().st_mtime)
+    except Exception:
+        out, _ = git(repo_root, ["log", "-1", "--format=%ct", "--", path])
+        out = out.strip()
+        return int(out) if out.isdigit() else 0
+
+
+def fmt_ts(ts: int) -> str:
+    if ts <= 0:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def run_fzf_picker(
+    repo_root: str,
+    lines: list[str],
+    *,
+    prompt: str,
+    header: str,
+    multi: bool = False,
+    height: str = "80%",
+) -> list[str]:
+    fzf = shutil.which("fzf")
+    if not fzf or not lines:
+        return []
+
+    cmd = [
+        fzf,
+        "--ansi",
+        "--no-sort",
+        "--height",
+        height,
+        "--layout",
+        "reverse",
+        "--border",
+        "--prompt",
+        prompt,
+        "--header",
+        header,
+    ]
+    if multi:
+        cmd.extend([
+            "--multi",
+            "--bind",
+            "ctrl-a:select-all,ctrl-d:deselect-all",
+        ])
+
+    proc = run_with_input(
+        cmd,
+        cwd=repo_root,
+        input_text="\n".join(lines) + "\n",
+        interactive=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def select_files_interactive(
+    repo_root: str,
+    repo_root_p: Path,
+    mode: str,
+    exclude_globs: list[str],
+    sensitive_globs: list[str],
+) -> list[str]:
+    # Gather changed files for the chosen mode (no pathspecs).
+    diff_base = ["diff", "-M", "-C", "--name-only"]
+    if mode == "staged":
+        diff_base.insert(1, "--cached")
+    name_only, _ = git(repo_root, diff_base)
+    tracked_files_all = [ln.strip() for ln in name_only.splitlines() if ln.strip()]
+
+    untracked_files_all: list[str] = []
+    if mode == "worktree":
+        untracked_files_all = filter_untracked_by_specs(repo_root, [])
+
+    # Classify excludes and sensitive
+    def classify(paths: list[str]) -> tuple[list[str], list[str], list[str]]:
+        kept, excluded, sensitive = [], [], []
+        for f in paths:
+            if sensitive_globs and matches_any_glob(f, sensitive_globs):
+                sensitive.append(f)
+                continue
+            if exclude_globs and matches_any_glob(f, exclude_globs):
+                excluded.append(f)
+                continue
+            kept.append(f)
+        return kept, excluded, sensitive
+
+    tracked_kept, tracked_excluded, tracked_sensitive = classify(tracked_files_all)
+    untracked_kept, untracked_excluded, untracked_sensitive = classify(untracked_files_all)
+
+    if not tracked_kept and not untracked_kept:
+        if tracked_excluded or untracked_excluded:
+            sys.stderr.write("All changes are excluded (try --no-default-excludes or --exclude).\n")
+        if tracked_sensitive or untracked_sensitive:
+            sys.stderr.write("All changes are sensitive (try --no-sensitive-skip).\n")
+        return []
+
+    status_z, _ = git(repo_root, ["status", "--porcelain=v1", "-z"])
+    status_map = parse_status_z(status_z)
+
+    # Build ordered list (mtime desc)
+    candidates: list[tuple[int, str]] = []
+    for f in tracked_kept:
+        ts = get_mtime(repo_root, repo_root_p, f)
+        status = status_map.get(f, "  ")
+        line = f"{fmt_ts(ts)}\t{status}\ttracked\t{f}"
+        candidates.append((ts, line))
+    for f in untracked_kept:
+        ts = get_mtime(repo_root, repo_root_p, f)
+        status = status_map.get(f, "??")
+        line = f"{fmt_ts(ts)}\t{status}\tuntracked\t{f}"
+        candidates.append((ts, line))
+
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    lines = [line for _, line in candidates]
+
+    if not lines:
+        sys.stderr.write(f"No changes found for mode={mode}.\n")
+        return []
+
+    if shutil.which("fzf"):
+        decorated_lines = []
+        for line in lines:
+            parts = line.split("\t")
+            ts = parts[0] if len(parts) > 0 else "-"
+            status = parts[1] if len(parts) > 1 else "  "
+            kind = parts[2] if len(parts) > 2 else "tracked"
+            path = "\t".join(parts[3:]) if len(parts) > 3 else ""
+            icon = "●" if kind == "tracked" else "○"
+            decorated_lines.append(f"{icon} {status} {path}\t{ts}\t{kind}\t{path}")
+
+        header = (
+            f"mode: {mode}  |  enter=select  tab=toggle  ctrl-a=all  ctrl-d=none"
+        )
+        selected_lines = run_fzf_picker(
+            repo_root,
+            decorated_lines,
+            prompt="files> ",
+            header=header,
+            multi=True,
+        )
+        if not selected_lines:
+            return []
+    else:
+        sys.stderr.write("fzf not found; falling back to numeric selection.\n")
+        for idx, line in enumerate(lines, 1):
+            parts = line.split("\t")
+            ts = parts[0] if len(parts) > 0 else "-"
+            status = parts[1] if len(parts) > 1 else "  "
+            kind = parts[2] if len(parts) > 2 else "tracked"
+            path = "\t".join(parts[3:]) if len(parts) > 3 else ""
+            sys.stderr.write(f"{idx:>3} {ts} {status} {kind} {path}\n")
+        sys.stderr.write("Select files (comma-separated numbers, empty to cancel): ")
+        sys.stderr.flush()
+        sel = sys.stdin.readline().strip()
+        if not sel:
+            return []
+        idxs: list[int] = []
+        for part in sel.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not part.isdigit():
+                sys.stderr.write("Invalid selection.\n")
+                return []
+            idxs.append(int(part))
+        selected_lines = [lines[i - 1] for i in idxs if 1 <= i <= len(lines)]
+
+    # Extract paths from selected lines
+    paths: list[str] = []
+    for ln in selected_lines:
+        parts = ln.split("\t")
+        if len(parts) >= 4:
+            paths.append("\t".join(parts[3:]))
+    return [p for p in paths if p]
+
+
 def redact_secrets(text: str) -> str:
     """
     Best-effort redaction. This does not guarantee catching all secrets,
@@ -276,30 +525,66 @@ def get_untracked_patch(repo_root: str, path: str) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(add_help=True)
+    ap = argparse.ArgumentParser(
+        add_help=True,
+        description=(
+            "Generate a Conventional Commit message from git diff using a Codex-compatible CLI.\n"
+            f'Default CLI binary: {DEFAULT_AI_BIN}\n'
+            f'Default model: {DEFAULT_AI_MODEL}\n'
+            f'Default config: -c {DEFAULT_AI_CONFIG_OVERRIDES[0]}'
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     ap.add_argument("-v", "--verbose", action="store_true", help="Show progress on stderr")
     ap.add_argument("--staged", action="store_true", help="Use staged changes only")
     ap.add_argument("--worktree", action="store_true", help="Use working-tree changes (incl. untracked)")
-    ap.add_argument("--model", default=None, help="Override Codex model (otherwise use CLI config)")
+    ap.add_argument(
+        "--bin",
+        default=DEFAULT_AI_BIN,
+        help=f"CLI binary to run (default: {DEFAULT_AI_BIN})",
+    )
+    ap.add_argument(
+        "--model",
+        default=None,
+        help=f"Override model (default: {DEFAULT_AI_MODEL})",
+    )
     ap.add_argument(
         "-c",
         "--config",
         action="append",
         default=[],
-        help='Pass through Codex config overrides (repeatable), e.g. -c model_reasoning_effort="medium"',
+        help=(
+            "Pass through CLI config overrides (repeatable).\n"
+            f'If omitted, defaults to: -c {DEFAULT_AI_CONFIG_OVERRIDES[0]}'
+        ),
     )
-    ap.add_argument("--max-chars", type=int, default=200_000, help="Max characters sent to Codex")
+    ap.add_argument(
+        "--extra",
+        action="append",
+        default=[],
+        help=(
+            "Additional context to pass to the CLI (repeatable). "
+            "Use this to add intent or detail not obvious from the diff."
+        ),
+    )
+    ap.add_argument("--max-chars", type=int, default=200_000, help="Max characters sent to the CLI")
     ap.add_argument("--max-files", type=int, default=25, help="Max files to include full patches for")
     ap.add_argument("--no-default-excludes", action="store_true", help="Do not exclude lockfiles by default")
     ap.add_argument("--exclude", action="append", default=[], help="Additional exclude glob (repeatable)")
     ap.add_argument("--no-redact", action="store_true", help="Disable secret redaction (not recommended)")
     ap.add_argument("--no-sensitive-skip", action="store_true", help="Include patches for sensitive files too")
+    ap.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Interactive file picker (uses fzf if available)",
+    )
     ap.add_argument("files", nargs="*", help="Optional file paths / globs / directories to limit the diff")
     args = ap.parse_args()
 
     def progress(msg: str) -> None:
         if args.verbose:
-            sys.stderr.write(f"[codex-commit] {msg}\n")
+            sys.stderr.write(f"[agent-commit] {msg}\n")
             sys.stderr.flush()
 
     if args.staged and args.worktree:
@@ -314,20 +599,6 @@ def main() -> int:
     repo_root = p.stdout.strip()
     repo_root_p = Path(repo_root)
 
-    specs = normalize_pathspecs(repo_root_p, args.files)
-
-    # Mode selection (auto): staged if there are staged changes for the selected specs; else worktree.
-    if args.staged:
-        mode = "staged"
-    elif args.worktree:
-        mode = "worktree"
-    else:
-        mode = "staged" if has_staged_diff(repo_root, specs) else "worktree"
-
-    # Branch + status
-    branch = (git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])[0].strip() or "HEAD")
-    status_text, _ = git(repo_root, ["status", "--porcelain=v1", "-b"])
-
     # Build exclude globs
     exclude_globs: list[str] = []
     if not args.no_default_excludes:
@@ -335,6 +606,55 @@ def main() -> int:
     exclude_globs.extend(args.exclude)
 
     sensitive_globs = [] if args.no_sensitive_skip else list(DEFAULT_SENSITIVE_GLOBS)
+
+    if args.interactive and args.files:
+        sys.stderr.write("Do not pass files when using --interactive\n")
+        return 2
+
+    specs: list[str] = []
+    if not args.interactive:
+        specs = normalize_pathspecs(repo_root_p, args.files)
+
+    # Mode selection
+    if args.staged:
+        mode = "staged"
+    elif args.worktree:
+        mode = "worktree"
+    else:
+        if args.interactive:
+            has_staged = has_staged_diff(repo_root, [])
+            has_worktree = has_worktree_changes(repo_root, [])
+            if has_staged and has_worktree:
+                sys.stderr.write("Select mode [s=staged, w=worktree]: ")
+                sys.stderr.flush()
+                ans = sys.stdin.readline().strip().lower()
+                mode = "staged" if ans.startswith("s") else "worktree" if ans.startswith("w") else ""
+                if mode not in ("staged", "worktree"):
+                    sys.stderr.write("No mode selected.\n")
+                    return 1
+            elif has_staged:
+                mode = "staged"
+            else:
+                mode = "worktree"
+        else:
+            mode = "staged" if has_staged_diff(repo_root, specs) else "worktree"
+
+    # Interactive file selection (after mode is known)
+    if args.interactive:
+        specs = select_files_interactive(
+            repo_root=repo_root,
+            repo_root_p=repo_root_p,
+            mode=mode,
+            exclude_globs=exclude_globs,
+            sensitive_globs=sensitive_globs,
+        )
+        if not specs:
+            sys.stderr.write("No files selected.\n")
+            return 1
+
+    # Branch + status
+    branch = (git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])[0].strip() or "HEAD")
+    status_text, _ = git(repo_root, ["status", "--porcelain=v1", "-b"])
 
     progress(f"mode={mode} specs={specs or '(all)'}")
 
@@ -379,7 +699,7 @@ def main() -> int:
 
     # If nothing left but we excluded everything, still proceed with a minimal message context.
     if not tracked_kept and not untracked_kept and not tracked_sensitive and not untracked_sensitive:
-        sys.stderr.write("codex-commit: no changes found (or everything excluded).\n")
+        sys.stderr.write("agent-commit: no changes found (or everything excluded).\n")
         return 1
 
     # Build FileChange list for ranking
@@ -496,9 +816,9 @@ def main() -> int:
     if len(payload) > budget:
         payload = payload[:budget] + "\n# [...payload truncated hard cap...]\n"
 
-    # Run Codex (read-only)
+    # Run AI CLI (read-only)
     try:
-        codex_bin = find_codex_bin()
+        ai_bin = find_ai_bin(args.bin)
     except FileNotFoundError as e:
         sys.stderr.write(str(e) + "\n")
         return 127
@@ -512,12 +832,21 @@ def main() -> int:
         "additionalProperties": False,
     }
 
-    with tempfile.TemporaryDirectory(dir=repo_root, prefix=".codex-commit-") as td:
+    extra_text = "\n".join([s for s in args.extra if s and s.strip()]).strip()
+
+    with tempfile.TemporaryDirectory(dir=repo_root, prefix=".agent-commit-") as td:
         td_p = Path(td)
         diff_path = td_p / "diff.txt"
         schema_path = td_p / "schema.json"
         diff_path.write_text(payload, encoding="utf-8", errors="replace")
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+
+        extra_block = ""
+        if extra_text:
+            extra_block = textwrap.dedent(f"""
+            Additional context from user (supplemental; prefer the diff if conflicts):
+            {extra_text}
+            """).strip()
 
         prompt = textwrap.dedent(f"""
         You are generating a single Git commit message based STRICTLY on the provided diff file.
@@ -537,14 +866,15 @@ def main() -> int:
         - Pathspec: {" ".join(specs) if specs else "(all)"}
         - Some files may be excluded (noise) or have patches omitted due to size.
         - Sensitive files may be listed but their patch content is omitted.
+        {extra_block if extra_block else ""}
 
         Read this diff file from disk: {diff_path.relative_to(repo_root_p).as_posix()}
         """).strip()
 
-        cmd = [codex_bin, "exec", "--sandbox", "read-only", "--color", "never"]
-        if args.model:
-            cmd += ["--model", args.model]
-        for c in args.config:
+        cmd = [ai_bin, "exec", "--sandbox", "read-only", "--color", "never"]
+        cmd += ["--model", args.model or DEFAULT_AI_MODEL]
+        config_overrides = args.config if args.config else list(DEFAULT_AI_CONFIG_OVERRIDES)
+        for c in config_overrides:
             cmd += ["-c", c]
         cmd += ["--output-schema", str(schema_path), prompt]
 
@@ -562,13 +892,13 @@ def main() -> int:
         try:
             obj = json.loads(out)
         except json.JSONDecodeError:
-            sys.stderr.write("Codex did not return valid JSON.\n")
+            sys.stderr.write(f"{args.bin} did not return valid JSON.\n")
             sys.stderr.write(out + "\n")
             return 3
 
         msg = (obj.get("message") or "").rstrip("\n")
         if not msg.strip():
-            sys.stderr.write("Codex returned an empty message.\n")
+            sys.stderr.write(f"{args.bin} returned an empty message.\n")
             return 3
 
         # Print ONLY the final message
