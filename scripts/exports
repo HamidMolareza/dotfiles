@@ -34,5 +34,13 @@ add_to_path_if_missing "$SRC_DIR/mirrors"
 add_to_path_if_missing "$SRC_DIR/video"
 add_to_path_if_missing "$SRC_DIR/json"
 add_to_path_if_missing "$SRC_DIR/agent"
+add_to_path_if_missing "$SRC_DIR/archive"
+add_to_path_if_missing "$SRC_DIR/desktop"
+add_to_path_if_missing "$SRC_DIR/dev"
+add_to_path_if_missing "$SRC_DIR/network"
+add_to_path_if_missing "$SRC_DIR/security"
+add_to_path_if_missing "$SRC_DIR/system"
+add_to_path_if_missing "$SRC_DIR/utils"
+add_to_path_if_missing "$SRC_DIR/web"
 
 export PATH
