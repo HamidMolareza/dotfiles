@@ -3,6 +3,19 @@
 # Define the name of the virtual environment
 VENV_DIR="./.venv"
 
+# Ensure python3-venv is installed (Debian/Ubuntu)
+if command -v dpkg >/dev/null 2>&1; then
+    if ! dpkg -s python3-venv >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y python3-venv
+    fi
+else
+    if ! python3 -m venv --help >/dev/null 2>&1; then
+        echo "python3-venv is not available; please install it for your OS."
+        exit 1
+    fi
+fi
+
 # Check if the virtual environment directory exists
 if [ ! -d "$VENV_DIR" ]; then
     # If not exists, create a new virtual environment
@@ -11,4 +24,4 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 # Activate the virtual environment
-source "$VENV_DIR/bin/activate"
+echo "source '$VENV_DIR/bin/activate'"

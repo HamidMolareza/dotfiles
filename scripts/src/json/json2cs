@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Config (override via env) ---
+ROOT_TYPE="${ROOT_TYPE:-Root}"  # e.g. ROOT_TYPE=MyDto ./json2cs -t MyDto
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Error: '$1' is required but not found in PATH." >&2
+    exit 1
+  }
+}
+
+usage() {
+  cat <<'EOF'
+Usage: json2cs [options]
+
+Generate C# classes from JSON via quicktype.
+
+Options:
+  -t TYPE   Root type name (default: ROOT_TYPE env or "Root")
+  -i FILE   Read JSON from file (default: clipboard or stdin)
+  -o FILE   Write output to file (default: stdout)
+  -h        Show help
+
+Input precedence:
+  1) stdin (if not a TTY)
+  2) -i FILE
+  3) clipboard
+
+Examples:
+  json2cs -t MyDto -i data.json -o MyDto.cs
+  cat data.json | json2cs -t MyDto
+  json2cs < data.json
+EOF
+}
+
+get_clipboard() {
+  if command -v pbpaste >/dev/null 2>&1; then
+    pbpaste
+  elif command -v wl-paste >/dev/null 2>&1; then
+    wl-paste
+  elif command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard -o
+  elif command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --output
+  else
+    echo "Error: No clipboard tool found." >&2
+    echo "Install one of: pbpaste (macOS), wl-clipboard (Wayland), xclip/xsel (X11)." >&2
+    exit 1
+  fi
+}
+
+need_cmd quicktype
+
+input_file=""
+output_file=""
+while getopts ":t:i:o:h" opt; do
+  case "$opt" in
+    t) ROOT_TYPE="$OPTARG" ;;
+    i) input_file="$OPTARG" ;;
+    o) output_file="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) echo "Error: Option -$OPTARG requires an argument." >&2; usage >&2; exit 2 ;;
+    \?) echo "Error: Unknown option -$OPTARG." >&2; usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -gt 0 ]]; then
+  echo "Error: Unexpected argument(s): $*" >&2
+  usage >&2
+  exit 2
+fi
+
+json=""
+if [[ ! -t 0 ]]; then
+  json="$(cat)"
+elif [[ -n "$input_file" ]]; then
+  if [[ ! -r "$input_file" ]]; then
+    echo "Error: Cannot read input file: $input_file" >&2
+    exit 1
+  fi
+  json="$(cat "$input_file")"
+else
+  json="$(get_clipboard || true)"
+fi
+
+if [[ -z "${json//[[:space:]]/}" ]]; then
+  echo "Error: Input is empty (or only whitespace)." >&2
+  usage >&2
+  exit 1
+fi
+
+# Optional JSON validation if jq is available.
+if command -v jq >/dev/null 2>&1; then
+  if ! printf "%s" "$json" | jq -e . >/dev/null 2>&1; then
+    echo "Error: Input is not valid JSON." >&2
+    usage >&2
+    exit 1
+  fi
+fi
+
+# Pipe clipboard JSON into quicktype and print generated C# to stdout
+if [[ -n "$output_file" ]]; then
+  printf "%s" "$json" | quicktype -s json -l csharp -t "$ROOT_TYPE" >"$output_file"
+else
+  printf "%s" "$json" | quicktype -s json -l csharp -t "$ROOT_TYPE"
+fi

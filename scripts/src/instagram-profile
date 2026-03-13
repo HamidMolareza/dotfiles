@@ -2,25 +2,93 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<'EOF'
+Usage:
+  instagram-profile [options] <instagram_username> [more_usernames...]
+
+Options:
+  -o, --output DIR   Output directory (default: instagram_profiles)
+  -h, --help         Show this help
+EOF
+}
+
+command_exists() {
+    if command -v command-exists >/dev/null 2>&1; then
+        command-exists "$@"
+    else
+        command -v "$@" >/dev/null 2>&1
+    fi
+}
+
 # Check if instaloader is installed
-if ! command-exists instaloader; then
-    echo "Instaloader is not installed. Please install it using 'pip install instaloader'."
+if ! command_exists instaloader; then
+    echo "Instaloader is not installed. Please install it using 'sudo apt install instaloader'."
     exit 1
+fi
+
+OUTPUT_DIR="instagram_profiles"
+USERNAMES=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -o|--output)
+            if [ -z "${2-}" ]; then
+                echo "Error: --output requires a directory argument."
+                usage
+                exit 1
+            fi
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option '$1'."
+            usage
+            exit 1
+            ;;
+        *)
+            USERNAMES+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ $# -gt 0 ]; then
+    USERNAMES+=("$@")
 fi
 
 # Check if a profile username was provided
-if [ -z "$1" ]; then
-    echo "Usage: $0 <instagram_username>"
-    exit 1
+if [ "${#USERNAMES[@]}" -eq 0 ]; then
+    read -r -p "Enter instagram_username (space-separated for multiple): " REPLY
+    if [ -z "${REPLY:-}" ]; then
+        echo "Error: Missing instagram_username."
+        usage
+        exit 1
+    fi
+    # Split REPLY into USERNAMES on whitespace
+    read -r -a USERNAMES <<< "$REPLY"
 fi
-
-USERNAME=$1
-OUTPUT_DIR="instagram_profiles"
 
 # Create the output directory if it doesn't exist
 mkdir -p "$OUTPUT_DIR"
 
-# Download the profile with high quality using instaloader
-instaloader --dirname-pattern="${OUTPUT_DIR}/{profile}" --no-pictures --no-videos --no-captions --no-posts --no-profile-pic --no-compress-json --no-captions "$USERNAME"
-
-echo "Download complete! Files are saved in: ${OUTPUT_DIR}/${USERNAME}"
+for USERNAME in "${USERNAMES[@]}"; do
+    # Download the profile metadata only using instaloader
+    instaloader --dirname-pattern="${OUTPUT_DIR}/{profile}" \
+        --no-pictures \
+        --no-videos \
+        --no-captions \
+        --no-posts \
+        --no-profile-pic \
+        --no-compress-json \
+        "$USERNAME"
+    echo "Download complete! Files are saved in: ${OUTPUT_DIR}/${USERNAME}"
+done

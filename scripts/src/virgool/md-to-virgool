@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+
+import html
+import json
+import os
+import sys
+
+try:
+    from markdown_it import MarkdownIt
+except ImportError:
+    print(
+        "Error: markdown-it-py is required. Install it with: pip install markdown-it-py",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+PARAGRAPH_CLASS = "v-block v-paragraph veditor-rtl"
+HEADING_CLASS = "v-block v-heading veditor-rtl"
+LIST_CLASS = "v-block v-bulletList veditor-rtl"
+ORDERED_LIST_CLASS = "v-block v-orderedList veditor-rtl"
+BLOCKQUOTE_CLASS = "v-block v-blockquote veditor-rtl"
+HR_CLASS = "v-block v-hr"
+LINK_CLASS = "v-link"
+CODE_BLOCK_CLASS = "veditor-ltr md-block-code"
+IMAGE_FIGURE_CLASS = "veditor-rtl image-block v-block-image"
+
+
+def show_help():
+    script_name = os.path.basename(sys.argv[0])
+    print(f"Usage: {script_name} INPUT.md [OUTPUT.json]")
+    print("Converts Markdown to Virgool JSON.")
+    print("If OUTPUT.json is omitted, JSON is printed to stdout.")
+    sys.exit(1)
+
+
+def get_attr(token, name):
+    attrs = getattr(token, "attrs", None)
+    if not attrs:
+        return None
+    if isinstance(attrs, dict):
+        return attrs.get(name)
+    for item in attrs:
+        if isinstance(item, dict):
+            if name in item:
+                return item.get(name)
+            continue
+        if isinstance(item, (list, tuple)):
+            if len(item) >= 2 and item[0] == name:
+                return item[1]
+            continue
+    return None
+
+
+def render_inline(inline_token):
+    parts = []
+    children = inline_token.children or []
+    for child in children:
+        token_type = child.type
+        if token_type == "text":
+            parts.append(html.escape(child.content))
+        elif token_type in ("softbreak", "hardbreak"):
+            parts.append("<br>")
+        elif token_type == "strong_open":
+            parts.append("<strong>")
+        elif token_type == "strong_close":
+            parts.append("</strong>")
+        elif token_type == "em_open":
+            parts.append("<em>")
+        elif token_type == "em_close":
+            parts.append("</em>")
+        elif token_type == "link_open":
+            href = get_attr(child, "href") or ""
+            href_attr = html.escape(href, quote=True)
+            parts.append(
+                f'<a target="_blank" rel="noopener noreferrer nofollow" '
+                f'class="{LINK_CLASS}" href="{href_attr}">'
+            )
+        elif token_type == "link_close":
+            parts.append("</a>")
+        elif token_type == "code_inline":
+            parts.append(f"<code>{html.escape(child.content)}</code>")
+        elif token_type == "image":
+            src = get_attr(child, "src") or ""
+            alt = child.content or get_attr(child, "alt") or ""
+            parts.append(
+                f'<img src="{html.escape(src, quote=True)}" '
+                f'alt="{html.escape(alt, quote=True)}">'
+            )
+        else:
+            if child.content:
+                parts.append(html.escape(child.content))
+    return "".join(parts)
+
+
+def extract_embed_url(inline_token):
+    children = inline_token.children or []
+    if len(children) != 3:
+        return None
+    if (
+        children[0].type != "link_open"
+        or children[1].type != "text"
+        or children[2].type != "link_close"
+    ):
+        return None
+    href = get_attr(children[0], "href")
+    if not href:
+        return None
+    if children[1].content.strip() != href:
+        return None
+    return href
+
+
+def extract_image(inline_token):
+    children = inline_token.children or []
+    if len(children) != 1 or children[0].type != "image":
+        return None
+    image_token = children[0]
+    src = get_attr(image_token, "src") or ""
+    alt = image_token.content or get_attr(image_token, "alt") or ""
+    return src, alt
+
+
+def render_tokens(tokens):
+    lines = []
+    index = 0
+
+    while index < len(tokens):
+        token = tokens[index]
+
+        if token.type == "paragraph_open":
+            inline_token = tokens[index + 1] if index + 1 < len(tokens) else None
+            if inline_token and inline_token.type == "inline":
+                embed_url = extract_embed_url(inline_token)
+                if embed_url:
+                    lines.append(
+                        '<div data-block-type="embed" class="v-block v-embed" '
+                        + 'data-rendered="true">'
+                        + html.escape(embed_url, quote=False)
+                        + "</div>"
+                    )
+                    index += 3
+                    continue
+
+                image_data = extract_image(inline_token)
+                if image_data:
+                    src, alt = image_data
+                    src_attr = html.escape(src, quote=True)
+                    alt_attr = html.escape(alt, quote=True)
+                    lines.append(
+                        f'<figure class="{IMAGE_FIGURE_CLASS}" '
+                        + f'src="{src_attr}" alt="{alt_attr}" '
+                        + 'loading="false" uploading="false" '
+                        + 'data-type="image-block">'
+                        + f'<img src="{src_attr}">'
+                        + '<figcaption class="v-image-caption"></figcaption>'
+                        + "</figure>"
+                    )
+                    index += 3
+                    continue
+
+                content = render_inline(inline_token)
+                lines.append(f'<p class="{PARAGRAPH_CLASS}">{content}</p>')
+                index += 3
+                continue
+
+        if token.type == "heading_open":
+            inline_token = tokens[index + 1] if index + 1 < len(tokens) else None
+            tag = token.tag
+            content = render_inline(inline_token) if inline_token else ""
+            lines.append(f'<{tag} class="{HEADING_CLASS}">{content}</{tag}>')
+            index += 3
+            continue
+
+        if token.type == "bullet_list_open":
+            lines.append(f'<ul class="{LIST_CLASS}">')
+            index += 1
+            continue
+
+        if token.type == "bullet_list_close":
+            lines.append("</ul>")
+            index += 1
+            continue
+
+        if token.type == "ordered_list_open":
+            lines.append(f'<ol class="{ORDERED_LIST_CLASS}">')
+            index += 1
+            continue
+
+        if token.type == "ordered_list_close":
+            lines.append("</ol>")
+            index += 1
+            continue
+
+        if token.type == "list_item_open":
+            lines.append('<li class="">')
+            index += 1
+            continue
+
+        if token.type == "list_item_close":
+            lines.append("</li>")
+            index += 1
+            continue
+
+        if token.type == "blockquote_open":
+            lines.append(f'<blockquote class="{BLOCKQUOTE_CLASS}">')
+            index += 1
+            continue
+
+        if token.type == "blockquote_close":
+            lines.append("</blockquote>")
+            index += 1
+            continue
+
+        if token.type in ("fence", "code_block"):
+            code = token.content.replace("\r\n", "\n").replace("\r", "\n")
+            code = code.rstrip("\n")
+            code_escaped = html.escape(code).replace("\n", "&#10;")
+            lines.append(
+                f'<pre class="{CODE_BLOCK_CLASS}" '
+                + 'data-type="code-block"><code>'
+                + f"{code_escaped}</code></pre>"
+            )
+            index += 1
+            continue
+
+        if token.type == "hr":
+            lines.append(f'<hr class="{HR_CLASS}">')
+            index += 1
+            continue
+
+        index += 1
+
+    return "".join(lines)
+
+
+def convert_markdown_to_virgool(markdown_text):
+    md = MarkdownIt("commonmark", {"breaks": True, "linkify": True, "html": False})
+    tokens = md.parse(markdown_text)
+    return render_tokens(tokens)
+
+
+def main():
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        show_help()
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) == 3 else None
+
+    if not os.path.isfile(input_path):
+        print(f"Error: File '{input_path}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(input_path, "r", encoding="utf-8") as md_file:
+        markdown_text = md_file.read()
+
+    html_output = convert_markdown_to_virgool(markdown_text)
+    json_output = json.dumps({"body": html_output}, ensure_ascii=False)
+
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as json_file:
+            json_file.write(json_output)
+        print(f"Virgool JSON saved to {output_path}")
+    else:
+        sys.stdout.write(json_output)
+
+
+if __name__ == "__main__":
+    main()

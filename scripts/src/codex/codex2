@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+export CODEX_HOME="$HOME/.codex2"
+exec codex "$@"

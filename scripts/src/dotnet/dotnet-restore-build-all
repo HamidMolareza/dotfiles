@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+
+def find_projects(root, max_depth):
+    matches = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if max_depth is not None:
+            relpath = os.path.relpath(dirpath, root)
+            depth = 0 if relpath == "." else relpath.count(os.sep) + 1
+            if depth >= max_depth:
+                dirnames[:] = []
+        for name in filenames:
+            if name.endswith(".sln") or name.endswith(".csproj"):
+                matches.append(os.path.join(dirpath, name))
+    return sorted(matches)
+
+
+def run_command_with_retries(cmd, retries, retry_delay):
+    attempts = retries + 1
+    for attempt in range(1, attempts + 1):
+        print("+", " ".join(cmd))
+        try:
+            result = subprocess.run(cmd)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Command not found: {cmd[0]}") from exc
+
+        if result.returncode == 0:
+            return True
+
+        if attempt < attempts:
+            print(
+                (
+                    f"Command failed ({result.returncode}): {' '.join(cmd)}; "
+                    f"retrying in {retry_delay}s (attempt {attempt}/{attempts})"
+                ),
+                file=sys.stderr,
+            )
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+        else:
+            return False
+
+
+def run_dotnet(path, continue_on_error, retries, retry_delay):
+    cmds = [
+        ["dotnet", "restore", path],
+        ["dotnet", "build", path],
+    ]
+    for cmd in cmds:
+        ok = run_command_with_retries(cmd, retries, retry_delay)
+        if not ok:
+            msg = f"Command failed after {retries + 1} attempt(s): {' '.join(cmd)}"
+            if continue_on_error:
+                print(msg, file=sys.stderr)
+                return False
+            raise RuntimeError(msg)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find .sln/.csproj files and run dotnet restore/build for each."
+    )
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=".",
+        help="Root directory to search (default: current directory).",
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop immediately if a project fails to restore/build.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of retries per command (default: 1).",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=2.0,
+        help="Seconds to wait between retries (default: 2.0).",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help="Maximum directory depth to search (default: unlimited).",
+    )
+    args = parser.parse_args()
+
+    if args.retries < 0:
+        print("--retries must be >= 0", file=sys.stderr)
+        return 1
+    if args.retry_delay < 0:
+        print("--retry-delay must be >= 0", file=sys.stderr)
+        return 1
+    if args.max_depth is not None and args.max_depth < 0:
+        print("--max-depth must be >= 0", file=sys.stderr)
+        return 1
+
+    root = os.path.abspath(args.root)
+    projects = find_projects(root, args.max_depth)
+    if not projects:
+        print(f"No .sln or .csproj files found under {root}")
+        return 1
+
+    print(f"Found {len(projects)} project file(s) under {root}")
+    any_failed = False
+    for path in projects:
+        print(f"\n==> {path}")
+        continue_on_error = not args.stop_on_error
+        try:
+            ok = run_dotnet(path, continue_on_error, args.retries, args.retry_delay)
+            if not ok:
+                any_failed = True
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            if continue_on_error:
+                any_failed = True
+                continue
+            return 1
+
+    return 1 if any_failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

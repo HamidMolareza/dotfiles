@@ -29,5 +29,11 @@ add_to_path_if_missing "$SRC_DIR/ssh"
 add_to_path_if_missing "$SRC_DIR/icons"
 add_to_path_if_missing "$SRC_DIR/gpg"
 add_to_path_if_missing "$SRC_DIR/codex"
+add_to_path_if_missing "$SRC_DIR/motamem"
+add_to_path_if_missing "$SRC_DIR/virgool"
+add_to_path_if_missing "$SRC_DIR/mirrors"
+add_to_path_if_missing "$SRC_DIR/video"
+add_to_path_if_missing "$SRC_DIR/json"
+add_to_path_if_missing "$SRC_DIR/agent"
 
 export PATH

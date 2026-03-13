@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+export https_proxy="http://localhost:10808"
+export http_proxy="http://localhost:10808"
+
+export CODEX_HOME="$HOME/.codex3"
+exec codex "$@"

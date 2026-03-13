@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  speed.sh <speed> <input> [output]
+
+<speed>:
+  1.5   -> 1.5x faster
+  -1.5  -> 1.5x slower (i.e., speed = 1/1.5)
+
+Examples:
+  ./speed.sh 2    input.mp4
+  ./speed.sh 1.25 input.mkv output.mkv
+  ./speed.sh -1.5 input.mp4
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 2 ]]; then
+  usage
+  exit 1
+fi
+
+speed_in="$1"
+in="$2"
+out="${3:-}"
+
+command -v ffmpeg >/dev/null || { echo "ffmpeg not found"; exit 1; }
+command -v ffprobe >/dev/null || { echo "ffprobe not found"; exit 1; }
+[[ -f "$in" ]] || { echo "Input file not found: $in"; exit 1; }
+
+# Reject 0 or -0 etc.
+if awk -v s="$speed_in" 'BEGIN{exit (s+0==0)?0:1}'; then
+  echo "Speed cannot be 0"
+  exit 1
+fi
+
+# If speed is negative, interpret as "N times slower": actual_factor = 1/abs(speed)
+actual_factor="$(awk -v s="$speed_in" 'BEGIN{
+  if (s < 0) s = -s
+  printf "%.12f", (ARGV[1] ~ /^-/ ? 1.0/s : s)
+}' "$speed_in")"
+# The awk above needs the original sign; easier: do it in bash + awk cleanly:
+if [[ "$speed_in" == -* ]]; then
+  abs="${speed_in#-}"
+  actual_factor="$(awk -v a="$abs" 'BEGIN{printf "%.12f", 1.0/a}')"
+  label="slow${abs}"
+else
+  actual_factor="$speed_in"
+  label="x${speed_in}"
+fi
+
+# Default output name if not provided
+if [[ -z "$out" ]]; then
+  base="${in%.*}"
+  ext="${in##*.}"
+  out="${base}_${label}.${ext}"
+fi
+
+# If factor is (almost) 1, just copy streams
+if awk -v f="$actual_factor" 'BEGIN{exit (f>0.999999 && f<1.000001)?0:1}'; then
+  ffmpeg -hide_banner -y -i "$in" -c copy "$out"
+  echo "Wrote: $out"
+  exit 0
+fi
+
+# Video PTS multiplier: setpts = (1/factor) * PTS
+v_mul="$(awk -v f="$actual_factor" 'BEGIN{printf "%.12f", 1.0/f}')"
+
+# Build atempo chain within [0.5, 2.0]
+atempo_chain="$(awk -v f="$actual_factor" 'BEGIN{
+  # output like: atempo=2,atempo=1.25
+  n=0
+  # speed up: f>1 ; slow down: f<1
+  while (f > 2.0000001) { a[++n]=2.0; f/=2.0 }
+  while (f < 0.4999999) { a[++n]=0.5; f/=0.5 }
+  if (f < 0.999999 || f > 1.000001) a[++n]=f
+  for (i=1;i<=n;i++){
+    if (i>1) printf(",")
+    printf("atempo=%.12f", a[i])
+  }
+  printf("\n")
+}')"
+
+# Detect if input has an audio stream
+has_audio="$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$in" | head -n1 || true)"
+
+if [[ -n "$has_audio" ]]; then
+  # If chain empty, keep audio unchanged
+  if [[ -z "$atempo_chain" ]]; then
+    atempo_chain="anull"
+  fi
+
+  ffmpeg -hide_banner -y -i "$in" \
+    -filter_complex "[0:v]setpts=${v_mul}*PTS[v];[0:a]${atempo_chain}[a]" \
+    -map "[v]" -map "[a]" \
+    -c:v libx264 -crf 18 -preset medium \
+    -c:a aac -b:a 192k \
+    -movflags +faststart \
+    "$out"
+else
+  ffmpeg -hide_banner -y -i "$in" \
+    -filter:v "setpts=${v_mul}*PTS" \
+    -an \
+    -c:v libx264 -crf 18 -preset medium \
+    -movflags +faststart \
+    "$out"
+fi
+
+echo "Wrote: $out"

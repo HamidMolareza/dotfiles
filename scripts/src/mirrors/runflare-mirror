@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Manage Runflare npm and NuGet mirrors."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from typing import Sequence
+
+
+NPM_REGISTRY = "https://mirror-npm.runflare.com"
+NUGET_SOURCE_NAME = "RunflareMirror"
+NUGET_SOURCE_URL = "https://mirror-nuget.runflare.com/v3/index.json"
+
+
+def run(cmd: Sequence[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def npm_install() -> None:
+    run(["npm", "config", "set", "registry", NPM_REGISTRY])
+
+
+def npm_remove() -> None:
+    run(["npm", "config", "delete", "registry", NPM_REGISTRY])
+
+
+def dotnet_install() -> None:
+    run([
+        "dotnet",
+        "nuget",
+        "add",
+        "source",
+        NUGET_SOURCE_URL,
+        "--name",
+        NUGET_SOURCE_NAME,
+    ])
+    run([
+        "dotnet",
+        "nuget",
+        "disable",
+        "source",
+        "nuget.org"
+    ])
+
+
+def dotnet_remove() -> None:
+    run(["dotnet", "nuget", "remove", "source", NUGET_SOURCE_NAME])
+    run([
+        "dotnet",
+        "nuget",
+        "enable",
+        "source",
+        "nuget.org"
+    ])
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "action",
+        choices=(
+            "npm-install",
+            "npm-remove",
+            "dotnet-install",
+            "dotnet-remove",
+        ),
+        help="Which mirror action to run.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str]) -> int:
+    args = parse_args(argv)
+    if args.action == "npm-install":
+        npm_install()
+    elif args.action == "npm-remove":
+        npm_remove()
+    elif args.action == "dotnet-install":
+        dotnet_install()
+    elif args.action == "dotnet-remove":
+        dotnet_remove()
+    else:
+        raise ValueError(f"Unknown action: {args.action}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
