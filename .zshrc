@@ -114,3 +114,6 @@ fi
 if [ -f ~/.exports ]; then
     source ~/.exports
 fi
+
+eval "$(codex completion zsh)"
+eval "$(gapcode completion zsh)"
