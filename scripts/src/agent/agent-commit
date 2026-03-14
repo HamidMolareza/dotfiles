@@ -75,9 +75,9 @@ Output format:
 """.strip()
 
 # AI CLI execution defaults for this script. Edit these in one place.
-DEFAULT_AI_BIN = "gapcode"
-DEFAULT_AI_MODEL = "gpt-5.3-codex"
-DEFAULT_AI_CONFIG_OVERRIDES = ['model_reasoning_effort="high"']
+DEFAULT_AI_BIN = "gapcodex"
+DEFAULT_AI_MODEL = "gpt-5.4"
+DEFAULT_AI_CONFIG_OVERRIDES = ['model_reasoning_effort="medium"']
 
 # Default "noise" excludes (can be disabled via --no-default-excludes)
 DEFAULT_EXCLUDE_GLOBS = [
