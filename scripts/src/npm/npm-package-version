@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+show_help() {
+  cat <<'EOF'
+Usage: npm-package-version <package-name>
+
+Print the published version of an npm package using:
+  npm view <package-name> version
+
+Options:
+  -h, --help    Show this help message and exit
+
+Examples:
+  npm-package-version react
+  npm-package-version @types/node
+EOF
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    echo "Error: package name is required." >&2
+    show_help >&2
+    exit 1
+  fi
+
+  case "${1:-}" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+  esac
+
+  if [[ $# -ne 1 ]]; then
+    echo "Error: exactly one package name must be provided." >&2
+    show_help >&2
+    exit 1
+  fi
+
+  npm view "$1" version
+}
+
+main "$@"

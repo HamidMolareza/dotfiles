@@ -42,5 +42,6 @@ add_to_path_if_missing "$SRC_DIR/security"
 add_to_path_if_missing "$SRC_DIR/system"
 add_to_path_if_missing "$SRC_DIR/utils"
 add_to_path_if_missing "$SRC_DIR/web"
+add_to_path_if_missing "$SRC_DIR/npm"
 
 export PATH
