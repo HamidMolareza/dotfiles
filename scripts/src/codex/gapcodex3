@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+export CODEX_HOME="$HOME/.gapcodex3"
+exec codex "$@"

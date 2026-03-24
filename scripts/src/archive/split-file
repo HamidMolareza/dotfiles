@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+set -e
+
+INPUT_FILE="$1"
+PARTS="$2"
+OUTPUT_DIR="$3"
+
+if [ -z "$INPUT_FILE" ] || [ -z "$PARTS" ] || [ -z "$OUTPUT_DIR" ]; then
+    echo "Usage: $0 <file_path> <number_of_parts> <output_directory>"
+    exit 1
+fi
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "Error: File not found: $INPUT_FILE"
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+FILE_SIZE=$(stat -c%s "$INPUT_FILE")
+PART_SIZE=$(( (FILE_SIZE + PARTS - 1) / PARTS ))
+
+BASENAME=$(basename "$INPUT_FILE")
+
+echo "File size: $FILE_SIZE bytes"
+echo "Splitting into $PARTS parts (~$PART_SIZE bytes each)"
+
+split -b "$PART_SIZE" -d -a 3 "$INPUT_FILE" "$OUTPUT_DIR/${BASENAME}.part."
+
+echo "Done. Parts written to $OUTPUT_DIR"
