@@ -1,3 +1,8 @@
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+
 # If you come from bash you might have to change your $PATH.
 export PATH=$HOME/bin:/usr/local/bin:$PATH
 
@@ -115,5 +120,6 @@ if [ -f ~/.exports ]; then
     source ~/.exports
 fi
 
-eval "$(codex completion zsh)"
-eval "$(gapcode completion zsh)"
+if command_exists gcodext; then
+    eval "$(codex completion zsh)"
+fi
