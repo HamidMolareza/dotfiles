@@ -55,6 +55,7 @@ backup_and_link "$DOTFILES_DIR/docker-services" "$HOME/docker-services"
 backup_and_link "$DOTFILES_DIR/.icons" "$HOME/.icons"
 backup_and_link "$DOTFILES_DIR/Templates" "$HOME/Templates"
 backup_and_link "$DOTFILES_DIR/.config" "$HOME/.config"
+backup_and_link $DOTFILES_DIR/.local/share/applications $HOME/.local/share/applications
 
 backup_and_link "$DOTFILES_DIR/scripts" "$HOME/scripts"
 chmod +x -R $HOME/scripts
@@ -62,6 +63,13 @@ chmod +x -R $HOME/scripts
 backup_and_link $DOTFILES_DIR/nautilus/scripts $HOME/.local/share/nautilus/scripts
 chmod +x -R $HOME/.local/share/nautilus/scripts
 
-backup_and_link $DOTFILES_DIR/.local/share/applications $HOME/.local/share/applications
+# Agents
+backup_and_link $DOTFILES_DIR/agent-helpers/AGENTS.md $HOME/AGENTS.md
+[ -d "$HOME/.codex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/prompts $HOME/.codex/prompts/mlrz
+[ -d "$HOME/.gapcodex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/prompts $HOME/.gapcodex/prompts/mlrz
+[ -d "$HOME/.gapcode" ] && backup_and_link $DOTFILES_DIR/agent-helpers/prompts $HOME/.gapcode/prompts/mlrz
+[ -d "$HOME/.codex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/skills $HOME/.codex/skills/mlrz
+[ -d "$HOME/.gapcodex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/skills $HOME/.gapcodex/skills/mlrz
+[ -d "$HOME/.gapcode" ] && backup_and_link $DOTFILES_DIR/agent-helpers/skills $HOME/.gapcode/skills/mlrz
 
 echo "✅ Symlinks created. Restart your shell to apply."
