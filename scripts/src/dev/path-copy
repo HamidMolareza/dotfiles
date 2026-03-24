@@ -1,0 +1,33 @@
+#!/bin/bash
+
+path="${1:-.}"
+
+ABSOLUTE_PATH=$(realpath "$path")
+
+copy_to_clipboard() {
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$ABSOLUTE_PATH" | pbcopy
+    return 0
+  fi
+
+  if command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$ABSOLUTE_PATH" | wl-copy
+    return 0
+  fi
+
+  if command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$ABSOLUTE_PATH" | xclip -selection clipboard
+    return 0
+  fi
+
+  if command -v xsel >/dev/null 2>&1; then
+    printf '%s' "$ABSOLUTE_PATH" | xsel --clipboard --input
+    return 0
+  fi
+
+  echo "No supported clipboard command found." >&2
+  return 1
+}
+
+echo "$ABSOLUTE_PATH"
+copy_to_clipboard
