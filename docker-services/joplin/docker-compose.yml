@@ -12,6 +12,8 @@ services:
         image: joplin/server:latest
         depends_on:
             - db
+        volumes:
+            - './ntp-bypass/ntp-bypass.patch:/home/joplin/packages/lib/vendor/ntp-client.js:ro'
         ports:
             - "22300:22300"
         restart: unless-stopped
@@ -32,4 +34,3 @@ services:
             - MAILER_AUTH_PASSWORD=${MAILER_AUTH_PASSWORD}
             - MAILER_NOREPLY_NAME=${MAILER_NOREPLY_NAME}
             - MAILER_NOREPLY_EMAIL=${MAILER_NOREPLY_EMAIL}
-
