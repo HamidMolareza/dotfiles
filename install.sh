@@ -64,12 +64,14 @@ backup_and_link $DOTFILES_DIR/nautilus/scripts $HOME/.local/share/nautilus/scrip
 chmod +x -R $HOME/.local/share/nautilus/scripts
 
 # Agents
+
 backup_and_link $DOTFILES_DIR/agent-helpers/AGENTS.md $HOME/AGENTS.md
-[ -d "$HOME/.codex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/prompts $HOME/.codex/prompts/mlrz
-[ -d "$HOME/.gapcodex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/prompts $HOME/.gapcodex/prompts/mlrz
-[ -d "$HOME/.gapcode" ] && backup_and_link $DOTFILES_DIR/agent-helpers/prompts $HOME/.gapcode/prompts/mlrz
-[ -d "$HOME/.codex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/skills $HOME/.codex/skills/mlrz
-[ -d "$HOME/.gapcodex" ] && backup_and_link $DOTFILES_DIR/agent-helpers/skills $HOME/.gapcodex/skills/mlrz
-[ -d "$HOME/.gapcode" ] && backup_and_link $DOTFILES_DIR/agent-helpers/skills $HOME/.gapcode/skills/mlrz
+[ -d "$HOME/.codex" ] && ln -srf agent-helpers/prompts/* ~/.codex/prompts
+[ -d "$HOME/.gapcodex" ] && ln -srf agent-helpers/prompts/* ~/.gapcodex/prompts
+[ -d "$HOME/.gapcode" ] && ln -srf agent-helpers/prompts/* ~/.gapcode/prompts
+
+[ -d "$HOME/.codex" ] && ln -srf $DOTFILES_DIR/agent-helpers/skills/* $HOME/.codex/skills/
+[ -d "$HOME/.gapcodex" ] && ln -srf $DOTFILES_DIR/agent-helpers/skills/* $HOME/.gapcodex/skills/
+[ -d "$HOME/.gapcode" ] && ln -srf $DOTFILES_DIR/agent-helpers/skills/* $HOME/.gapcode/skills/
 
 echo "✅ Symlinks created. Restart your shell to apply."
