@@ -52,8 +52,6 @@ alias size-all='du -sh .'
 alias wifi-connection-name="nmcli -t -f DEVICE,STATE connection show --active | grep ':activated' | cut -d':' -f1 | head -n 1"
 alias wifi-usage="vnstat -i '$(wifi-connection-name)'"
 
-alias v2ray-config="/usr/local/etc/v2ray/config.json"
-
 te() {
     temp "$1" && exit
 }
