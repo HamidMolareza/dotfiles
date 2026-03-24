@@ -1,0 +1,4 @@
+interface:
+  display_name: "Command Creator"
+  short_description: "Create Codex CLI prompt commands"
+  default_prompt: "Use $command-creator to create a reusable Codex CLI custom command prompt for the task I describe."
