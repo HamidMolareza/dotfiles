@@ -1,0 +1,35 @@
+services:
+  adguardhome:
+    image: adguard/adguardhome
+    container_name: adguardhome
+    hostname: adguardhome
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    stop_grace_period: 30s
+    environment:
+      TZ: ${TZ:-Asia/Tehran}
+    volumes:
+      - type: bind
+        source: ./data/adguard/workdir
+        target: /opt/adguardhome/work
+      - type: bind
+        source: ./data/adguard/confdir
+        target: /opt/adguardhome/conf
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Host networking is the simplest and most reliable setup for DNS/DHCP.
+    # If you later switch away from `network_mode: host`, expose only the ports
+    # you actually use instead of publishing the full default list.
