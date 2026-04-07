@@ -1,0 +1,1409 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_RULES_FILE="$SCRIPT_DIR/backup-home.rules"
+DEFAULT_MANUAL_FILE="$SCRIPT_DIR/backup-home.manual"
+
+COMMAND=""
+DEST_ROOT=""
+DEST_ROOT_REAL=""
+RULES_FILE="$DEFAULT_RULES_FILE"
+MANUAL_FILE="$DEFAULT_MANUAL_FILE"
+DRY_RUN=0
+VERBOSE=0
+ASSUME_YES=0
+IGNORE_ERRORS=0
+LOG_FILE=""
+ACTIVE_LOG_FILE=""
+SNAPSHOT_NAME=""
+RESTORE_PATH=""
+RESTORE_DEST=""
+MANUAL_STAGE_DIR=""
+MANUAL_STAGE_ADDED=0
+
+
+declare -a POSITIONAL_ARGS=()
+declare -a TEMP_FILES=()
+declare -a INCLUDE_RULES=()
+declare -a EXCLUDE_RULES=()
+declare -a TRANSFER_PATHS=()
+declare -a EXPECTED_PATHS=()
+declare -a INCLUDE_ANCHORS=()
+declare -a SIZE_REPORT_ENTRIES=()
+SIZE_REPORT_TOTAL=0
+SIZE_REPORT_READY=0
+COLOR_ENABLED=0
+COLOR_RESET=$'\033[0m'
+COLOR_BOLD=$'\033[1m'
+COLOR_RED=$'\033[31m'
+COLOR_GREEN=$'\033[32m'
+COLOR_YELLOW=$'\033[33m'
+COLOR_BLUE=$'\033[34m'
+COLOR_MAGENTA=$'\033[35m'
+COLOR_CYAN=$'\033[36m'
+
+cleanup() {
+  local path
+
+  cleanup_manual_stage_dir
+
+  for path in "${TEMP_FILES[@]}"; do
+    [[ -n "$path" && -e "$path" ]] && rm -f -- "$path"
+  done
+  return 0
+}
+
+handle_interrupt() {
+  cleanup
+  exit 130
+}
+
+trap cleanup EXIT
+trap handle_interrupt INT TERM
+
+init_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+    COLOR_ENABLED=1
+  fi
+}
+
+print_colored_line() {
+  local color="$1"
+  local message="$2"
+
+  if [[ "$COLOR_ENABLED" -eq 1 ]]; then
+    printf '%b%s%b\n' "$color" "$message" "$COLOR_RESET"
+  else
+    printf '%s\n' "$message"
+  fi
+}
+
+print_heading() {
+  print_colored_line "${COLOR_BOLD}${COLOR_BLUE}" "$1"
+}
+
+print_label_value() {
+  local label="$1"
+  local value="$2"
+
+  if [[ "$COLOR_ENABLED" -eq 1 ]]; then
+    printf '%b%s%b %s\n' "${COLOR_BOLD}${COLOR_CYAN}" "$label" "$COLOR_RESET" "$value"
+  else
+    printf '%s %s\n' "$label" "$value"
+  fi
+}
+
+print_status_line() {
+  local color="$1"
+  local message="$2"
+
+  print_colored_line "$color" "$message"
+}
+
+console_log_line() {
+  local message="$1"
+
+  case "$message" in
+    "Backup finished successfully"*)
+      print_status_line "$COLOR_GREEN" "$message"
+      ;;
+    "Backup finished with warnings"*)
+      print_status_line "$COLOR_YELLOW" "$message"
+      ;;
+    "Backup mode:"*|"Expected behavior:"*)
+      print_status_line "$COLOR_MAGENTA" "$message"
+      ;;
+    "Rules file:"*|"Destination:"*|"Snapshot:"*|"Estimated source size:"*|"Available destination space:"*|"Manual staging directory:"*|"Previous snapshot for link-dest:"*|"Log file:"*|"Mode:"*)
+      print_status_line "$COLOR_CYAN" "$message"
+      ;;
+    *)
+      printf '%s\n' "$message"
+      ;;
+  esac
+}
+
+usage() {
+  cat <<EOF2
+Usage:
+  $SCRIPT_NAME [global-options] <command> [command-options]
+
+Commands:
+  plan       Show included rules, excluded rules, resolved backup paths, and manual tasks
+  manual     Show the manual pre-backup checklist
+  run        Create a new timestamped snapshot with rsync
+  list       Show available snapshots in the destination
+  verify     Validate a snapshot and report basic size and file counts
+  restore    Restore a full snapshot or one path to a chosen destination
+  help       Show this help text
+
+Global options:
+  --dest PATH         Backup destination root
+  --config-file PATH  Rules file path (default: $DEFAULT_RULES_FILE)
+  --manual-file PATH  Manual checklist path (default: $DEFAULT_MANUAL_FILE)
+  --dry-run           Preview write-capable actions without changing files
+  --verbose           Show detailed rsync output
+  --yes               Skip confirmation prompts where supported
+  --ignore-errors     Continue on rsync and validation errors where practical
+  --log-file PATH     Explicit log file path
+  -h, --help          Show help
+
+Command options:
+  verify [SNAPSHOT]
+  verify --snapshot SNAPSHOT
+
+  restore [SNAPSHOT]
+  restore --snapshot SNAPSHOT
+  restore --path /home/home/.dotfiles
+  restore --restore-to PATH
+
+Rules file format:
+  # comment
+  /home/home/my-files               include path or pattern
+  /home/home/Downloads/*.txt        include only matching files
+  !/home/home/Desktop/temp          exclude path or pattern
+
+Examples:
+  $SCRIPT_NAME --dest /media/home/backup-drive plan
+  $SCRIPT_NAME --config-file ./backup-home.rules --dest /media/home/backup-drive run --dry-run
+  $SCRIPT_NAME --dest /media/home/backup-drive list
+  $SCRIPT_NAME --dest /media/home/backup-drive verify 2026-04-07_12-00-00
+  $SCRIPT_NAME --dest /media/home/backup-drive restore 2026-04-07_12-00-00 --path /home/home/.dotfiles --restore-to /tmp/restore-dotfiles
+  $SCRIPT_NAME manual
+EOF2
+}
+
+die() {
+  if [[ "$COLOR_ENABLED" -eq 1 && -t 2 ]]; then
+    printf '%bError:%b %s\n' "${COLOR_BOLD}${COLOR_RED}" "$COLOR_RESET" "$*" >&2
+  else
+    printf 'Error: %s\n' "$*" >&2
+  fi
+  exit 1
+}
+
+warn() {
+  if [[ "$COLOR_ENABLED" -eq 1 && -t 2 ]]; then
+    printf '%bWarning:%b %s\n' "${COLOR_BOLD}${COLOR_YELLOW}" "$COLOR_RESET" "$*" >&2
+  else
+    printf 'Warning: %s\n' "$*" >&2
+  fi
+}
+
+log_line() {
+  local message="$1"
+  console_log_line "$message"
+  if [[ -n "$ACTIVE_LOG_FILE" ]]; then
+    printf '%s\n' "$message" >>"$ACTIVE_LOG_FILE"
+  fi
+}
+
+warn_line() {
+  local message="$1"
+  warn "$message"
+  if [[ -n "$ACTIVE_LOG_FILE" ]]; then
+    printf 'WARNING: %s\n' "$message" >>"$ACTIVE_LOG_FILE"
+  fi
+}
+
+require_commands() {
+  local cmd
+  for cmd in rsync find du df date mkdir mktemp readlink sort wc awk sed dirname cat tr; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+  done
+}
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+normalize_rule_line() {
+  local line="$1"
+  line="$(printf '%s\n' "$line" | sed -E 's/[[:space:]]+#.*$//')"
+  line="$(trim_whitespace "$line")"
+  if [[ "$line" == \#* ]]; then
+    printf '\n'
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
+timestamp_now() {
+  date '+%Y-%m-%d_%H-%M-%S'
+}
+
+canonicalize_path() {
+  readlink -m -- "$1"
+}
+
+is_absolute_rule() {
+  [[ "$1" == /* ]]
+}
+
+has_glob_pattern() {
+  local value="$1"
+  [[ "$value" == *'*'* || "$value" == *'?'* || "$value" == *'['* ]]
+}
+
+rule_anchor() {
+  local rule="$1"
+  local prefix
+
+  if ! has_glob_pattern "$rule"; then
+    printf '%s\n' "${rule%/}"
+    return 0
+  fi
+
+  prefix="$(printf '%s\n' "$rule" | sed -E 's/[*?\[].*$//')"
+  prefix="${prefix%/}"
+  [[ -n "$prefix" ]] || return 0
+
+  if [[ -e "$prefix" ]]; then
+    printf '%s\n' "$prefix"
+  else
+    dirname -- "$prefix"
+  fi
+}
+
+ensure_rules_file() {
+  [[ -f "$RULES_FILE" ]] || die "Rules file not found: $RULES_FILE"
+}
+
+parse_rules_file() {
+  local line
+  local rule
+
+  INCLUDE_RULES=()
+  EXCLUDE_RULES=()
+  INCLUDE_ANCHORS=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(normalize_rule_line "$line")"
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" == '!'* ]]; then
+      rule="$(trim_whitespace "${line:1}")"
+      [[ -n "$rule" ]] || die "Exclude rule is empty"
+      [[ "$rule" != "/" ]] || die "Exclude rule / is not allowed"
+      EXCLUDE_RULES+=("${rule%/}")
+    else
+      rule="$(trim_whitespace "$line")"
+      [[ "$rule" == /* ]] || die "Include rules must be absolute paths or patterns: $rule"
+      [[ "$rule" != "/" ]] || die "Include rule / is not allowed"
+      INCLUDE_RULES+=("${rule%/}")
+      rule="$(rule_anchor "$rule")"
+      [[ -n "$rule" ]] && INCLUDE_ANCHORS+=("$(canonicalize_path "$rule")")
+    fi
+  done <"$RULES_FILE"
+
+  [[ "${#INCLUDE_RULES[@]}" -gt 0 ]] || die "Rules file has no include rules: $RULES_FILE"
+}
+
+matches_exclude_rule() {
+  local path="$1"
+  local rule="$2"
+  local relative_path
+  local suffix
+
+  if is_absolute_rule "$rule"; then
+    if has_glob_pattern "$rule"; then
+      [[ "$path" == $rule ]]
+    else
+      [[ "$path" == "$rule" || "$path" == "$rule"/* ]]
+    fi
+    return
+  fi
+
+  relative_path="${path#/}"
+
+  if has_glob_pattern "$rule"; then
+    suffix="$relative_path"
+    while :; do
+      if [[ "$suffix" == $rule || "$suffix" == $rule/* ]]; then
+        return 0
+      fi
+      [[ "$suffix" == */* ]] || break
+      suffix="${suffix#*/}"
+    done
+    return 1
+  fi
+
+  [[ "$relative_path" == "$rule" || "$relative_path" == "$rule"/* || "$relative_path" == */"$rule" || "$relative_path" == */"$rule"/* ]]
+}
+
+is_excluded_path() {
+  local path="$1"
+  local rule
+
+  for rule in "${EXCLUDE_RULES[@]}"; do
+    if matches_exclude_rule "$path" "$rule"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+expand_include_rule() {
+  local rule="$1"
+  local old_settings
+  local match
+
+  if ! has_glob_pattern "$rule"; then
+    if [[ -e "$rule" ]]; then
+      printf '%s\n' "$(canonicalize_path "$rule")"
+    else
+      warn "Skipping missing include path: $rule"
+    fi
+    return 0
+  fi
+
+  old_settings="$(shopt -p nullglob dotglob globstar)"
+  shopt -s nullglob dotglob globstar
+
+  while IFS= read -r match; do
+    [[ -n "$match" ]] && printf '%s\n' "$(canonicalize_path "$match")"
+  done < <(compgen -G "$rule" || true)
+
+  eval "$old_settings"
+}
+
+minimize_paths() {
+  local path
+  local kept
+  local skip
+  local -a input=("$@")
+  local -a ordered=()
+  local -a minimal=()
+
+  if [[ "${#input[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  mapfile -t ordered < <(
+    printf '%s\n' "${input[@]}" \
+      | awk 'NF && !seen[$0]++ { print }' \
+      | awk -F/ '{ print NF "|" length($0) "|" $0 }' \
+      | sort -t'|' -k1,1n -k2,2n \
+      | cut -d'|' -f3-
+  )
+
+  for path in "${ordered[@]}"; do
+    skip=0
+    for kept in "${minimal[@]}"; do
+      if [[ "$path" == "$kept" || "$path" == "$kept"/* ]]; then
+        skip=1
+        break
+      fi
+    done
+    [[ "$skip" -eq 0 ]] && minimal+=("$path")
+  done
+
+  printf '%s\n' "${minimal[@]}"
+}
+
+resolve_transfer_paths() {
+  local rule
+  local candidate
+  local -a raw_paths=()
+  local -a raw_expected=()
+  local matched_count
+
+  for rule in "${INCLUDE_RULES[@]}"; do
+    candidate="$(rule_anchor "$rule")"
+    if [[ -n "$candidate" ]]; then
+      candidate="$(canonicalize_path "$candidate")"
+      if [[ -e "$candidate" ]]; then
+        raw_expected+=("$candidate")
+      fi
+    fi
+
+    matched_count=0
+
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      matched_count=1
+      if is_excluded_path "$candidate"; then
+        continue
+      fi
+      raw_paths+=("$candidate")
+    done < <(expand_include_rule "$rule")
+
+    if [[ "$matched_count" -eq 0 ]]; then
+      warn_line "No existing path matched include rule: $rule"
+    fi
+  done
+
+  [[ "${#raw_paths[@]}" -gt 0 ]] || die "No paths matched the include rules in $RULES_FILE"
+
+  mapfile -t TRANSFER_PATHS < <(minimize_paths "${raw_paths[@]}")
+  mapfile -t EXPECTED_PATHS < <(minimize_paths "${raw_expected[@]}")
+  SIZE_REPORT_ENTRIES=()
+  SIZE_REPORT_TOTAL=0
+  SIZE_REPORT_READY=0
+}
+
+ensure_dest_required() {
+  [[ -n "$DEST_ROOT" ]] || die "--dest is required for the $COMMAND command"
+}
+
+ensure_safe_destination() {
+  [[ -n "$DEST_ROOT" ]] || return 0
+
+  DEST_ROOT_REAL="$(canonicalize_path "$DEST_ROOT")"
+
+  case "$DEST_ROOT_REAL" in
+    /)
+      die "Destination / is not allowed"
+      ;;
+  esac
+}
+
+ensure_dest_access() {
+  local create_mode="$1"
+  local parent_dir
+
+  ensure_dest_required
+  ensure_safe_destination
+
+  if [[ -d "$DEST_ROOT_REAL" ]]; then
+    return 0
+  fi
+
+  if [[ "$create_mode" == "create" && "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p -- "$DEST_ROOT_REAL" || die "Could not create destination root: $DEST_ROOT_REAL"
+    return 0
+  fi
+
+  parent_dir="$(dirname "$DEST_ROOT_REAL")"
+  [[ -d "$parent_dir" ]] || die "Destination parent does not exist: $parent_dir"
+  [[ -w "$parent_dir" ]] || die "Destination parent is not writable: $parent_dir"
+}
+
+ensure_dest_not_inside_sources() {
+  local anchor
+
+  for anchor in "${INCLUDE_ANCHORS[@]}"; do
+    case "$DEST_ROOT_REAL" in
+      "$anchor"|"$anchor"/*)
+        die "Destination must not be inside a configured source path: $anchor"
+        ;;
+    esac
+  done
+}
+
+snapshot_root_dir() {
+  printf '%s\n' "$DEST_ROOT_REAL/snapshots"
+}
+
+logs_root_dir() {
+  printf '%s\n' "$DEST_ROOT_REAL/logs"
+}
+
+snapshot_path_for() {
+  printf '%s\n' "$(snapshot_root_dir)/$1"
+}
+
+list_snapshot_names() {
+  local root
+  root="$(snapshot_root_dir)"
+  [[ -d "$root" ]] || return 0
+  find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+latest_snapshot_name() {
+  list_snapshot_names | tail -n 1
+}
+
+resolve_snapshot_name() {
+  local resolved="$SNAPSHOT_NAME"
+  local latest=""
+  local snapshots_root
+
+  if [[ -z "$resolved" ]]; then
+    latest="$(latest_snapshot_name || true)"
+    resolved="$latest"
+  fi
+
+  if [[ -z "$resolved" ]]; then
+    snapshots_root="$(snapshot_root_dir)"
+    die "No snapshots found under $snapshots_root. Create a backup first or pass an existing snapshot name."
+  fi
+
+  printf '%s\n' "$resolved"
+}
+
+build_size_report() {
+  local path
+  local size
+  local rule
+  local -a du_cmd=()
+
+  [[ "$SIZE_REPORT_READY" -eq 0 ]] || return 0
+
+  SIZE_REPORT_ENTRIES=()
+  SIZE_REPORT_TOTAL=0
+
+  for path in "${TRANSFER_PATHS[@]}"; do
+    [[ -e "$path" ]] || continue
+
+    du_cmd=(du -sb)
+    for rule in "${EXCLUDE_RULES[@]}"; do
+      du_cmd+=(--exclude="$rule")
+    done
+    du_cmd+=(-- "$path")
+
+    size="$("${du_cmd[@]}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    [[ -n "$size" ]] || size=0
+    SIZE_REPORT_TOTAL=$((SIZE_REPORT_TOTAL + size))
+    SIZE_REPORT_ENTRIES+=("$size|$path")
+  done
+
+  SIZE_REPORT_READY=1
+}
+
+estimate_source_bytes() {
+  build_size_report
+  printf '%s\n' "$SIZE_REPORT_TOTAL"
+}
+
+size_report_rows() {
+  build_size_report
+
+  if [[ "${#SIZE_REPORT_ENTRIES[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  printf '%s\n' "${SIZE_REPORT_ENTRIES[@]}" | sort -t'|' -k1,1nr -k2,2
+}
+
+show_transfer_size_report() {
+  local size
+  local path
+  local found=0
+
+  print_heading "Estimated size by backup root:"
+  while IFS='|' read -r size path; do
+    [[ -n "$path" ]] || continue
+    printf '  - %8s  %s\n' "$(format_bytes_human "$size")" "$path"
+    found=1
+  done < <(size_report_rows)
+
+  if [[ "$found" -eq 0 ]]; then
+    printf '  - none\n'
+  fi
+}
+
+log_transfer_size_report() {
+  local source
+  local size
+  local found=0
+
+  log_line "Estimated size by backup root:"
+  while IFS='|' read -r size source; do
+    [[ -n "$source" ]] || continue
+    log_line "  - $(format_bytes_human "$size")  $source"
+    found=1
+  done < <(size_report_rows)
+
+  if [[ "$found" -eq 0 ]]; then
+    log_line "  - none"
+  fi
+}
+
+available_dest_bytes() {
+  local target="$DEST_ROOT_REAL"
+
+  while [[ ! -e "$target" && "$target" != "/" ]]; do
+    target="$(dirname "$target")"
+  done
+
+  df -B1 --output=avail "$target" | awk 'NR==2 {print $1}'
+}
+
+format_bytes_human() {
+  local value="$1"
+  awk -v bytes="$value" '
+    function human(x) {
+      split("B KiB MiB GiB TiB PiB", units, " ")
+      i = 1
+      while (x >= 1024 && i < 6) {
+        x /= 1024
+        i++
+      }
+      return sprintf("%.2f %s", x, units[i])
+    }
+    BEGIN {
+      print human(bytes + 0)
+    }
+  '
+}
+
+build_exclude_file() {
+  local temp_file
+  local rule
+
+  temp_file="$(mktemp)"
+  TEMP_FILES+=("$temp_file")
+
+  for rule in "${EXCLUDE_RULES[@]}"; do
+    if is_absolute_rule "$rule"; then
+      printf '%s\n' "${rule#/}" >>"$temp_file"
+    elif has_glob_pattern "$rule"; then
+      printf '%s\n' "$rule" >>"$temp_file"
+    else
+      printf '**/%s\n' "$rule" >>"$temp_file"
+      printf '**/%s/***\n' "$rule" >>"$temp_file"
+    fi
+  done
+
+  printf '%s\n' "$temp_file"
+}
+
+write_log_header() {
+  [[ -n "$ACTIVE_LOG_FILE" ]] || return 0
+  {
+    printf 'command=%s\n' "$COMMAND"
+    printf 'rules_file=%s\n' "$RULES_FILE"
+    printf 'dest=%s\n' "$DEST_ROOT_REAL"
+    printf 'start=%s\n' "$(date --iso-8601=seconds)"
+    [[ -n "$SNAPSHOT_NAME" ]] && printf 'snapshot=%s\n' "$SNAPSHOT_NAME"
+    printf '\n'
+  } >>"$ACTIVE_LOG_FILE"
+}
+
+write_log_footer() {
+  local status="$1"
+  [[ -n "$ACTIVE_LOG_FILE" ]] || return 0
+  {
+    printf '\n'
+    printf 'end=%s\n' "$(date --iso-8601=seconds)"
+    printf 'status=%s\n' "$status"
+  } >>"$ACTIVE_LOG_FILE"
+}
+
+run_command_logged() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    if [[ -n "$ACTIVE_LOG_FILE" ]]; then
+      "$@" 2>&1 | tee -a "$ACTIVE_LOG_FILE"
+    else
+      "$@"
+    fi
+  else
+    if [[ -n "$ACTIVE_LOG_FILE" ]]; then
+      "$@" >>"$ACTIVE_LOG_FILE" 2>&1
+    else
+      "$@"
+    fi
+  fi
+}
+
+run_command_logged_ignoreable() {
+  if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
+    set +e
+    run_command_logged "$@"
+    local rc=$?
+    set -e
+    return "$rc"
+  fi
+
+  run_command_logged "$@"
+}
+
+confirm_or_exit() {
+  local prompt="$1"
+  local reply
+
+  [[ "$ASSUME_YES" -eq 1 ]] && return 0
+
+  if [[ "$COLOR_ENABLED" -eq 1 ]]; then
+    printf '%b%s%b [y/N]: ' "${COLOR_BOLD}${COLOR_YELLOW}" "$prompt" "$COLOR_RESET"
+  else
+    printf '%s [y/N]: ' "$prompt"
+  fi
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      die "Operation cancelled"
+      ;;
+  esac
+}
+
+rsync_backup() {
+  local exclude_file="$1"
+  local destination_dir="$2"
+  local link_dest_dir="${3:-}"
+
+  local -a cmd=(
+    rsync
+    --archive
+    --hard-links
+    --human-readable
+    --relative
+    --exclude-from="$exclude_file"
+  )
+
+  [[ "$DRY_RUN" -eq 1 ]] && cmd+=(--dry-run)
+  [[ "$VERBOSE" -eq 1 ]] && cmd+=(--info=progress2 --itemize-changes)
+  [[ -n "$link_dest_dir" ]] && cmd+=(--link-dest="$link_dest_dir")
+
+  cmd+=("${TRANSFER_PATHS[@]}" "$destination_dir/")
+
+  run_command_logged_ignoreable "${cmd[@]}"
+}
+
+rsync_restore() {
+  local source_path="$1"
+  local destination_path="$2"
+
+  local -a cmd=(
+    rsync
+    --archive
+    --hard-links
+    --human-readable
+    --mkpath
+  )
+
+  [[ "$DRY_RUN" -eq 1 ]] && cmd+=(--dry-run)
+  [[ "$VERBOSE" -eq 1 ]] && cmd+=(--info=progress2 --itemize-changes)
+
+  cmd+=("$source_path" "$destination_path/")
+
+  run_command_logged "${cmd[@]}"
+}
+
+manual_items() {
+  local line
+
+  [[ -f "$MANUAL_FILE" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(normalize_rule_line "$line")"
+    [[ -z "$line" ]] && continue
+    printf '%s\n' "$line"
+  done <"$MANUAL_FILE"
+}
+
+parse_manual_entry() {
+  local raw="$1"
+  local title
+  local description=""
+
+  if [[ "$raw" == *"|"* ]]; then
+    title="$(trim_whitespace "${raw%%|*}")"
+    description="$(trim_whitespace "${raw#*|}")"
+  else
+    title="$(trim_whitespace "$raw")"
+  fi
+
+  [[ -n "$title" ]] || return 1
+  printf '%s\t%s\n' "$title" "$description"
+}
+
+manual_entries() {
+  local line
+  local parsed
+
+  while IFS= read -r line; do
+    parsed="$(parse_manual_entry "$line")" || continue
+    printf '%s\n' "$parsed"
+  done < <(manual_items)
+}
+
+manual_task_count() {
+  local count=0
+  local _
+
+  while IFS= read -r _; do
+    count=$((count + 1))
+  done < <(manual_entries)
+
+  printf '%s\n' "$count"
+}
+
+sanitize_manual_stage_name() {
+  local value="$1"
+
+  value="$(printf '%s' "$value" | tr -cs '[:alnum:].@_-' '_' | sed -E 's/^_+//; s/_+$//; s/_+/_/g')"
+  [[ -n "$value" ]] || value="item"
+  printf '%s\n' "$value"
+}
+
+create_manual_stage_dir() {
+  local title
+  local description
+  local base_name
+  local dir_name
+  local count
+  declare -A used_names=()
+
+  [[ -z "$MANUAL_STAGE_DIR" ]] || return 0
+
+  MANUAL_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/backup-home-manual.${SNAPSHOT_NAME}.XXXXXX")" \
+    || die "Could not create manual staging directory"
+
+  {
+    printf 'Manual backup staging for snapshot %s\n' "$SNAPSHOT_NAME"
+    printf '\n'
+    printf 'Copy files for manual checklist items into the matching folders below.\n'
+    printf 'Everything placed here will be included in this backup run.\n'
+    printf 'After a successful backup, the staging directory is removed automatically.\n'
+  } >"$MANUAL_STAGE_DIR/README.txt"
+
+  while IFS=$'\t' read -r title description; do
+    base_name="$(sanitize_manual_stage_name "$title")"
+    count="${used_names[$base_name]:-0}"
+    count=$((count + 1))
+    used_names["$base_name"]="$count"
+
+    dir_name="$base_name"
+    if [[ "$count" -gt 1 ]]; then
+      dir_name="${base_name}-${count}"
+    fi
+
+    mkdir -p -- "$MANUAL_STAGE_DIR/$dir_name"
+    if [[ -n "$description" ]]; then
+      {
+        printf 'Title: %s\n' "$title"
+        printf 'Description: %s\n' "$description"
+      } >"$MANUAL_STAGE_DIR/$dir_name/task.txt"
+    fi
+  done < <(manual_entries)
+}
+
+open_manual_stage_dir() {
+  [[ -n "$MANUAL_STAGE_DIR" ]] || return 0
+
+  if command -v xdg-open >/dev/null 2>&1; then
+    (xdg-open "$MANUAL_STAGE_DIR" >/dev/null 2>&1 &) || true
+  fi
+}
+
+attach_manual_stage_dir() {
+  [[ -n "$MANUAL_STAGE_DIR" ]] || return 0
+  [[ "$MANUAL_STAGE_ADDED" -eq 0 ]] || return 0
+
+  TRANSFER_PATHS+=("$MANUAL_STAGE_DIR")
+  mapfile -t TRANSFER_PATHS < <(minimize_paths "${TRANSFER_PATHS[@]}")
+  MANUAL_STAGE_ADDED=1
+  SIZE_REPORT_ENTRIES=()
+  SIZE_REPORT_TOTAL=0
+  SIZE_REPORT_READY=0
+}
+
+prepare_manual_stage_for_run() {
+  local reply
+  local task_total
+
+  [[ "$DRY_RUN" -eq 0 ]] || return 0
+
+  task_total="$(manual_task_count)"
+  [[ "$task_total" -gt 0 ]] || return 0
+
+  [[ -t 0 ]] || die "Manual staging requires an interactive terminal for a real backup run"
+
+  create_manual_stage_dir
+  attach_manual_stage_dir
+
+  printf '\n'
+  printf 'Manual checklist staging: %s task(s)\n' "$task_total"
+  printf 'Copy related files into: %s\n' "$MANUAL_STAGE_DIR"
+  printf 'Each task has its own folder and optional task.txt note.\n'
+  printf '\n'
+
+  open_manual_stage_dir
+  printf 'Press Enter when the manual staging folder is ready, or type q to abort: '
+  read -r reply
+  case "$reply" in
+    q|Q|quit|QUIT)
+      die "Backup cancelled while waiting for manual staging"
+      ;;
+  esac
+  printf '\n'
+}
+
+cleanup_manual_stage_dir() {
+  [[ -n "$MANUAL_STAGE_DIR" ]] || return 0
+
+  rm -rf -- "$MANUAL_STAGE_DIR" || warn_line "Could not remove manual staging directory: $MANUAL_STAGE_DIR"
+  MANUAL_STAGE_DIR=""
+  MANUAL_STAGE_ADDED=0
+}
+
+show_plan() {
+  local rule
+  local path
+  local bytes_estimate
+  local manual_count=0
+  local title
+  local description
+
+  ensure_dest_required
+  ensure_dest_access "check"
+  ensure_rules_file
+  parse_rules_file
+  ensure_dest_not_inside_sources
+  resolve_transfer_paths
+
+  build_size_report
+  bytes_estimate="$SIZE_REPORT_TOTAL"
+
+  print_label_value "Rules file:" "$RULES_FILE"
+  print_label_value "Destination:" "$DEST_ROOT_REAL"
+  print_label_value "Estimated source size:" "$(format_bytes_human "$bytes_estimate")"
+  printf '\n'
+
+  show_transfer_size_report
+  printf '\n'
+
+  print_heading "Include rules:"
+  for rule in "${INCLUDE_RULES[@]}"; do
+    printf '  - %s\n' "$rule"
+  done
+  printf '\n'
+
+  print_heading "Exclude rules:"
+  if [[ "${#EXCLUDE_RULES[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+  else
+    for rule in "${EXCLUDE_RULES[@]}"; do
+      printf '  - %s\n' "$rule"
+    done
+  fi
+  printf '\n'
+
+  print_heading "Resolved backup roots:"
+  for path in "${TRANSFER_PATHS[@]}"; do
+    printf '  - %s\n' "$path"
+  done
+  printf '\n'
+
+  print_heading "Manual checklist:"
+  while IFS=$'\t' read -r title description; do
+    if [[ -n "$description" ]]; then
+      printf '  - %s | %s\n' "$title" "$description"
+    else
+      printf '  - %s\n' "$title"
+    fi
+    manual_count=$((manual_count + 1))
+  done < <(manual_entries)
+
+  if [[ "$manual_count" -eq 0 ]]; then
+    printf '  - none\n'
+  fi
+}
+
+show_manual() {
+  local total
+  local index=1
+  local found=0
+  local title
+  local description
+  local reply
+
+  total="$(manual_task_count)"
+
+  while IFS=$'\t' read -r title description; do
+    printf '[%d/%s] %s\n' "$index" "$total" "$title"
+    if [[ -n "$description" ]]; then
+      printf '  %s\n' "$description"
+    fi
+    index=$((index + 1))
+    found=1
+
+    if [[ "$ASSUME_YES" -eq 0 && -t 0 ]]; then
+      printf 'Press Enter when done, or type q to stop: '
+      read -r reply
+      case "$reply" in
+        q|Q|quit|QUIT)
+          printf 'Stopped manual checklist.\n'
+          return 0
+          ;;
+      esac
+      printf '\n'
+    fi
+  done < <(manual_entries)
+
+  if [[ "$found" -eq 0 ]]; then
+    printf 'No manual checklist items are configured.\n'
+  fi
+}
+
+run_backup() {
+  local snapshot_dir
+  local previous_snapshot
+  local link_dest_dir=""
+  local estimated_bytes
+  local free_bytes
+  local exclude_file
+  local backup_rc=0
+
+  ensure_dest_required
+  ensure_dest_access "create"
+  ensure_rules_file
+  parse_rules_file
+  ensure_dest_not_inside_sources
+  resolve_transfer_paths
+  require_commands
+
+  SNAPSHOT_NAME="$(timestamp_now)"
+  prepare_manual_stage_for_run
+  build_size_report
+  estimated_bytes="$SIZE_REPORT_TOTAL"
+  free_bytes="$(available_dest_bytes)"
+
+  if [[ "$DRY_RUN" -eq 0 && "$estimated_bytes" -gt 0 && "$free_bytes" -lt "$estimated_bytes" ]]; then
+    die "Not enough free space at destination. Need about $(format_bytes_human "$estimated_bytes"), have $(format_bytes_human "$free_bytes")"
+  fi
+
+  snapshot_dir="$(snapshot_path_for "$SNAPSHOT_NAME")"
+  previous_snapshot="$(latest_snapshot_name || true)"
+  exclude_file="$(build_exclude_file)"
+
+  log_line "Rules file: $RULES_FILE"
+  log_line "Destination: $DEST_ROOT_REAL"
+  log_line "Snapshot: $SNAPSHOT_NAME"
+  log_line "Estimated source size: $(format_bytes_human "$estimated_bytes")"
+  log_line "Available destination space: $(format_bytes_human "$free_bytes")"
+  log_transfer_size_report
+  if [[ -n "$MANUAL_STAGE_DIR" ]]; then
+    log_line "Manual staging directory: $MANUAL_STAGE_DIR"
+  elif [[ "$DRY_RUN" -eq 1 && "$(manual_task_count)" -gt 0 ]]; then
+    log_line "Manual staging directory: skipped in dry-run mode"
+  fi
+  if [[ -n "$previous_snapshot" ]]; then
+    log_line "Backup mode: snapshot with hard-link reuse for unchanged files"
+    log_line "Previous snapshot for link-dest: $previous_snapshot"
+    log_line "Expected behavior: unchanged files are reused from the previous snapshot, changed files are copied again"
+  else
+    log_line "Backup mode: full initial snapshot"
+    log_line "Previous snapshot for link-dest: none"
+    log_line "Expected behavior: all selected files are copied into this first snapshot"
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_line "Mode: dry-run"
+  else
+    if [[ -n "$LOG_FILE" ]]; then
+      log_line "Log file: $LOG_FILE"
+    else
+      log_line "Log file: $(logs_root_dir)/backup-home-$SNAPSHOT_NAME.log"
+    fi
+  fi
+
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    printf '\n'
+    confirm_or_exit "Create snapshot $SNAPSHOT_NAME under $DEST_ROOT_REAL?"
+    mkdir -p -- "$(snapshot_root_dir)" "$(logs_root_dir)"
+    [[ -n "$LOG_FILE" ]] || LOG_FILE="$(logs_root_dir)/backup-home-$SNAPSHOT_NAME.log"
+    ACTIVE_LOG_FILE="$LOG_FILE"
+    : >"$ACTIVE_LOG_FILE"
+    write_log_header
+    trap 'write_log_footer "failed"' ERR
+    mkdir -p -- "$snapshot_dir"
+    link_dest_dir=""
+    if [[ -n "$previous_snapshot" ]]; then
+      link_dest_dir="$(snapshot_path_for "$previous_snapshot")"
+    fi
+  else
+    if [[ -n "$previous_snapshot" ]]; then
+      link_dest_dir="$(snapshot_path_for "$previous_snapshot")"
+    fi
+  fi
+
+  rsync_backup "$exclude_file" "$snapshot_dir" "$link_dest_dir"
+  backup_rc=$?
+
+  if [[ "$backup_rc" -ne 0 ]]; then
+    if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
+      warn_line "Backup completed with rsync errors. Exit code: $backup_rc"
+    else
+      die "Backup failed with rsync exit code: $backup_rc"
+    fi
+  fi
+
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    trap - ERR
+    if [[ "$backup_rc" -eq 0 ]]; then
+      cleanup_manual_stage_dir
+      write_log_footer "success"
+    else
+      [[ -n "$MANUAL_STAGE_DIR" ]] && warn_line "Manual staging directory kept for review: $MANUAL_STAGE_DIR"
+      write_log_footer "success-with-errors"
+    fi
+  fi
+
+  if [[ "$backup_rc" -eq 0 ]]; then
+    log_line "Backup finished successfully"
+  else
+    log_line "Backup finished with warnings"
+  fi
+}
+
+list_backups() {
+  local names
+
+  ensure_dest_required
+  ensure_dest_access "check"
+
+  names="$(list_snapshot_names)"
+  if [[ -z "$names" ]]; then
+    printf 'No snapshots found in %s.\n' "$(snapshot_root_dir)"
+    return 0
+  fi
+
+  print_heading "Snapshots in $(snapshot_root_dir):"
+  printf '%s\n' "$names" | sed 's/^/  - /'
+}
+
+verify_snapshot() {
+  local snapshot
+  local snapshot_dir
+  local expected_path
+  local missing=0
+  local size_human
+  local file_count
+
+  ensure_dest_required
+  ensure_dest_access "check"
+  ensure_rules_file
+  parse_rules_file
+  ensure_dest_not_inside_sources
+  resolve_transfer_paths
+
+  snapshot="$(resolve_snapshot_name)"
+  snapshot_dir="$(snapshot_path_for "$snapshot")"
+  [[ -d "$snapshot_dir" ]] || die "Snapshot not found: $snapshot_dir"
+
+  print_label_value "Snapshot:" "$snapshot"
+  print_label_value "Path:" "$snapshot_dir"
+  printf '\n'
+
+  print_heading "Expected paths:"
+  for expected_path in "${EXPECTED_PATHS[@]}"; do
+    if [[ -e "$snapshot_dir$expected_path" ]]; then
+      if [[ "$COLOR_ENABLED" -eq 1 ]]; then
+        printf '  %bOK%b  %s\n' "$COLOR_GREEN" "$COLOR_RESET" "$snapshot_dir$expected_path"
+      else
+        printf '  OK  %s\n' "$snapshot_dir$expected_path"
+      fi
+    else
+      if [[ "$COLOR_ENABLED" -eq 1 ]]; then
+        printf '  %bMISSING%b  %s\n' "$COLOR_RED" "$COLOR_RESET" "$snapshot_dir$expected_path"
+      else
+        printf '  MISSING  %s\n' "$snapshot_dir$expected_path"
+      fi
+      missing=1
+    fi
+  done
+
+  size_human="$(du -sh -- "$snapshot_dir" | awk '{print $1}')"
+  file_count="$(find "$snapshot_dir" -type f | wc -l | awk '{print $1}')"
+
+  printf '\n'
+  print_label_value "Snapshot size:" "$size_human"
+  print_label_value "File count:" "$file_count"
+
+  if [[ "$missing" -ne 0 ]]; then
+    if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
+      warn_line "Snapshot verification found missing expected paths"
+    else
+      die "Snapshot verification found missing expected paths"
+    fi
+  fi
+}
+
+restore_snapshot() {
+  local snapshot
+  local snapshot_dir
+  local source_path
+  local restore_source
+  local restore_mode
+
+  ensure_dest_required
+  ensure_dest_access "check"
+  snapshot="${SNAPSHOT_NAME:-}"
+  [[ -n "$snapshot" ]] || snapshot="${POSITIONAL_ARGS[0]:-}"
+  [[ -n "$snapshot" ]] || die "Restore requires a snapshot name"
+  [[ -n "$RESTORE_DEST" ]] || die "Restore requires --restore-to PATH"
+
+  snapshot_dir="$(snapshot_path_for "$snapshot")"
+  [[ -d "$snapshot_dir" ]] || die "Snapshot not found: $snapshot_dir"
+
+  RESTORE_DEST="$(canonicalize_path "$RESTORE_DEST")"
+
+  restore_mode="dry-run"
+  if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 1 ]]; then
+    restore_mode="real"
+  else
+    DRY_RUN=1
+  fi
+
+  if [[ "$restore_mode" == "real" ]]; then
+    mkdir -p -- "$RESTORE_DEST"
+  else
+    [[ -d "$RESTORE_DEST" || -d "$(dirname "$RESTORE_DEST")" ]] || die "Restore destination parent does not exist: $(dirname "$RESTORE_DEST")"
+    [[ -w "$RESTORE_DEST" || -w "$(dirname "$RESTORE_DEST")" ]] || die "Restore destination parent is not writable: $(dirname "$RESTORE_DEST")"
+  fi
+
+  if [[ -n "$RESTORE_PATH" ]]; then
+    source_path="$RESTORE_PATH"
+    case "$source_path" in
+      /*)
+        restore_source="$snapshot_dir$source_path"
+        ;;
+      *)
+        restore_source="$snapshot_dir/$source_path"
+        ;;
+    esac
+    [[ -e "$restore_source" ]] || die "Restore path not found in snapshot: $RESTORE_PATH"
+  else
+    restore_source="$snapshot_dir/"
+  fi
+
+  print_label_value "Restore snapshot:" "$snapshot"
+  print_label_value "Restore source:" "$restore_source"
+  print_label_value "Restore destination:" "$RESTORE_DEST"
+  print_label_value "Mode:" "$restore_mode"
+  if [[ "$restore_mode" == "dry-run" ]]; then
+    print_status_line "$COLOR_YELLOW" "Note: restore defaults to dry-run. Re-run with --yes to apply changes."
+  fi
+  printf '\n'
+
+  rsync_restore "$restore_source" "$RESTORE_DEST"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      plan|manual|run|list|verify|restore|help)
+        if [[ -z "$COMMAND" ]]; then
+          COMMAND="$1"
+        else
+          POSITIONAL_ARGS+=("$1")
+        fi
+        shift
+        ;;
+      --dest)
+        [[ $# -ge 2 ]] || die "--dest requires a value"
+        DEST_ROOT="$2"
+        shift 2
+        ;;
+      --config-file)
+        [[ $# -ge 2 ]] || die "--config-file requires a value"
+        RULES_FILE="$2"
+        shift 2
+        ;;
+      --manual-file)
+        [[ $# -ge 2 ]] || die "--manual-file requires a value"
+        MANUAL_FILE="$2"
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --yes)
+        ASSUME_YES=1
+        shift
+        ;;
+      --ignore-errors)
+        IGNORE_ERRORS=1
+        shift
+        ;;
+      --log-file)
+        [[ $# -ge 2 ]] || die "--log-file requires a value"
+        LOG_FILE="$2"
+        shift 2
+        ;;
+      --snapshot)
+        [[ $# -ge 2 ]] || die "--snapshot requires a value"
+        SNAPSHOT_NAME="$2"
+        shift 2
+        ;;
+      --path)
+        [[ $# -ge 2 ]] || die "--path requires a value"
+        RESTORE_PATH="$2"
+        shift 2
+        ;;
+      --restore-to)
+        [[ $# -ge 2 ]] || die "--restore-to requires a value"
+        RESTORE_DEST="$2"
+        shift 2
+        ;;
+      -h|--help)
+        COMMAND="help"
+        shift
+        ;;
+      *)
+        if [[ "$1" == -* ]]; then
+          die "Unknown option: $1"
+        fi
+        POSITIONAL_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+apply_positional_defaults() {
+  case "$COMMAND" in
+    verify)
+      if [[ -z "$SNAPSHOT_NAME" && "${#POSITIONAL_ARGS[@]}" -gt 0 ]]; then
+        SNAPSHOT_NAME="${POSITIONAL_ARGS[0]}"
+      fi
+      ;;
+    restore)
+      if [[ -z "$SNAPSHOT_NAME" && "${#POSITIONAL_ARGS[@]}" -gt 0 ]]; then
+        SNAPSHOT_NAME="${POSITIONAL_ARGS[0]}"
+      fi
+      ;;
+  esac
+}
+
+main() {
+  init_colors
+  parse_args "$@"
+  [[ -n "$COMMAND" ]] || COMMAND="help"
+  apply_positional_defaults
+
+  case "$COMMAND" in
+    help)
+      usage
+      ;;
+    plan)
+      show_plan
+      ;;
+    manual)
+      show_manual
+      ;;
+    run)
+      run_backup
+      ;;
+    list)
+      list_backups
+      ;;
+    verify)
+      verify_snapshot
+      ;;
+    restore)
+      restore_snapshot
+      ;;
+    *)
+      die "Unknown command: $COMMAND"
+      ;;
+  esac
+}
+
+main "$@"

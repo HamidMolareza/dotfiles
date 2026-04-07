@@ -1,0 +1,20 @@
+# Include rules. Use absolute paths or glob patterns.
+# Exclude rules start with !.
+# Use non-absolute excludes like !node_modules to skip matching names anywhere.
+
+/home/home/Downloads
+/home/home/Desktop
+
+# Exclusions
+!/home/home/Desktop/temp
+
+# Global dev/build excludes
+!node_modules
+!bin
+!obj
+!dist
+!build
+!.next
+!.nuxt
+!.cache
+!coverage
