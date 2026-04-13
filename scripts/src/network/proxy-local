@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import errno
 import http.client
 import ipaddress
 import select
@@ -369,7 +370,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if ensure_client_allowed(self.client_address[0], self.server.allowed_networks):
             return True
 
-        self.send_error(403, "Client IP is not allowed to use this proxy.")
+        self._safe_send_error_response(403, "Client IP is not allowed to use this proxy.")
         return False
 
     def _forward_http_request(self):
@@ -492,6 +493,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
             self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            log_event(
+                self.server.proxy_label,
+                f"{self.client_address[0]} - client disconnected while receiving upstream response",
+            )
         finally:
             response.close()
             connection.close()
@@ -501,7 +507,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.server.proxy_label,
             f"{self.client_address[0]} - proxy error: {exc}",
         )
-        self.send_error(502, f"Proxy error: {exc}")
+        self._safe_send_error_response(502, self._describe_upstream_error(exc))
 
     def _log_http_event(self, message: str):
         if self.server.verbose:
@@ -509,6 +515,34 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.server.proxy_label,
                 f"{self.client_address[0]} - {message}",
             )
+
+    def _safe_send_error_response(self, code: int, message: str):
+        try:
+            self.send_error(code, message)
+        except (BrokenPipeError, ConnectionResetError):
+            log_event(
+                self.server.proxy_label,
+                f"{self.client_address[0]} - client disconnected before error response could be sent",
+            )
+
+    def _describe_upstream_error(self, exc: Exception) -> str:
+        if isinstance(exc, TimeoutError):
+            return "Upstream connection timed out."
+
+        if isinstance(exc, socket.gaierror):
+            return "Failed to resolve the upstream host."
+
+        if isinstance(exc, OSError):
+            if exc.errno == errno.ENETUNREACH:
+                return "Network is unreachable from this machine."
+            if exc.errno == errno.EHOSTUNREACH:
+                return "Upstream host is unreachable."
+            if exc.errno == errno.ECONNREFUSED:
+                return "Upstream server refused the connection."
+            if exc.errno == errno.ECONNRESET:
+                return "Upstream connection was reset."
+
+        return f"Proxy error: {exc}"
 
 
 class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
