@@ -4,6 +4,7 @@ import argparse
 import errno
 import http.client
 import ipaddress
+import os
 import select
 import socket
 import socketserver
@@ -37,10 +38,59 @@ SOCKS_CMD_CONNECT = 1
 SOCKS_ATYP_IPV4 = 1
 SOCKS_ATYP_DOMAIN = 3
 SOCKS_ATYP_IPV6 = 4
+COLOR_RESET = "\033[0m"
+COLOR_BOLD = "\033[1m"
+COLOR_CYAN = "\033[36m"
+COLOR_BLUE = "\033[34m"
+COLOR_GREEN = "\033[32m"
+COLOR_YELLOW = "\033[33m"
+COLOR_RED = "\033[31m"
+COLOR_MAGENTA = "\033[35m"
+
+
+def supports_color(stream) -> bool:
+    if not hasattr(stream, "isatty") or not stream.isatty():
+        return False
+    return "NO_COLOR" not in os.environ
+
+
+def colorize(text: str, *styles: str, stream=sys.stdout) -> str:
+    if not supports_color(stream):
+        return text
+    return f"{''.join(styles)}{text}{COLOR_RESET}"
+
+
+def style_proxy_label(proxy_label: str, stream) -> str:
+    palette = {
+        "http": COLOR_CYAN,
+        "https": COLOR_MAGENTA,
+        "socks5": COLOR_GREEN,
+    }
+    return colorize(proxy_label, COLOR_BOLD, palette.get(proxy_label, COLOR_BLUE), stream=stream)
+
+
+def print_info(message: str):
+    print(colorize(message, COLOR_CYAN, stream=sys.stdout))
+
+
+def print_success(message: str):
+    print(colorize(message, COLOR_GREEN, stream=sys.stdout))
+
+
+def print_warning(message: str):
+    print(colorize(message, COLOR_YELLOW, stream=sys.stdout))
+
+
+def print_section(title: str):
+    print(colorize(title, COLOR_BOLD, COLOR_BLUE, stream=sys.stdout))
 
 
 def log_event(proxy_label: str, message: str):
-    print(f"[{proxy_label}] {message}", file=sys.stderr, flush=True)
+    print(
+        f"[{style_proxy_label(proxy_label, sys.stderr)}] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -738,42 +788,48 @@ def start_servers(args, allowed_networks):
 
 
 def print_startup_instructions(servers, allowed_networks, client_ips):
-    print("Proxy listeners:")
+    print_section("Proxy listeners")
     for item in servers:
-        print(f"  {item.proxy_type}: {item.bind_ip}:{item.port}")
-        print(f"    {item.compatibility}")
+        listener = f"{item.bind_ip}:{item.port}"
+        print(f"  {style_proxy_label(item.proxy_type, sys.stdout)}  {colorize(listener, COLOR_BOLD, stream=sys.stdout)}")
+        print(f"     {colorize(item.compatibility, COLOR_BLUE, stream=sys.stdout)}")
 
     if allowed_networks:
         allowed_text = ", ".join(str(network) for network in allowed_networks)
-        print(f"Allowed clients: {allowed_text}")
+        print_success(f"Allowed clients: {allowed_text}")
     else:
-        print("Allowed clients: any device that can reach this address")
-        print("Security note: on shared Wi-Fi, prefer --allow-client PHONE_IP")
+        print_warning("Allowed clients: any device that can reach this address")
+        print_warning("Security note: on shared Wi-Fi, prefer --allow-client PHONE_IP")
 
     http_server = next((item for item in servers if item.proxy_type == "http"), None)
     if http_server:
-        print("\nPhone Wi-Fi setup:")
-        print("  Proxy type: Manual / HTTP")
+        print()
+        print_section("Phone Wi-Fi setup")
+        print(f"  Proxy type: {colorize('Manual / HTTP', COLOR_BOLD, COLOR_CYAN, stream=sys.stdout)}")
         if client_ips:
-            print(f"  Host: {client_ips[0]}")
+            print(f"  Host: {colorize(client_ips[0], COLOR_BOLD, COLOR_GREEN, stream=sys.stdout)}")
         else:
-            print(f"  Host: <use this computer's Wi-Fi IPv4 address>")
-        print(f"  Port: {http_server.port}")
+            print_warning("  Host: <use this computer's Wi-Fi IPv4 address>")
+        print(f"  Port: {colorize(str(http_server.port), COLOR_BOLD, COLOR_GREEN, stream=sys.stdout)}")
         if len(client_ips) > 1:
-            print(f"  Other detected IPv4 addresses: {', '.join(client_ips[1:])}")
+            print_info(f"  Other detected IPv4 addresses: {', '.join(client_ips[1:])}")
 
     if client_ips:
-        print(f"\nDetected IPv4 addresses for clients: {', '.join(client_ips)}")
+        print()
+        print_info(f"Detected IPv4 addresses for clients: {', '.join(client_ips)}")
     elif any(item.bind_ip == "0.0.0.0" for item in servers):
-        print("\nDetected IPv4 addresses for clients: none found automatically")
-        print("Use your computer's Wi-Fi IPv4 address as the phone proxy host.")
+        print()
+        print_warning("Detected IPv4 addresses for clients: none found automatically")
+        print_warning("Use your computer's Wi-Fi IPv4 address as the phone proxy host.")
 
     if any(item.bind_ip == "127.0.0.1" for item in servers):
-        print("\nWarning: 127.0.0.1 is only reachable from this machine.")
-        print("Use --bind 0.0.0.0 or your LAN IP for phone access.")
+        print()
+        print_warning("Warning: 127.0.0.1 is only reachable from this machine.")
+        print_warning("Use --bind 0.0.0.0 or your LAN IP for phone access.")
 
-    print("\nConnection logs are printed automatically when devices connect or disconnect.")
-    print("\nPress Ctrl+C to stop.")
+    print()
+    print_info("Connection logs are printed automatically when devices connect or disconnect.")
+    print_success("Press Ctrl+C to stop.")
 
 
 def shutdown_servers(servers):
