@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+
+import argparse
+import http.client
+import ipaddress
+import select
+import socket
+import socketserver
+import ssl
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit
+
+HTTP_DEFAULT_PORT = 8899
+HTTPS_DEFAULT_PORT = 8900
+SOCKS5_DEFAULT_PORT = 1080
+DEFAULT_TIMEOUT_SECONDS = 30
+BUFFER_SIZE = 64 * 1024
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+SOCKS_VERSION = 5
+SOCKS_CMD_CONNECT = 1
+SOCKS_ATYP_IPV4 = 1
+SOCKS_ATYP_DOMAIN = 3
+SOCKS_ATYP_IPV6 = 4
+
+
+def log_event(proxy_label: str, message: str):
+    print(f"[{proxy_label}] {message}", file=sys.stderr, flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name,
+        description="Start proxy listeners on this computer so a phone or another device on the same Wi-Fi can use them.",
+        epilog=(
+            "Examples:\n"
+            "  proxy-local\n"
+            "  proxy-local --type http --type socks5\n"
+            "  proxy-local --allow-client 192.168.1.50\n"
+            "  proxy-local --type https --cert-file cert.pem --key-file key.pem\n\n"
+            "Notes:\n"
+            "  - Phone Wi-Fi settings usually support only an HTTP proxy.\n"
+            "  - HTTPS mode here means a TLS-wrapped HTTP proxy server.\n"
+            "  - SOCKS5 is useful for apps or tools that support it directly.\n"
+            "  - On shared Wi-Fi, prefer --allow-client with your phone IP."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--type",
+        action="append",
+        choices=["http", "https", "socks5"],
+        dest="proxy_types",
+        help="Proxy type to start. Repeat to start more than one. Default: http and socks5",
+    )
+    parser.add_argument(
+        "--bind",
+        default="0.0.0.0",
+        help="IP address to listen on. Default: 0.0.0.0 (all IPv4 interfaces).",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=HTTP_DEFAULT_PORT,
+        help=f"TCP port for the HTTP proxy. Default: {HTTP_DEFAULT_PORT}",
+    )
+    parser.add_argument(
+        "--https-port",
+        type=int,
+        default=HTTPS_DEFAULT_PORT,
+        help=f"TCP port for the HTTPS proxy. Default: {HTTPS_DEFAULT_PORT}",
+    )
+    parser.add_argument(
+        "--socks5-port",
+        type=int,
+        default=SOCKS5_DEFAULT_PORT,
+        help=f"TCP port for the SOCKS5 proxy. Default: {SOCKS5_DEFAULT_PORT}",
+    )
+    parser.add_argument(
+        "--allow-client",
+        action="append",
+        default=[],
+        metavar="IP_OR_CIDR",
+        help="Allow only the given client IP or CIDR. Repeat to allow multiple entries.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"Upstream connect/read timeout in seconds. Default: {DEFAULT_TIMEOUT_SECONDS}",
+    )
+    parser.add_argument(
+        "--cert-file",
+        help="Certificate file for --type https.",
+    )
+    parser.add_argument(
+        "--key-file",
+        help="Private key file for --type https.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-request and tunnel logs in addition to the default connection logs.",
+    )
+    return parser
+
+
+def detect_candidate_client_ips():
+    candidates = []
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("1.1.1.1", 80))
+            candidates.append(probe.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            if family == socket.AF_INET:
+                candidates.append(sockaddr[0])
+    except OSError:
+        pass
+
+    preferred = []
+    fallback = []
+    seen = set()
+
+    for candidate in candidates:
+        if not candidate or candidate.startswith("127.") or candidate in seen:
+            continue
+
+        seen.add(candidate)
+
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+
+        if address.is_private:
+            preferred.append(candidate)
+        else:
+            fallback.append(candidate)
+
+    return preferred or fallback
+
+
+def parse_allowed_networks(values):
+    networks = []
+    for value in values:
+        try:
+            if "/" in value:
+                networks.append(ipaddress.ip_network(value, strict=False))
+            else:
+                networks.append(ipaddress.ip_network(f"{value}/32", strict=False))
+        except ValueError as exc:
+            raise SystemExit(f"Error: invalid --allow-client value '{value}': {exc}") from exc
+    return networks
+
+
+def ensure_valid_port(port: int, label: str):
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"Error: {label} must be between 1 and 65535.")
+
+
+def ensure_client_allowed(client_ip: str, allowed_networks) -> bool:
+    if not allowed_networks:
+        return True
+
+    return any(ipaddress.ip_address(client_ip) in network for network in allowed_networks)
+
+
+def split_host_port(value: str, default_port: int):
+    value = value.strip()
+    if not value:
+        raise ValueError("missing host")
+
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            raise ValueError("invalid IPv6 host")
+        host = value[1:end]
+        rest = value[end + 1 :]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError("invalid host:port")
+        return host, int(rest[1:])
+
+    if value.count(":") == 1:
+        host, port_text = value.rsplit(":", 1)
+        if port_text.isdigit():
+            return host, int(port_text)
+
+    return value, default_port
+
+
+def tunnel_bidirectional(left_socket, right_socket):
+    left_socket.setblocking(False)
+    right_socket.setblocking(False)
+    sockets = [left_socket, right_socket]
+
+    while True:
+        readable, _, exceptional = select.select(sockets, [], sockets, 1.0)
+        if exceptional:
+            return
+
+        for current in readable:
+            try:
+                data = current.recv(BUFFER_SIZE)
+            except OSError:
+                return
+
+            if not data:
+                return
+
+            target = right_socket if current is left_socket else left_socket
+            try:
+                target.sendall(data)
+            except OSError:
+                return
+
+
+class ClientTracker:
+    def __init__(self, proxy_label: str):
+        self.proxy_label = proxy_label
+        self._lock = threading.Lock()
+        self._active_by_ip = {}
+
+    def connected(self, client_ip: str):
+        with self._lock:
+            self._active_by_ip[client_ip] = self._active_by_ip.get(client_ip, 0) + 1
+            active_count = self._active_by_ip[client_ip]
+            total_count = sum(self._active_by_ip.values())
+        log_event(
+            self.proxy_label,
+            f"client connected: {client_ip} (active for IP: {active_count}, total: {total_count})",
+        )
+
+    def disconnected(self, client_ip: str):
+        with self._lock:
+            current = self._active_by_ip.get(client_ip, 0)
+            if current <= 1:
+                self._active_by_ip.pop(client_ip, None)
+                active_count = 0
+            else:
+                self._active_by_ip[client_ip] = current - 1
+                active_count = self._active_by_ip[client_ip]
+            total_count = sum(self._active_by_ip.values())
+        log_event(
+            self.proxy_label,
+            f"client disconnected: {client_ip} (active for IP: {active_count}, total: {total_count})",
+        )
+
+
+class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler_class, *, allowed_networks, timeout_seconds, verbose, proxy_label):
+        super().__init__(server_address, handler_class)
+        self.allowed_networks = allowed_networks
+        self.timeout_seconds = timeout_seconds
+        self.verbose = verbose
+        self.proxy_label = proxy_label
+        self.client_tracker = ClientTracker(proxy_label)
+
+
+class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
+    def __init__(
+        self,
+        server_address,
+        handler_class,
+        *,
+        ssl_context,
+        allowed_networks,
+        timeout_seconds,
+        verbose,
+        proxy_label,
+    ):
+        self.ssl_context = ssl_context
+        super().__init__(
+            server_address,
+            handler_class,
+            allowed_networks=allowed_networks,
+            timeout_seconds=timeout_seconds,
+            verbose=verbose,
+            proxy_label=proxy_label,
+        )
+
+    def get_request(self):
+        raw_socket, client_address = super().get_request()
+        try:
+            return self.ssl_context.wrap_socket(raw_socket, server_side=True), client_address
+        except ssl.SSLError:
+            raw_socket.close()
+            raise
+
+
+class ProxyRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "proxy-local/2.0"
+
+    def handle(self):
+        self.server.client_tracker.connected(self.client_address[0])
+        try:
+            super().handle()
+        finally:
+            self.server.client_tracker.disconnected(self.client_address[0])
+
+    def log_message(self, fmt, *args):
+        if self.server.verbose:
+            log_event(
+                self.server.proxy_label,
+                f"{self.client_address[0]} - {fmt % args}",
+            )
+
+    def do_CONNECT(self):
+        if not self._check_client_allowed():
+            return
+
+        try:
+            host, port = split_host_port(self.path, 443)
+            with socket.create_connection((host, port), timeout=self.server.timeout_seconds) as upstream:
+                self.send_response(200, "Connection Established")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                tunnel_bidirectional(self.connection, upstream)
+        except Exception as exc:
+            self._send_gateway_error(exc)
+
+    def do_GET(self):
+        self._forward_http_request()
+
+    def do_HEAD(self):
+        self._forward_http_request()
+
+    def do_POST(self):
+        self._forward_http_request()
+
+    def do_PUT(self):
+        self._forward_http_request()
+
+    def do_PATCH(self):
+        self._forward_http_request()
+
+    def do_DELETE(self):
+        self._forward_http_request()
+
+    def do_OPTIONS(self):
+        self._forward_http_request()
+
+    def _check_client_allowed(self) -> bool:
+        if ensure_client_allowed(self.client_address[0], self.server.allowed_networks):
+            return True
+
+        self.send_error(403, "Client IP is not allowed to use this proxy.")
+        return False
+
+    def _forward_http_request(self):
+        if not self._check_client_allowed():
+            return
+
+        transfer_encoding = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in transfer_encoding.lower():
+            self.send_error(501, "Chunked request bodies are not supported.")
+            return
+
+        try:
+            scheme, host, port, target_path = self._extract_target()
+            body = self._read_request_body()
+            connection, response = self._perform_upstream_request(scheme, host, port, target_path, body)
+            self._write_response(connection, response)
+        except Exception as exc:
+            self._send_gateway_error(exc)
+
+    def _extract_target(self):
+        parsed = urlsplit(self.path)
+
+        if parsed.scheme and parsed.netloc:
+            scheme = parsed.scheme.lower()
+            host, port = split_host_port(parsed.netloc, 443 if scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            return scheme, host, port, path
+
+        host_header = self.headers.get("Host", "").strip()
+        if not host_header:
+            raise ValueError("missing Host header")
+
+        host, port = split_host_port(host_header, 80)
+        return "http", host, port, self.path or "/"
+
+    def _read_request_body(self):
+        content_length = self.headers.get("Content-Length")
+        if not content_length:
+            return None
+
+        length = int(content_length)
+        if length <= 0:
+            return None
+
+        return self.rfile.read(length)
+
+    def _perform_upstream_request(self, scheme, host, port, target_path, body):
+        connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        connection_kwargs = {"timeout": self.server.timeout_seconds}
+        if scheme == "https":
+            connection_kwargs["context"] = ssl.create_default_context()
+
+        outbound_headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in HOP_BY_HOP_HEADERS
+        }
+        outbound_headers["Host"] = host if port in {80, 443} else f"{host}:{port}"
+        outbound_headers["Connection"] = "close"
+
+        connection = connection_class(host, port, **connection_kwargs)
+        connection.request(self.command, target_path, body=body, headers=outbound_headers)
+        return connection, connection.getresponse()
+
+    def _write_response(self, connection, response):
+        try:
+            self.send_response(response.status, response.reason)
+            for key, value in response.getheaders():
+                if key.lower() in HOP_BY_HOP_HEADERS:
+                    continue
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            while True:
+                chunk = response.read(BUFFER_SIZE)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+            self.wfile.flush()
+        finally:
+            response.close()
+            connection.close()
+
+    def _send_gateway_error(self, exc: Exception):
+        self.send_error(502, f"Proxy error: {exc}")
+
+
+class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    address_family = socket.AF_INET
+
+    def __init__(self, server_address, handler_class, *, allowed_networks, timeout_seconds, verbose):
+        super().__init__(server_address, handler_class)
+        self.allowed_networks = allowed_networks
+        self.timeout_seconds = timeout_seconds
+        self.verbose = verbose
+        self.proxy_label = "socks5"
+        self.client_tracker = ClientTracker(self.proxy_label)
+
+
+class Socks5RequestHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client_ip = self.client_address[0]
+        self.server.client_tracker.connected(client_ip)
+        try:
+            if not ensure_client_allowed(client_ip, self.server.allowed_networks):
+                self._log("denied")
+                return
+
+            self.request.settimeout(self.server.timeout_seconds)
+
+            version = self._read_exact(1)[0]
+            if version != SOCKS_VERSION:
+                raise ValueError("unsupported SOCKS version")
+
+            methods_count = self._read_exact(1)[0]
+            methods = self._read_exact(methods_count)
+            if 0 not in methods:
+                self.request.sendall(bytes([SOCKS_VERSION, 0xFF]))
+                return
+
+            self.request.sendall(bytes([SOCKS_VERSION, 0x00]))
+
+            version, command, _, address_type = self._read_exact(4)
+            if version != SOCKS_VERSION:
+                raise ValueError("unsupported SOCKS version")
+            if command != SOCKS_CMD_CONNECT:
+                self._send_reply(0x07)
+                return
+
+            destination_host = self._read_destination_host(address_type)
+            destination_port = int.from_bytes(self._read_exact(2), "big")
+
+            with socket.create_connection(
+                (destination_host, destination_port),
+                timeout=self.server.timeout_seconds,
+            ) as upstream:
+                bind_host, bind_port = upstream.getsockname()[:2]
+                self._send_success_reply(bind_host, bind_port)
+                self._log(f"connect {destination_host}:{destination_port}")
+                tunnel_bidirectional(self.request, upstream)
+        except (OSError, ValueError):
+            self._send_reply(0x01)
+        finally:
+            self.server.client_tracker.disconnected(client_ip)
+
+    def _read_exact(self, size: int) -> bytes:
+        remaining = size
+        chunks = []
+        while remaining > 0:
+            chunk = self.request.recv(remaining)
+            if not chunk:
+                raise OSError("connection closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _read_destination_host(self, address_type: int) -> str:
+        if address_type == SOCKS_ATYP_IPV4:
+            return socket.inet_ntoa(self._read_exact(4))
+        if address_type == SOCKS_ATYP_IPV6:
+            return socket.inet_ntop(socket.AF_INET6, self._read_exact(16))
+        if address_type == SOCKS_ATYP_DOMAIN:
+            length = self._read_exact(1)[0]
+            return self._read_exact(length).decode("utf-8")
+        raise ValueError("unsupported address type")
+
+    def _send_success_reply(self, bind_host: str, bind_port: int):
+        try:
+            packed_host = socket.inet_aton(bind_host)
+            address_type = SOCKS_ATYP_IPV4
+        except OSError:
+            packed_host = socket.inet_pton(socket.AF_INET6, bind_host)
+            address_type = SOCKS_ATYP_IPV6
+
+        reply = bytearray([SOCKS_VERSION, 0x00, 0x00, address_type])
+        reply.extend(packed_host)
+        reply.extend(bind_port.to_bytes(2, "big"))
+        self.request.sendall(reply)
+
+    def _send_reply(self, reply_code: int):
+        self.request.sendall(bytes([SOCKS_VERSION, reply_code, 0x00, SOCKS_ATYP_IPV4, 0, 0, 0, 0, 0, 0]))
+
+    def _log(self, message: str):
+        if self.server.verbose:
+            sys.stderr.write(f"[socks5] {self.client_address[0]} - {message}\n")
+
+
+@dataclass
+class RunningServer:
+    proxy_type: str
+    bind_ip: str
+    port: int
+    compatibility: str
+    server: socketserver.BaseServer
+    thread: threading.Thread
+
+
+def build_ssl_context(cert_file: str, key_file: str) -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    return context
+
+
+def start_servers(args, allowed_networks):
+    selected_types = args.proxy_types or ["http", "socks5"]
+    servers = []
+
+    if "http" in selected_types:
+        server = ThreadedHTTPProxyServer(
+            (args.bind, args.http_port),
+            ProxyRequestHandler,
+            allowed_networks=allowed_networks,
+            timeout_seconds=args.timeout,
+            verbose=args.verbose,
+            proxy_label="http",
+        )
+        servers.append(
+            RunningServer(
+                proxy_type="http",
+                bind_ip=args.bind,
+                port=args.http_port,
+                compatibility="Works with phone Wi-Fi proxy settings.",
+                server=server,
+                thread=threading.Thread(target=server.serve_forever, daemon=True),
+            )
+        )
+
+    if "https" in selected_types:
+        if not args.cert_file or not args.key_file:
+            raise SystemExit("Error: --type https requires both --cert-file and --key-file.")
+
+        ssl_context = build_ssl_context(args.cert_file, args.key_file)
+        server = ThreadedTLSHTTPProxyServer(
+            (args.bind, args.https_port),
+            ProxyRequestHandler,
+            ssl_context=ssl_context,
+            allowed_networks=allowed_networks,
+            timeout_seconds=args.timeout,
+            verbose=args.verbose,
+            proxy_label="https",
+        )
+        servers.append(
+            RunningServer(
+                proxy_type="https",
+                bind_ip=args.bind,
+                port=args.https_port,
+                compatibility="Only for clients that support an HTTPS proxy with your certificate.",
+                server=server,
+                thread=threading.Thread(target=server.serve_forever, daemon=True),
+            )
+        )
+
+    if "socks5" in selected_types:
+        server = ThreadedSocks5Server(
+            (args.bind, args.socks5_port),
+            Socks5RequestHandler,
+            allowed_networks=allowed_networks,
+            timeout_seconds=args.timeout,
+            verbose=args.verbose,
+        )
+        servers.append(
+            RunningServer(
+                proxy_type="socks5",
+                bind_ip=args.bind,
+                port=args.socks5_port,
+                compatibility="Use only in apps or tools that support SOCKS5.",
+                server=server,
+                thread=threading.Thread(target=server.serve_forever, daemon=True),
+            )
+        )
+
+    for item in servers:
+        item.thread.start()
+
+    return servers
+
+
+def print_startup_instructions(servers, allowed_networks, client_ips):
+    print("Proxy listeners:")
+    for item in servers:
+        print(f"  {item.proxy_type}: {item.bind_ip}:{item.port}")
+        print(f"    {item.compatibility}")
+
+    if allowed_networks:
+        allowed_text = ", ".join(str(network) for network in allowed_networks)
+        print(f"Allowed clients: {allowed_text}")
+    else:
+        print("Allowed clients: any device that can reach this address")
+        print("Security note: on shared Wi-Fi, prefer --allow-client PHONE_IP")
+
+    http_server = next((item for item in servers if item.proxy_type == "http"), None)
+    if http_server:
+        print("\nPhone Wi-Fi setup:")
+        print("  Proxy type: Manual / HTTP")
+        if client_ips:
+            print(f"  Host: {client_ips[0]}")
+        else:
+            print(f"  Host: <use this computer's Wi-Fi IPv4 address>")
+        print(f"  Port: {http_server.port}")
+        if len(client_ips) > 1:
+            print(f"  Other detected IPv4 addresses: {', '.join(client_ips[1:])}")
+
+    if client_ips:
+        print(f"\nDetected IPv4 addresses for clients: {', '.join(client_ips)}")
+    elif any(item.bind_ip == "0.0.0.0" for item in servers):
+        print("\nDetected IPv4 addresses for clients: none found automatically")
+        print("Use your computer's Wi-Fi IPv4 address as the phone proxy host.")
+
+    if any(item.bind_ip == "127.0.0.1" for item in servers):
+        print("\nWarning: 127.0.0.1 is only reachable from this machine.")
+        print("Use --bind 0.0.0.0 or your LAN IP for phone access.")
+
+    print("\nConnection logs are printed automatically when devices connect or disconnect.")
+    print("\nPress Ctrl+C to stop.")
+
+
+def shutdown_servers(servers):
+    for item in servers:
+        try:
+            item.server.shutdown()
+        finally:
+            item.server.server_close()
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        ipaddress.ip_address(args.bind)
+    except ValueError as exc:
+        raise SystemExit(f"Error: invalid --bind address '{args.bind}': {exc}") from exc
+
+    ensure_valid_port(args.http_port, "--http-port")
+    ensure_valid_port(args.https_port, "--https-port")
+    ensure_valid_port(args.socks5_port, "--socks5-port")
+
+    if args.timeout <= 0:
+        raise SystemExit("Error: --timeout must be greater than 0.")
+
+    allowed_networks = parse_allowed_networks(args.allow_client)
+    client_ips = detect_candidate_client_ips()
+    servers = start_servers(args, allowed_networks)
+    print_startup_instructions(servers, allowed_networks, client_ips)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        shutdown_servers(servers)
+
+
+if __name__ == "__main__":
+    main()
