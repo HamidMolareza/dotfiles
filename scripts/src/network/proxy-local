@@ -336,9 +336,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         try:
             host, port = split_host_port(self.path, 443)
+            self._log_http_event(f"CONNECT {host}:{port}")
             with socket.create_connection((host, port), timeout=self.server.timeout_seconds) as upstream:
                 self.send_response(200, "Connection Established")
-                self.send_header("Connection", "close")
                 self.end_headers()
                 tunnel_bidirectional(self.connection, upstream)
         except Exception as exc:
@@ -376,15 +376,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if not self._check_client_allowed():
             return
 
-        transfer_encoding = self.headers.get("Transfer-Encoding", "")
-        if "chunked" in transfer_encoding.lower():
-            self.send_error(501, "Chunked request bodies are not supported.")
-            return
-
         try:
             scheme, host, port, target_path = self._extract_target()
-            body = self._read_request_body()
-            connection, response = self._perform_upstream_request(scheme, host, port, target_path, body)
+            body, outbound_headers = self._prepare_outbound_body_and_headers(host, port)
+            self._log_http_event(f"{self.command} {scheme}://{host}:{port}{target_path}")
+            connection, response = self._perform_upstream_request(
+                scheme,
+                host,
+                port,
+                target_path,
+                body,
+                outbound_headers,
+            )
             self._write_response(connection, response)
         except Exception as exc:
             self._send_gateway_error(exc)
@@ -418,12 +421,33 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         return self.rfile.read(length)
 
-    def _perform_upstream_request(self, scheme, host, port, target_path, body):
-        connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        connection_kwargs = {"timeout": self.server.timeout_seconds}
-        if scheme == "https":
-            connection_kwargs["context"] = ssl.create_default_context()
+    def _read_chunked_request_body(self):
+        chunks = bytearray()
 
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                raise ValueError("unexpected end of stream while reading chunk size")
+
+            size_text = line.split(b";", 1)[0].strip()
+            try:
+                chunk_size = int(size_text, 16)
+            except ValueError as exc:
+                raise ValueError("invalid chunk size in request body") from exc
+
+            if chunk_size == 0:
+                while True:
+                    trailer_line = self.rfile.readline()
+                    if not trailer_line or trailer_line in {b"\r\n", b"\n"}:
+                        return bytes(chunks)
+                break
+
+            chunks.extend(self.rfile.read(chunk_size))
+            terminator = self.rfile.read(2)
+            if terminator != b"\r\n":
+                raise ValueError("invalid chunk terminator in request body")
+
+    def _prepare_outbound_body_and_headers(self, host, port):
         outbound_headers = {
             key: value
             for key, value in self.headers.items()
@@ -431,6 +455,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         }
         outbound_headers["Host"] = host if port in {80, 443} else f"{host}:{port}"
         outbound_headers["Connection"] = "close"
+
+        transfer_encoding = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in transfer_encoding.lower():
+            body = self._read_chunked_request_body()
+            outbound_headers.pop("Transfer-Encoding", None)
+            outbound_headers.pop("transfer-encoding", None)
+            outbound_headers["Content-Length"] = str(len(body))
+            return body, outbound_headers
+
+        return self._read_request_body(), outbound_headers
+
+    def _perform_upstream_request(self, scheme, host, port, target_path, body, outbound_headers):
+        connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        connection_kwargs = {"timeout": self.server.timeout_seconds}
+        if scheme == "https":
+            connection_kwargs["context"] = ssl.create_default_context()
 
         connection = connection_class(host, port, **connection_kwargs)
         connection.request(self.command, target_path, body=body, headers=outbound_headers)
@@ -457,7 +497,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             connection.close()
 
     def _send_gateway_error(self, exc: Exception):
+        log_event(
+            self.server.proxy_label,
+            f"{self.client_address[0]} - proxy error: {exc}",
+        )
         self.send_error(502, f"Proxy error: {exc}")
+
+    def _log_http_event(self, message: str):
+        if self.server.verbose:
+            log_event(
+                self.server.proxy_label,
+                f"{self.client_address[0]} - {message}",
+            )
 
 
 class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
