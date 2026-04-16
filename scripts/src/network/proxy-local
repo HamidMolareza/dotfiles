@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 HTTP_DEFAULT_PORT = 8899
 HTTPS_DEFAULT_PORT = 8900
 SOCKS5_DEFAULT_PORT = 1080
+MIXED_DEFAULT_PORT = HTTP_DEFAULT_PORT
 DEFAULT_TIMEOUT_SECONDS = 30
 BUFFER_SIZE = 64 * 1024
 HOP_BY_HOP_HEADERS = {
@@ -81,6 +82,7 @@ def colorize(text: str, *styles: str, stream=sys.stdout) -> str:
 
 def style_proxy_label(proxy_label: str, stream) -> str:
     palette = {
+        "mixed": COLOR_BLUE,
         "http": COLOR_CYAN,
         "https": COLOR_MAGENTA,
         "socks5": COLOR_GREEN,
@@ -417,15 +419,17 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  proxy-local\n"
-            "  proxy-local --type http --type socks5\n"
+            "  proxy-local --mixed-port 1080\n"
+            "  proxy-local --type mixed --type https\n"
             "  proxy-local --allow-client 192.168.1.50\n"
             "  proxy-local --type https --cert-file cert.pem --key-file key.pem\n\n"
             "  proxy-local usage-analyze\n"
             "  proxy-local usage-analyze /tmp/proxy-local-usage.log\n\n"
             "Notes:\n"
             "  - Phone Wi-Fi settings usually support only an HTTP proxy.\n"
+            "  - The mixed listener accepts both HTTP and SOCKS5 on one port.\n"
             "  - HTTPS mode here means a TLS-wrapped HTTP proxy server.\n"
-            "  - SOCKS5 is useful for apps or tools that support it directly.\n"
+            "  - SOCKS5 is useful for apps or tools that support it directly, even on the mixed port.\n"
             "  - On shared Wi-Fi, prefer --allow-client with your phone IP.\n"
             "  - Usage data is written to /tmp/proxy-local-usage.log by default."
         ),
@@ -434,9 +438,9 @@ def build_proxy_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--type",
         action="append",
-        choices=["http", "https", "socks5"],
+        choices=["mixed", "http", "https", "socks5"],
         dest="proxy_types",
-        help="Proxy type to start. Repeat to start more than one. Default: http and socks5",
+        help="Proxy type to start. Repeat to start more than one. Default: mixed. Legacy http/socks5 selections also use the mixed port.",
     )
     parser.add_argument(
         "--bind",
@@ -444,10 +448,10 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help="IP address to listen on. Default: 0.0.0.0 (all IPv4 interfaces).",
     )
     parser.add_argument(
-        "--http-port",
+        "--mixed-port",
         type=int,
-        default=HTTP_DEFAULT_PORT,
-        help=f"TCP port for the HTTP proxy. Default: {HTTP_DEFAULT_PORT}",
+        default=MIXED_DEFAULT_PORT,
+        help=f"TCP port for the mixed HTTP + SOCKS5 proxy listener. Default: {MIXED_DEFAULT_PORT}",
     )
     parser.add_argument(
         "--https-port",
@@ -456,10 +460,14 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help=f"TCP port for the HTTPS proxy. Default: {HTTPS_DEFAULT_PORT}",
     )
     parser.add_argument(
+        "--http-port",
+        type=int,
+        help="Legacy compatibility alias for the mixed port. If set together with --socks5-port they must match.",
+    )
+    parser.add_argument(
         "--socks5-port",
         type=int,
-        default=SOCKS5_DEFAULT_PORT,
-        help=f"TCP port for the SOCKS5 proxy. Default: {SOCKS5_DEFAULT_PORT}",
+        help="Legacy compatibility alias for the mixed port. If set together with --http-port they must match.",
     )
     parser.add_argument(
         "--allow-client",
@@ -754,6 +762,54 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
         except ssl.SSLError:
             raw_socket.close()
             raise
+
+
+class ProtocolServerView:
+    def __init__(self, server, proxy_label: str):
+        self._server = server
+        self.allowed_networks = server.allowed_networks
+        self.timeout_seconds = server.timeout_seconds
+        self.verbose = server.verbose
+        self.debug = server.debug
+        self.proxy_label = proxy_label
+        self.client_tracker = server.client_trackers[proxy_label]
+
+
+class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    address_family = socket.AF_INET
+
+    def __init__(self, server_address, *, allowed_networks, timeout_seconds, verbose, debug):
+        super().__init__(server_address, socketserver.BaseRequestHandler)
+        self.allowed_networks = allowed_networks
+        self.timeout_seconds = timeout_seconds
+        self.verbose = verbose
+        self.debug = debug
+        self.client_trackers = {
+            "http": ClientTracker("http"),
+            "socks5": ClientTracker("socks5"),
+        }
+        self._protocol_views = {
+            "http": ProtocolServerView(self, "http"),
+            "socks5": ProtocolServerView(self, "socks5"),
+        }
+
+    def finish_request(self, request, client_address):
+        protocol = self.detect_protocol(request)
+        handler_class = Socks5RequestHandler if protocol == "socks5" else ProxyRequestHandler
+        handler_class(request, client_address, self._protocol_views[protocol])
+
+    def detect_protocol(self, request) -> str:
+        try:
+            first_byte = request.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return "http"
+
+        if first_byte == bytes([SOCKS_VERSION]):
+            return "socks5"
+
+        return "http"
 
 
 class ProxyRequestHandler(BaseHTTPRequestHandler):
@@ -1129,6 +1185,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             debug_log("dashboard", fmt % args, level="INFO")
 
     def do_GET(self):
+        if self.path in {"/api/dashboard", "/api/dashboard.json"}:
+            snapshot = self.server.dashboard_state.snapshot()
+            payload = json.dumps(snapshot, sort_keys=True).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         if self.path not in {"/", "/index.html"}:
             self.send_error(404, "Not Found")
             return
@@ -1483,7 +1550,6 @@ def render_dashboard_html(snapshot) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="2">
   <title>proxy-local dashboard</title>
   <style>
     :root {{
@@ -1546,6 +1612,7 @@ def render_dashboard_html(snapshot) -> str:
       border-radius: 18px;
       box-shadow: 0 12px 30px var(--shadow);
       padding: 1rem;
+      min-width: 0;
     }}
     .cards {{
       grid-column: 1 / -1;
@@ -1558,6 +1625,7 @@ def render_dashboard_html(snapshot) -> str:
       border-radius: 14px;
       background: linear-gradient(180deg, #fff 0%, #f6f4ed 100%);
       border: 1px solid #e8e0d1;
+      min-width: 0;
     }}
     .card-label {{
       color: var(--muted);
@@ -1565,8 +1633,15 @@ def render_dashboard_html(snapshot) -> str:
     }}
     .card-value {{
       margin-top: 0.35rem;
-      font-size: 1.35rem;
+      font-size: clamp(1.05rem, 2vw, 1.35rem);
       font-weight: 700;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }}
+    .table-wrap {{
+      width: 100%;
+      overflow-x: auto;
     }}
     .latest {{ grid-column: span 5; }}
     .clients {{ grid-column: span 3; }}
@@ -1576,6 +1651,7 @@ def render_dashboard_html(snapshot) -> str:
       width: 100%;
       border-collapse: collapse;
       font-size: 0.95rem;
+      min-width: 0;
     }}
     th, td {{
       text-align: left;
@@ -1615,6 +1691,17 @@ def render_dashboard_html(snapshot) -> str:
       color: var(--muted);
       padding: 0.5rem 0 0.25rem;
     }}
+    .pill-warning {{
+      background: #f7e4bb;
+      color: var(--warning);
+    }}
+    .totals table {{
+      font-size: 0.88rem;
+    }}
+    .totals th, .totals td {{
+      padding: 0.6rem 0.35rem;
+      white-space: nowrap;
+    }}
     @media (max-width: 900px) {{
       .latest, .clients, .totals {{ grid-column: 1 / -1; }}
       .hero {{ flex-direction: column; align-items: start; }}
@@ -1628,33 +1715,213 @@ def render_dashboard_html(snapshot) -> str:
         <h1>proxy-local dashboard</h1>
         <p>Current session view for traffic totals, active clients, and the latest completed request.</p>
       </div>
-      <div class="pill">Auto refresh every 2 seconds</div>
+      <div class="pill" id="dashboard-status">Live updates every 2 seconds</div>
     </section>
     <section class="grid">
-      <div class="cards">{render_summary_cards(snapshot)}</div>
+      <div class="cards" id="summary-cards">{render_summary_cards(snapshot)}</div>
       <section class="panel latest">
         <h2>Latest request</h2>
-        {render_latest_request(snapshot)}
+        <div id="latest-request">{render_latest_request(snapshot)}</div>
       </section>
       <section class="panel clients">
         <h2>Active clients</h2>
-        {render_active_clients(snapshot)}
+        <div id="active-clients">{render_active_clients(snapshot)}</div>
       </section>
       <section class="panel totals">
         <h2>By proxy</h2>
-        <table>
-          <thead>
-            <tr><th>Proxy</th><th>Handled</th><th>Active</th><th>Upload</th><th>Download</th><th>Total</th></tr>
-          </thead>
-          <tbody>{render_totals_table(snapshot)}</tbody>
-        </table>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Proxy</th><th>Handled</th><th>Active</th><th>Upload</th><th>Download</th><th>Total</th></tr>
+            </thead>
+            <tbody id="totals-table">{render_totals_table(snapshot)}</tbody>
+          </table>
+        </div>
       </section>
       <section class="panel recent">
         <h2>Recent requests</h2>
-        {render_recent_requests(snapshot)}
+        <div id="recent-requests">{render_recent_requests(snapshot)}</div>
       </section>
     </section>
   </main>
+  <script>
+    const PROXY_TYPES = ["http", "https", "socks5"];
+    const bytesInMb = 1000000;
+    const summaryCardsElement = document.getElementById("summary-cards");
+    const latestRequestElement = document.getElementById("latest-request");
+    const activeClientsElement = document.getElementById("active-clients");
+    const totalsTableElement = document.getElementById("totals-table");
+    const recentRequestsElement = document.getElementById("recent-requests");
+    const statusElement = document.getElementById("dashboard-status");
+
+    function escapeHtml(value) {{
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }}
+
+    function formatMb(byteCount) {{
+      return `${{(byteCount / bytesInMb).toFixed(2)}} MB`;
+    }}
+
+    function emptyUsageSummary() {{
+      return {{
+        count: 0,
+        uploaded_bytes: 0,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+      }};
+    }}
+
+    function renderSummaryCards(snapshot) {{
+      const overall = snapshot.overall;
+      const activeTotal = Object.values(snapshot.active_by_proxy).reduce((sum, count) => sum + count, 0);
+      const cards = [
+        ["Started", snapshot.started_at],
+        ["Active connections", String(activeTotal)],
+        ["Requests handled", String(overall.count)],
+        ["Uploaded", formatMb(overall.uploaded_bytes)],
+        ["Downloaded", formatMb(overall.downloaded_bytes)],
+        ["Total traffic", formatMb(overall.total_bytes)],
+      ];
+      summaryCardsElement.innerHTML = cards.map(([label, value]) => `
+        <div class="card">
+          <div class="card-label">${{escapeHtml(label)}}</div>
+          <div class="card-value">${{escapeHtml(value)}}</div>
+        </div>
+      `).join("");
+    }}
+
+    function renderLatestRequest(snapshot) {{
+      const latest = snapshot.latest_request;
+      if (!latest) {{
+        latestRequestElement.innerHTML = "<div class='empty'>No completed requests yet.</div>";
+        return;
+      }}
+
+      const fields = [
+        ["Time", latest.timestamp],
+        ["Proxy", latest.proxy_type],
+        ["Method", latest.method],
+        ["Client", latest.client],
+        ["Destination", latest.destination],
+        ["Upload", formatMb(latest.uploaded_bytes)],
+        ["Download", formatMb(latest.downloaded_bytes)],
+        ["Total", formatMb(latest.total_bytes)],
+      ];
+      latestRequestElement.innerHTML = fields.map(([label, value]) => `
+        <div class="detail-row">
+          <span class="detail-label">${{escapeHtml(label)}}</span>
+          <span class="detail-value">${{escapeHtml(value)}}</span>
+        </div>
+      `).join("");
+    }}
+
+    function renderActiveClients(snapshot) {{
+      const clients = Object.entries(snapshot.active_by_client);
+      if (!clients.length) {{
+        activeClientsElement.innerHTML = "<div class='empty'>No active clients right now.</div>";
+        return;
+      }}
+
+      activeClientsElement.innerHTML = `
+        <table>
+          <thead><tr><th>Client</th><th>Active connections</th></tr></thead>
+          <tbody>
+            ${{clients.map(([client, count]) => `
+              <tr><td>${{escapeHtml(client)}}</td><td>${{count}}</td></tr>
+            `).join("")}}
+          </tbody>
+        </table>
+      `;
+    }}
+
+    function renderTotalsTable(snapshot) {{
+      totalsTableElement.innerHTML = PROXY_TYPES.map((proxyType) => {{
+        const summary = snapshot.totals_by_proxy[proxyType] || emptyUsageSummary();
+        const activeCount = snapshot.active_by_proxy[proxyType] || 0;
+        return `
+          <tr>
+            <td>${{escapeHtml(proxyType)}}</td>
+            <td>${{summary.count}}</td>
+            <td>${{activeCount}}</td>
+            <td>${{escapeHtml(formatMb(summary.uploaded_bytes))}}</td>
+            <td>${{escapeHtml(formatMb(summary.downloaded_bytes))}}</td>
+            <td>${{escapeHtml(formatMb(summary.total_bytes))}}</td>
+          </tr>
+        `;
+      }}).join("");
+    }}
+
+    function renderRecentRequests(snapshot) {{
+      const requests = snapshot.recent_requests || [];
+      if (!requests.length) {{
+        recentRequestsElement.innerHTML = "<div class='empty'>No recent requests yet.</div>";
+        return;
+      }}
+
+      recentRequestsElement.innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Proxy</th><th>Method</th><th>Client</th><th>Destination</th><th>Total</th></tr>
+          </thead>
+          <tbody>
+            ${{requests.map((request) => `
+              <tr>
+                <td>${{escapeHtml(request.timestamp)}}</td>
+                <td>${{escapeHtml(request.proxy_type)}}</td>
+                <td>${{escapeHtml(request.method)}}</td>
+                <td>${{escapeHtml(request.client)}}</td>
+                <td class="destination">${{escapeHtml(request.destination)}}</td>
+                <td>${{escapeHtml(formatMb(request.total_bytes))}}</td>
+              </tr>
+            `).join("")}}
+          </tbody>
+        </table>
+      `;
+    }}
+
+    function renderDashboard(snapshot) {{
+      renderSummaryCards(snapshot);
+      renderLatestRequest(snapshot);
+      renderActiveClients(snapshot);
+      renderTotalsTable(snapshot);
+      renderRecentRequests(snapshot);
+    }}
+
+    function setStatus(text, isWarning = false) {{
+      statusElement.textContent = text;
+      statusElement.classList.toggle("pill-warning", isWarning);
+    }}
+
+    async function refreshDashboard() {{
+      try {{
+        const response = await fetch("/api/dashboard", {{
+          cache: "no-store",
+          headers: {{
+            "Accept": "application/json"
+          }}
+        }});
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
+        }}
+        const snapshot = await response.json();
+        renderDashboard(snapshot);
+        setStatus(`Live updates every 2 seconds · ${{
+          new Date().toLocaleTimeString()
+        }}`);
+      }} catch (error) {{
+        setStatus(`Live updates paused: ${{error.message}}`, true);
+      }}
+    }}
+
+    setStatus("Connecting to live dashboard…");
+    window.setTimeout(refreshDashboard, 0);
+    window.setInterval(refreshDashboard, 2000);
+  </script>
 </body>
 </html>
 """
@@ -1684,26 +1951,47 @@ def build_ssl_context(cert_file: str, key_file: str) -> ssl.SSLContext:
     return context
 
 
+def uses_mixed_listener(selected_types) -> bool:
+    return any(proxy_type in {"mixed", "http", "socks5"} for proxy_type in selected_types)
+
+
+def resolve_mixed_port(args, selected_types):
+    if not uses_mixed_listener(selected_types):
+        return None
+
+    if args.http_port is not None and args.socks5_port is not None and args.http_port != args.socks5_port:
+        raise SystemExit(
+            "Error: --http-port and --socks5-port now map to the same mixed listener and must use the same value. "
+            "Use --mixed-port for the shared port."
+        )
+
+    if args.http_port is not None:
+        return args.http_port
+    if args.socks5_port is not None:
+        return args.socks5_port
+    return args.mixed_port
+
+
 def start_servers(args, allowed_networks):
-    selected_types = args.proxy_types or ["http", "socks5"]
+    selected_types = args.proxy_types or ["mixed"]
     servers = []
 
-    if "http" in selected_types:
-        server = ThreadedHTTPProxyServer(
-            (args.bind, args.http_port),
-            ProxyRequestHandler,
+    mixed_port = resolve_mixed_port(args, selected_types)
+
+    if mixed_port is not None:
+        server = ThreadedMixedProxyServer(
+            (args.bind, mixed_port),
             allowed_networks=allowed_networks,
             timeout_seconds=args.timeout,
             verbose=args.verbose,
             debug=args.debug,
-            proxy_label="http",
         )
         servers.append(
             RunningServer(
-                proxy_type="http",
+                proxy_type="mixed",
                 bind_ip=args.bind,
-                port=args.http_port,
-                compatibility="Works with phone Wi-Fi proxy settings.",
+                port=mixed_port,
+                compatibility="Works with phone Wi-Fi HTTP proxy settings and SOCKS5 clients on the same port.",
                 server=server,
                 thread=threading.Thread(target=server.serve_forever, daemon=True),
             )
@@ -1782,8 +2070,8 @@ def print_startup_instructions(
         print_warning("Allowed clients: any device that can reach this address")
         print_warning("Security note: on shared Wi-Fi, prefer --allow-client PHONE_IP")
 
-    http_server = next((item for item in servers if item.proxy_type == "http"), None)
-    if http_server:
+    mixed_server = next((item for item in servers if item.proxy_type == "mixed"), None)
+    if mixed_server:
         print()
         print_section("Phone Wi-Fi setup")
         print(f"  Proxy type: {colorize('Manual / HTTP', COLOR_BOLD, COLOR_CYAN, stream=sys.stdout)}")
@@ -1791,9 +2079,10 @@ def print_startup_instructions(
             print(f"  Host: {colorize(client_ips[0], COLOR_BOLD, COLOR_GREEN, stream=sys.stdout)}")
         else:
             print_warning("  Host: <use this computer's Wi-Fi IPv4 address>")
-        print(f"  Port: {colorize(str(http_server.port), COLOR_BOLD, COLOR_GREEN, stream=sys.stdout)}")
+        print(f"  Port: {colorize(str(mixed_server.port), COLOR_BOLD, COLOR_GREEN, stream=sys.stdout)}")
         if len(client_ips) > 1:
             print_info(f"  Other detected IPv4 addresses: {', '.join(client_ips[1:])}")
+        print_info("  The same port also accepts SOCKS5 for apps that support it.")
 
     if client_ips:
         print()
@@ -1858,9 +2147,12 @@ def main():
     except ValueError as exc:
         raise SystemExit(f"Error: invalid --bind address '{args.bind}': {exc}") from exc
 
-    ensure_valid_port(args.http_port, "--http-port")
+    ensure_valid_port(args.mixed_port, "--mixed-port")
     ensure_valid_port(args.https_port, "--https-port")
-    ensure_valid_port(args.socks5_port, "--socks5-port")
+    if args.http_port is not None:
+        ensure_valid_port(args.http_port, "--http-port")
+    if args.socks5_port is not None:
+        ensure_valid_port(args.socks5_port, "--socks5-port")
     if not args.no_dashboard:
         try:
             ipaddress.ip_address(args.dashboard_bind)
@@ -1888,7 +2180,7 @@ def main():
     debug_log(
         "system",
         "configuration "
-        f"bind={args.bind} http_port={args.http_port} https_port={args.https_port} "
+        f"bind={args.bind} mixed_port={args.mixed_port} http_port={args.http_port} https_port={args.https_port} "
         f"socks5_port={args.socks5_port} timeout={args.timeout}s verbose={args.verbose} debug={args.debug} "
         f"usage_log={usage_log_path} dashboard={args.dashboard_bind}:{args.dashboard_port} "
         f"dashboard_enabled={not args.no_dashboard} quiet={args.quiet}",
