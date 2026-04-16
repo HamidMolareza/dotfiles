@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import html
 import errno
 import http.client
 import ipaddress
+import json
 import os
 import select
 import socket
@@ -12,7 +14,10 @@ import ssl
 import sys
 import threading
 import time
+import traceback
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -46,6 +51,20 @@ COLOR_GREEN = "\033[32m"
 COLOR_YELLOW = "\033[33m"
 COLOR_RED = "\033[31m"
 COLOR_MAGENTA = "\033[35m"
+SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+}
+MAX_DEBUG_VALUE_LENGTH = 512
+DEFAULT_USAGE_LOG_PATH = Path("/tmp/proxy-local-usage.log")
+BYTES_IN_MB = 1_000_000
+DASHBOARD_DEFAULT_BIND = "127.0.0.1"
+DASHBOARD_DEFAULT_PORT = 8898
+RECENT_REQUEST_LIMIT = 25
 
 
 def supports_color(stream) -> bool:
@@ -85,15 +104,313 @@ def print_section(title: str):
     print(colorize(title, COLOR_BOLD, COLOR_BLUE, stream=sys.stdout))
 
 
-def log_event(proxy_label: str, message: str):
-    print(
-        f"[{style_proxy_label(proxy_label, sys.stderr)}] {message}",
-        file=sys.stderr,
-        flush=True,
+class DebugLogger:
+    def __init__(self, enabled: bool = False, log_file: Path | None = None):
+        self.enabled = enabled
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._stream = None
+
+        if self.enabled and self.log_file is not None:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stream = self.log_file.open("a", encoding="utf-8", buffering=1)
+
+    def write(self, proxy_label: str, message: str, *, level: str = "DEBUG"):
+        if not self.enabled or self._stream is None:
+            return
+
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        thread_name = threading.current_thread().name
+        line = f"{timestamp} [{level}] [{proxy_label}] [{thread_name}] {message}\n"
+        with self._lock:
+            self._stream.write(line)
+            self._stream.flush()
+
+    def exception(self, proxy_label: str, context: str, exc: Exception):
+        self.write(proxy_label, f"{context}: {exc!r}", level="ERROR")
+        for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+            for stripped_line in line.rstrip().splitlines():
+                self.write(proxy_label, stripped_line, level="TRACE")
+
+    def close(self):
+        if self._stream is None:
+            return
+
+        with self._lock:
+            self._stream.close()
+            self._stream = None
+
+
+DEBUG_LOGGER = DebugLogger()
+RUNTIME_LOG_ENABLED = True
+
+
+def configure_debug_logger(enabled: bool, log_file: Path | None):
+    global DEBUG_LOGGER
+    DEBUG_LOGGER.close()
+    DEBUG_LOGGER = DebugLogger(enabled=enabled, log_file=log_file)
+
+
+def debug_log(proxy_label: str, message: str, *, level: str = "DEBUG"):
+    DEBUG_LOGGER.write(proxy_label, message, level=level)
+
+
+def debug_exception(proxy_label: str, context: str, exc: Exception):
+    DEBUG_LOGGER.exception(proxy_label, context, exc)
+
+
+def configure_runtime_logging(enabled: bool):
+    global RUNTIME_LOG_ENABLED
+    RUNTIME_LOG_ENABLED = enabled
+
+
+def empty_usage_summary():
+    return {
+        "count": 0,
+        "uploaded_bytes": 0,
+        "downloaded_bytes": 0,
+        "total_bytes": 0,
+    }
+
+
+class DashboardState:
+    def __init__(self, recent_limit: int = RECENT_REQUEST_LIMIT):
+        self._lock = threading.Lock()
+        self.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._active_by_proxy = {}
+        self._active_by_client = {}
+        self._totals_by_proxy = {}
+        self._recent_requests = deque(maxlen=recent_limit)
+
+    def client_connected(self, proxy_label: str, client_ip: str):
+        with self._lock:
+            self._active_by_proxy[proxy_label] = self._active_by_proxy.get(proxy_label, 0) + 1
+            self._active_by_client[client_ip] = self._active_by_client.get(client_ip, 0) + 1
+
+    def client_disconnected(self, proxy_label: str, client_ip: str):
+        with self._lock:
+            current_proxy_count = self._active_by_proxy.get(proxy_label, 0)
+            if current_proxy_count <= 1:
+                self._active_by_proxy.pop(proxy_label, None)
+            else:
+                self._active_by_proxy[proxy_label] = current_proxy_count - 1
+
+            current_client_count = self._active_by_client.get(client_ip, 0)
+            if current_client_count <= 1:
+                self._active_by_client.pop(client_ip, None)
+            else:
+                self._active_by_client[client_ip] = current_client_count - 1
+
+    def record_request(
+        self,
+        *,
+        proxy_label: str,
+        kind: str,
+        client: str,
+        destination: str,
+        uploaded_bytes: int,
+        downloaded_bytes: int,
+        method: str | None,
+        timestamp: str,
+    ):
+        with self._lock:
+            summary = self._totals_by_proxy.setdefault(proxy_label, empty_usage_summary())
+            summary["count"] += 1
+            summary["uploaded_bytes"] += uploaded_bytes
+            summary["downloaded_bytes"] += downloaded_bytes
+            summary["total_bytes"] += uploaded_bytes + downloaded_bytes
+            self._recent_requests.appendleft(
+                {
+                    "timestamp": timestamp,
+                    "proxy_type": proxy_label,
+                    "kind": kind,
+                    "client": client,
+                    "destination": destination,
+                    "uploaded_bytes": uploaded_bytes,
+                    "downloaded_bytes": downloaded_bytes,
+                    "total_bytes": uploaded_bytes + downloaded_bytes,
+                    "method": method or kind.upper(),
+                }
+            )
+
+    def snapshot(self):
+        with self._lock:
+            totals_by_proxy = {
+                proxy_type: summary.copy() for proxy_type, summary in self._totals_by_proxy.items()
+            }
+            overall = empty_usage_summary()
+            for summary in totals_by_proxy.values():
+                overall["count"] += summary["count"]
+                overall["uploaded_bytes"] += summary["uploaded_bytes"]
+                overall["downloaded_bytes"] += summary["downloaded_bytes"]
+                overall["total_bytes"] += summary["total_bytes"]
+
+            active_by_proxy = dict(sorted(self._active_by_proxy.items()))
+            active_by_client = dict(
+                sorted(self._active_by_client.items(), key=lambda item: (-item[1], item[0]))
+            )
+            recent_requests = list(self._recent_requests)
+
+        return {
+            "started_at": self.started_at,
+            "overall": overall,
+            "totals_by_proxy": totals_by_proxy,
+            "active_by_proxy": active_by_proxy,
+            "active_by_client": active_by_client,
+            "recent_requests": recent_requests,
+            "latest_request": recent_requests[0] if recent_requests else None,
+        }
+
+
+DASHBOARD_STATE = DashboardState()
+
+
+class UsageLogger:
+    def __init__(self, log_file: Path | None):
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._stream = None
+
+        if self.log_file is not None:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stream = self.log_file.open("a", encoding="utf-8", buffering=1)
+
+    def record(
+        self,
+        *,
+        proxy_label: str,
+        kind: str,
+        client: str,
+        destination: str,
+        uploaded_bytes: int,
+        downloaded_bytes: int,
+        method: str | None = None,
+    ):
+        if self._stream is None:
+            return
+
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        event = {
+            "timestamp": timestamp,
+            "proxy_type": proxy_label,
+            "kind": kind,
+            "client": client,
+            "destination": destination,
+            "uploaded_bytes": uploaded_bytes,
+            "downloaded_bytes": downloaded_bytes,
+            "total_bytes": uploaded_bytes + downloaded_bytes,
+        }
+        if method is not None:
+            event["method"] = method
+
+        with self._lock:
+            self._stream.write(json.dumps(event, sort_keys=True) + "\n")
+            self._stream.flush()
+
+        DASHBOARD_STATE.record_request(
+            proxy_label=proxy_label,
+            kind=kind,
+            client=client,
+            destination=destination,
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            method=method,
+            timestamp=timestamp,
+        )
+
+    def close(self):
+        if self._stream is None:
+            return
+
+        with self._lock:
+            self._stream.close()
+            self._stream = None
+
+
+USAGE_LOGGER = UsageLogger(None)
+
+
+def configure_usage_logger(log_file: Path | None):
+    global USAGE_LOGGER
+    USAGE_LOGGER.close()
+    USAGE_LOGGER = UsageLogger(log_file)
+
+
+def record_usage(
+    *,
+    proxy_label: str,
+    kind: str,
+    client: str,
+    destination: str,
+    uploaded_bytes: int,
+    downloaded_bytes: int,
+    method: str | None = None,
+):
+    USAGE_LOGGER.record(
+        proxy_label=proxy_label,
+        kind=kind,
+        client=client,
+        destination=destination,
+        uploaded_bytes=uploaded_bytes,
+        downloaded_bytes=downloaded_bytes,
+        method=method,
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
+def truncate_for_log(value: str, limit: int = MAX_DEBUG_VALUE_LENGTH) -> str:
+    if len(value) <= limit:
+        return value
+
+    extra = len(value) - limit
+    return f"{value[:limit]}... <truncated {extra} chars>"
+
+
+def format_client_address(address) -> str:
+    if isinstance(address, tuple) and len(address) >= 2:
+        return f"{address[0]}:{address[1]}"
+    return str(address)
+
+
+def redact_header_value(header_name: str, value: str) -> str:
+    if header_name.lower() in SENSITIVE_HEADER_NAMES:
+        return "<redacted>"
+    return truncate_for_log(value)
+
+
+def format_headers_for_log(headers) -> str:
+    items = []
+    for key, value in headers.items():
+        items.append(f"{key}={redact_header_value(key, value)}")
+    return ", ".join(items) if items else "<none>"
+
+
+def resolve_debug_log_path(path_text: str | None) -> Path | None:
+    if path_text:
+        return Path(path_text).expanduser()
+    return Path("/tmp") / f"proxy-local-debug-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+
+
+def resolve_usage_log_path(path_text: str | None) -> Path | None:
+    if not path_text:
+        return DEFAULT_USAGE_LOG_PATH
+    return Path(path_text).expanduser()
+
+
+def log_event(proxy_label: str, message: str):
+    if RUNTIME_LOG_ENABLED:
+        print(
+            f"[{style_proxy_label(proxy_label, sys.stderr)}] {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+    debug_log(proxy_label, message, level="INFO")
+
+
+def format_mb(byte_count: int) -> str:
+    return f"{byte_count / BYTES_IN_MB:.2f} MB"
+
+
+def build_proxy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).name,
         description="Start proxy listeners on this computer so a phone or another device on the same Wi-Fi can use them.",
@@ -103,11 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  proxy-local --type http --type socks5\n"
             "  proxy-local --allow-client 192.168.1.50\n"
             "  proxy-local --type https --cert-file cert.pem --key-file key.pem\n\n"
+            "  proxy-local usage-analyze\n"
+            "  proxy-local usage-analyze /tmp/proxy-local-usage.log\n\n"
             "Notes:\n"
             "  - Phone Wi-Fi settings usually support only an HTTP proxy.\n"
             "  - HTTPS mode here means a TLS-wrapped HTTP proxy server.\n"
             "  - SOCKS5 is useful for apps or tools that support it directly.\n"
-            "  - On shared Wi-Fi, prefer --allow-client with your phone IP."
+            "  - On shared Wi-Fi, prefer --allow-client with your phone IP.\n"
+            "  - Usage data is written to /tmp/proxy-local-usage.log by default."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -166,6 +486,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Print per-request and tunnel logs in addition to the default connection logs.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Keep startup output, but suppress runtime console connection logs.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable detailed redacted debugging and save it to a log file. Implies --verbose.",
+    )
+    parser.add_argument(
+        "--debug-log-file",
+        help="Debug log file path. Implies --debug. Default: /tmp/proxy-local-debug-<timestamp>.log",
+    )
+    parser.add_argument(
+        "--usage-log-file",
+        default=str(DEFAULT_USAGE_LOG_PATH),
+        help=f"Usage log file path for transfer summaries. Default: {DEFAULT_USAGE_LOG_PATH}",
+    )
+    parser.add_argument(
+        "--dashboard-bind",
+        default=DASHBOARD_DEFAULT_BIND,
+        help=f"Bind address for the dashboard page. Default: {DASHBOARD_DEFAULT_BIND}",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=DASHBOARD_DEFAULT_PORT,
+        help=f"TCP port for the dashboard page. Default: {DASHBOARD_DEFAULT_PORT}",
+    )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Disable the built-in dashboard page.",
+    )
+    return parser
+
+
+def build_usage_analyze_parser(prog_name: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{prog_name} usage-analyze",
+        description="Analyze transfer totals recorded by proxy-local.",
+    )
+    parser.add_argument(
+        "log_file",
+        nargs="?",
+        default=str(DEFAULT_USAGE_LOG_PATH),
+        help=f"Usage log file to analyze. Default: {DEFAULT_USAGE_LOG_PATH}",
+    )
+    parser.add_argument(
+        "--client",
+        help="Only include records for the given client IP.",
+    )
+    parser.add_argument(
+        "--type",
+        dest="proxy_type",
+        choices=["http", "https", "socks5"],
+        help="Only include records for one proxy type.",
     )
     return parser
 
@@ -265,26 +644,35 @@ def tunnel_bidirectional(left_socket, right_socket):
     left_socket.setblocking(False)
     right_socket.setblocking(False)
     sockets = [left_socket, right_socket]
+    stats = {
+        "left_to_right_bytes": 0,
+        "right_to_left_bytes": 0,
+    }
 
     while True:
         readable, _, exceptional = select.select(sockets, [], sockets, 1.0)
         if exceptional:
-            return
+            return stats
 
         for current in readable:
             try:
                 data = current.recv(BUFFER_SIZE)
             except OSError:
-                return
+                return stats
 
             if not data:
-                return
+                return stats
 
             target = right_socket if current is left_socket else left_socket
             try:
                 target.sendall(data)
             except OSError:
-                return
+                return stats
+
+            if current is left_socket:
+                stats["left_to_right_bytes"] += len(data)
+            else:
+                stats["right_to_left_bytes"] += len(data)
 
 
 class ClientTracker:
@@ -294,6 +682,7 @@ class ClientTracker:
         self._active_by_ip = {}
 
     def connected(self, client_ip: str):
+        DASHBOARD_STATE.client_connected(self.proxy_label, client_ip)
         with self._lock:
             self._active_by_ip[client_ip] = self._active_by_ip.get(client_ip, 0) + 1
             active_count = self._active_by_ip[client_ip]
@@ -304,6 +693,7 @@ class ClientTracker:
         )
 
     def disconnected(self, client_ip: str):
+        DASHBOARD_STATE.client_disconnected(self.proxy_label, client_ip)
         with self._lock:
             current = self._active_by_ip.get(client_ip, 0)
             if current <= 1:
@@ -323,11 +713,12 @@ class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler_class, *, allowed_networks, timeout_seconds, verbose, proxy_label):
+    def __init__(self, server_address, handler_class, *, allowed_networks, timeout_seconds, verbose, debug, proxy_label):
         super().__init__(server_address, handler_class)
         self.allowed_networks = allowed_networks
         self.timeout_seconds = timeout_seconds
         self.verbose = verbose
+        self.debug = debug
         self.proxy_label = proxy_label
         self.client_tracker = ClientTracker(proxy_label)
 
@@ -342,6 +733,7 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
         allowed_networks,
         timeout_seconds,
         verbose,
+        debug,
         proxy_label,
     ):
         self.ssl_context = ssl_context
@@ -351,6 +743,7 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
             allowed_networks=allowed_networks,
             timeout_seconds=timeout_seconds,
             verbose=verbose,
+            debug=debug,
             proxy_label=proxy_label,
         )
 
@@ -366,6 +759,13 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
 class ProxyRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "proxy-local/2.0"
+
+    def _client_label(self) -> str:
+        return format_client_address(self.client_address)
+
+    def _debug(self, message: str, *, level: str = "DEBUG"):
+        if self.server.debug:
+            debug_log(self.server.proxy_label, f"{self._client_label()} - {message}", level=level)
 
     def handle(self):
         self.server.client_tracker.connected(self.client_address[0])
@@ -385,15 +785,39 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if not self._check_client_allowed():
             return
 
+        request_started = time.monotonic()
         try:
             host, port = split_host_port(self.path, 443)
+            self._debug(f"request-line={truncate_for_log(self.requestline)}")
+            self._debug(f"request-headers={format_headers_for_log(self.headers)}")
             self._log_http_event(f"CONNECT {host}:{port}")
             with socket.create_connection((host, port), timeout=self.server.timeout_seconds) as upstream:
+                local_bind = format_client_address(upstream.getsockname())
+                remote_peer = format_client_address(upstream.getpeername())
+                self._debug(
+                    f"CONNECT upstream established target={host}:{port} local-bind={local_bind} remote-peer={remote_peer}"
+                )
                 self.send_response(200, "Connection Established")
                 self.end_headers()
-                tunnel_bidirectional(self.connection, upstream)
+                stats = tunnel_bidirectional(self.connection, upstream)
+                duration_ms = int((time.monotonic() - request_started) * 1000)
+                self._debug(
+                    "CONNECT tunnel closed "
+                    f"duration_ms={duration_ms} "
+                    f"client_to_upstream_bytes={stats['left_to_right_bytes']} "
+                    f"upstream_to_client_bytes={stats['right_to_left_bytes']}"
+                )
+                record_usage(
+                    proxy_label=self.server.proxy_label,
+                    kind="connect",
+                    client=self.client_address[0],
+                    destination=f"{host}:{port}",
+                    uploaded_bytes=stats["left_to_right_bytes"],
+                    downloaded_bytes=stats["right_to_left_bytes"],
+                    method="CONNECT",
+                )
         except Exception as exc:
-            self._send_gateway_error(exc)
+            self._send_gateway_error(exc, context=f"CONNECT {host}:{port}" if "host" in locals() else "CONNECT")
 
     def do_GET(self):
         self._forward_http_request()
@@ -420,6 +844,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if ensure_client_allowed(self.client_address[0], self.server.allowed_networks):
             return True
 
+        self._debug(
+            "client denied by allowlist "
+            f"allowed={', '.join(str(network) for network in self.server.allowed_networks) or '<none>'}",
+            level="WARNING",
+        )
         self._safe_send_error_response(403, "Client IP is not allowed to use this proxy.")
         return False
 
@@ -427,10 +856,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if not self._check_client_allowed():
             return
 
+        request_started = time.monotonic()
         try:
+            self._debug(f"request-line={truncate_for_log(self.requestline)}")
+            self._debug(f"request-headers={format_headers_for_log(self.headers)}")
             scheme, host, port, target_path = self._extract_target()
-            body, outbound_headers = self._prepare_outbound_body_and_headers(host, port)
+            body, outbound_headers, body_details, request_body_bytes = self._prepare_outbound_body_and_headers(
+                host, port
+            )
             self._log_http_event(f"{self.command} {scheme}://{host}:{port}{target_path}")
+            self._debug(
+                f"resolved-target scheme={scheme} host={host} port={port} path={truncate_for_log(target_path)}"
+            )
+            self._debug(f"outbound-headers={format_headers_for_log(outbound_headers)}")
+            self._debug(body_details)
             connection, response = self._perform_upstream_request(
                 scheme,
                 host,
@@ -439,11 +878,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 body,
                 outbound_headers,
             )
-            self._write_response(connection, response)
+            self._write_response(
+                connection,
+                response,
+                request_started=request_started,
+                target_description=f"{scheme}://{host}:{port}{target_path}",
+                request_body_bytes=request_body_bytes,
+                method=self.command,
+            )
         except Exception as exc:
-            self._send_gateway_error(exc)
+            self._send_gateway_error(exc, context="forward request")
 
     def _extract_target(self):
+        self._debug(f"raw-path={truncate_for_log(self.path)}")
         parsed = urlsplit(self.path)
 
         if parsed.scheme and parsed.netloc:
@@ -459,6 +906,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("missing Host header")
 
         host, port = split_host_port(host_header, 80)
+        self._debug(f"origin-form request using Host header {truncate_for_log(host_header)}")
         return "http", host, port, self.path or "/"
 
     def _read_request_body(self):
@@ -513,9 +961,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             outbound_headers.pop("Transfer-Encoding", None)
             outbound_headers.pop("transfer-encoding", None)
             outbound_headers["Content-Length"] = str(len(body))
-            return body, outbound_headers
+            return (
+                body,
+                outbound_headers,
+                f"request-body mode=chunked normalized_content_length={len(body)}",
+                len(body),
+            )
 
-        return self._read_request_body(), outbound_headers
+        body = self._read_request_body()
+        body_length = len(body) if body is not None else 0
+        content_length = self.headers.get("Content-Length", "<none>")
+        return (
+            body,
+            outbound_headers,
+            f"request-body mode=content-length header={content_length} bytes={body_length}",
+            body_length,
+        )
 
     def _perform_upstream_request(self, scheme, host, port, target_path, body, outbound_headers):
         connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
@@ -523,11 +984,32 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if scheme == "https":
             connection_kwargs["context"] = ssl.create_default_context()
 
+        upstream_started = time.monotonic()
+        self._debug(
+            f"opening upstream connection class={connection_class.__name__} target={host}:{port} timeout={self.server.timeout_seconds}s"
+        )
         connection = connection_class(host, port, **connection_kwargs)
         connection.request(self.command, target_path, body=body, headers=outbound_headers)
-        return connection, connection.getresponse()
+        response = connection.getresponse()
+        upstream_elapsed_ms = int((time.monotonic() - upstream_started) * 1000)
+        self._debug(
+            f"upstream response status={response.status} reason={truncate_for_log(response.reason)} "
+            f"elapsed_ms={upstream_elapsed_ms}"
+        )
+        self._debug(f"upstream response headers={format_headers_for_log(response.headers)}")
+        return connection, response
 
-    def _write_response(self, connection, response):
+    def _write_response(
+        self,
+        connection,
+        response,
+        *,
+        request_started: float,
+        target_description: str,
+        request_body_bytes: int,
+        method: str,
+    ):
+        bytes_written = 0
         try:
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
@@ -542,28 +1024,48 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+                bytes_written += len(chunk)
             self.wfile.flush()
+            total_elapsed_ms = int((time.monotonic() - request_started) * 1000)
+            self._debug(
+                f"response relayed target={truncate_for_log(target_description)} status={response.status} "
+                f"bytes={bytes_written} total_elapsed_ms={total_elapsed_ms}"
+            )
         except (BrokenPipeError, ConnectionResetError):
             log_event(
                 self.server.proxy_label,
-                f"{self.client_address[0]} - client disconnected while receiving upstream response",
+                f"{self._client_label()} - client disconnected while receiving upstream response",
+            )
+            self._debug(
+                f"client disconnected while receiving upstream response bytes_sent={bytes_written}",
+                level="INFO",
             )
         finally:
+            record_usage(
+                proxy_label=self.server.proxy_label,
+                kind="http",
+                client=self.client_address[0],
+                destination=target_description,
+                uploaded_bytes=request_body_bytes,
+                downloaded_bytes=bytes_written,
+                method=method,
+            )
             response.close()
             connection.close()
 
-    def _send_gateway_error(self, exc: Exception):
+    def _send_gateway_error(self, exc: Exception, *, context: str):
         log_event(
             self.server.proxy_label,
-            f"{self.client_address[0]} - proxy error: {exc}",
+            f"{self._client_label()} - proxy error during {context}: {exc}",
         )
+        debug_exception(self.server.proxy_label, f"{self._client_label()} - proxy error during {context}", exc)
         self._safe_send_error_response(502, self._describe_upstream_error(exc))
 
     def _log_http_event(self, message: str):
         if self.server.verbose:
             log_event(
                 self.server.proxy_label,
-                f"{self.client_address[0]} - {message}",
+                f"{self._client_label()} - {message}",
             )
 
     def _safe_send_error_response(self, code: int, message: str):
@@ -572,7 +1074,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             log_event(
                 self.server.proxy_label,
-                f"{self.client_address[0]} - client disconnected before error response could be sent",
+                f"{self._client_label()} - client disconnected before error response could be sent",
             )
 
     def _describe_upstream_error(self, exc: Exception) -> str:
@@ -600,22 +1102,67 @@ class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     address_family = socket.AF_INET
 
-    def __init__(self, server_address, handler_class, *, allowed_networks, timeout_seconds, verbose):
+    def __init__(self, server_address, handler_class, *, allowed_networks, timeout_seconds, verbose, debug):
         super().__init__(server_address, handler_class)
         self.allowed_networks = allowed_networks
         self.timeout_seconds = timeout_seconds
         self.verbose = verbose
+        self.debug = debug
         self.proxy_label = "socks5"
         self.client_tracker = ClientTracker(self.proxy_label)
 
 
+class ThreadedDashboardServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler_class):
+        super().__init__(server_address, handler_class)
+        self.dashboard_state = DASHBOARD_STATE
+
+
+class DashboardRequestHandler(BaseHTTPRequestHandler):
+    server_version = "proxy-local-dashboard/1.0"
+
+    def log_message(self, fmt, *args):
+        if DEBUG_LOGGER.enabled:
+            debug_log("dashboard", fmt % args, level="INFO")
+
+    def do_GET(self):
+        if self.path not in {"/", "/index.html"}:
+            self.send_error(404, "Not Found")
+            return
+
+        snapshot = self.server.dashboard_state.snapshot()
+        document = render_dashboard_html(snapshot)
+        body = document.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class Socks5RequestHandler(socketserver.BaseRequestHandler):
+    def _client_label(self) -> str:
+        return format_client_address(self.client_address)
+
+    def _debug(self, message: str, *, level: str = "DEBUG"):
+        if self.server.debug:
+            debug_log(self.server.proxy_label, f"{self._client_label()} - {message}", level=level)
+
     def handle(self):
         client_ip = self.client_address[0]
         self.server.client_tracker.connected(client_ip)
         try:
             if not ensure_client_allowed(client_ip, self.server.allowed_networks):
                 self._log("denied")
+                self._debug(
+                    "client denied by allowlist "
+                    f"allowed={', '.join(str(network) for network in self.server.allowed_networks) or '<none>'}",
+                    level="WARNING",
+                )
                 return
 
             self.request.settimeout(self.server.timeout_seconds)
@@ -626,6 +1173,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
             methods_count = self._read_exact(1)[0]
             methods = self._read_exact(methods_count)
+            self._debug(f"handshake methods={list(methods)}")
             if 0 not in methods:
                 self.request.sendall(bytes([SOCKS_VERSION, 0xFF]))
                 return
@@ -641,6 +1189,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
             destination_host = self._read_destination_host(address_type)
             destination_port = int.from_bytes(self._read_exact(2), "big")
+            self._debug(f"CONNECT destination={destination_host}:{destination_port}")
 
             with socket.create_connection(
                 (destination_host, destination_port),
@@ -649,8 +1198,23 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 bind_host, bind_port = upstream.getsockname()[:2]
                 self._send_success_reply(bind_host, bind_port)
                 self._log(f"connect {destination_host}:{destination_port}")
-                tunnel_bidirectional(self.request, upstream)
-        except (OSError, ValueError):
+                stats = tunnel_bidirectional(self.request, upstream)
+                self._debug(
+                    "tunnel closed "
+                    f"client_to_upstream_bytes={stats['left_to_right_bytes']} "
+                    f"upstream_to_client_bytes={stats['right_to_left_bytes']}"
+                )
+                record_usage(
+                    proxy_label=self.server.proxy_label,
+                    kind="connect",
+                    client=self.client_address[0],
+                    destination=f"{destination_host}:{destination_port}",
+                    uploaded_bytes=stats["left_to_right_bytes"],
+                    downloaded_bytes=stats["right_to_left_bytes"],
+                    method="CONNECT",
+                )
+        except (OSError, ValueError) as exc:
+            debug_exception(self.server.proxy_label, f"{self._client_label()} - SOCKS5 handler error", exc)
             self._send_reply(0x01)
         finally:
             self.server.client_tracker.disconnected(client_ip)
@@ -707,6 +1271,413 @@ class RunningServer:
     thread: threading.Thread
 
 
+@dataclass
+class RunningDashboard:
+    bind_ip: str
+    port: int
+    server: socketserver.BaseServer
+    thread: threading.Thread
+
+
+def summarize_usage_records(records):
+    summary = {
+        "count": 0,
+        "uploaded_bytes": 0,
+        "downloaded_bytes": 0,
+        "total_bytes": 0,
+    }
+    for record in records:
+        summary["count"] += 1
+        summary["uploaded_bytes"] += int(record.get("uploaded_bytes", 0))
+        summary["downloaded_bytes"] += int(record.get("downloaded_bytes", 0))
+        summary["total_bytes"] += int(record.get("total_bytes", 0))
+    return summary
+
+
+def print_usage_summary(label: str, summary):
+    print(f"{label}:")
+    print(f"  Records: {summary['count']}")
+    print(f"  Upload:   {format_mb(summary['uploaded_bytes'])} ({summary['uploaded_bytes']} bytes)")
+    print(f"  Download: {format_mb(summary['downloaded_bytes'])} ({summary['downloaded_bytes']} bytes)")
+    print(f"  Total:    {format_mb(summary['total_bytes'])} ({summary['total_bytes']} bytes)")
+
+
+def load_usage_records(log_file: Path):
+    records = []
+    invalid_lines = 0
+
+    try:
+        with log_file.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    records.append(json.loads(stripped))
+                except json.JSONDecodeError:
+                    invalid_lines += 1
+                    debug_log(
+                        "usage-analyze",
+                        f"skipping invalid JSON line {line_number} from {log_file}",
+                        level="WARNING",
+                    )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Error: usage log file not found: {log_file}") from exc
+
+    return records, invalid_lines
+
+
+def run_usage_analyze(argv):
+    parser = build_usage_analyze_parser(Path(sys.argv[0]).name)
+    args = parser.parse_args(argv)
+    log_file = resolve_usage_log_path(args.log_file)
+    records, invalid_lines = load_usage_records(log_file)
+
+    if args.client:
+        records = [record for record in records if record.get("client") == args.client]
+    if args.proxy_type:
+        records = [record for record in records if record.get("proxy_type") == args.proxy_type]
+
+    if not records:
+        print_warning("No usage records matched the requested filters.")
+        return
+
+    overall = summarize_usage_records(records)
+    print_section("Usage summary")
+    print(f"  Log file: {log_file}")
+    timestamps = [record.get("timestamp") for record in records if record.get("timestamp")]
+    if timestamps:
+        print(f"  Time range: {min(timestamps)} -> {max(timestamps)}")
+    if invalid_lines:
+        print_warning(f"Skipped invalid log lines: {invalid_lines}")
+    print_usage_summary("Overall", overall)
+
+    print()
+    print_section("By proxy type")
+    for proxy_type in sorted({record.get('proxy_type', 'unknown') for record in records}):
+        summary = summarize_usage_records(
+            [record for record in records if record.get("proxy_type", "unknown") == proxy_type]
+        )
+        print_usage_summary(proxy_type, summary)
+
+    print()
+    print_section("By client")
+    clients = sorted({record.get("client", "unknown") for record in records})
+    for client in clients:
+        summary = summarize_usage_records(
+            [record for record in records if record.get("client", "unknown") == client]
+        )
+        print_usage_summary(client, summary)
+
+    print()
+    print_info(
+        "HTTP records count request and response bodies. CONNECT and SOCKS5 records count raw tunnel bytes."
+    )
+
+
+def render_summary_cards(snapshot) -> str:
+    overall = snapshot["overall"]
+    active_total = sum(snapshot["active_by_proxy"].values())
+    cards = [
+        ("Started", snapshot["started_at"]),
+        ("Active connections", str(active_total)),
+        ("Requests handled", str(overall["count"])),
+        ("Uploaded", format_mb(overall["uploaded_bytes"])),
+        ("Downloaded", format_mb(overall["downloaded_bytes"])),
+        ("Total traffic", format_mb(overall["total_bytes"])),
+    ]
+    items = []
+    for label, value in cards:
+        items.append(
+            "<div class='card'>"
+            f"<div class='card-label'>{html.escape(label)}</div>"
+            f"<div class='card-value'>{html.escape(value)}</div>"
+            "</div>"
+        )
+    return "".join(items)
+
+
+def render_totals_table(snapshot) -> str:
+    rows = []
+    for proxy_type in ("http", "https", "socks5"):
+        summary = snapshot["totals_by_proxy"].get(proxy_type, empty_usage_summary())
+        active_count = snapshot["active_by_proxy"].get(proxy_type, 0)
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(proxy_type)}</td>"
+            f"<td>{summary['count']}</td>"
+            f"<td>{active_count}</td>"
+            f"<td>{html.escape(format_mb(summary['uploaded_bytes']))}</td>"
+            f"<td>{html.escape(format_mb(summary['downloaded_bytes']))}</td>"
+            f"<td>{html.escape(format_mb(summary['total_bytes']))}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def render_active_clients(snapshot) -> str:
+    if not snapshot["active_by_client"]:
+        return "<div class='empty'>No active clients right now.</div>"
+
+    rows = []
+    for client_ip, count in snapshot["active_by_client"].items():
+        rows.append(f"<tr><td>{html.escape(client_ip)}</td><td>{count}</td></tr>")
+    return (
+        "<table><thead><tr><th>Client</th><th>Active connections</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def render_latest_request(snapshot) -> str:
+    latest = snapshot["latest_request"]
+    if latest is None:
+        return "<div class='empty'>No completed requests yet.</div>"
+
+    fields = [
+        ("Time", latest["timestamp"]),
+        ("Proxy", latest["proxy_type"]),
+        ("Method", latest["method"]),
+        ("Client", latest["client"]),
+        ("Destination", latest["destination"]),
+        ("Upload", format_mb(latest["uploaded_bytes"])),
+        ("Download", format_mb(latest["downloaded_bytes"])),
+        ("Total", format_mb(latest["total_bytes"])),
+    ]
+    items = []
+    for label, value in fields:
+        items.append(
+            "<div class='detail-row'>"
+            f"<span class='detail-label'>{html.escape(label)}</span>"
+            f"<span class='detail-value'>{html.escape(str(value))}</span>"
+            "</div>"
+        )
+    return "".join(items)
+
+
+def render_recent_requests(snapshot) -> str:
+    if not snapshot["recent_requests"]:
+        return "<div class='empty'>No recent requests yet.</div>"
+
+    rows = []
+    for request in snapshot["recent_requests"]:
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(request['timestamp'])}</td>"
+            f"<td>{html.escape(request['proxy_type'])}</td>"
+            f"<td>{html.escape(request['method'])}</td>"
+            f"<td>{html.escape(request['client'])}</td>"
+            f"<td class='destination'>{html.escape(request['destination'])}</td>"
+            f"<td>{html.escape(format_mb(request['total_bytes']))}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Time</th><th>Proxy</th><th>Method</th><th>Client</th>"
+        "<th>Destination</th><th>Total</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def render_dashboard_html(snapshot) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="2">
+  <title>proxy-local dashboard</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f2efe8;
+      --panel: #fffdf8;
+      --line: #d8d1c2;
+      --text: #1f2a30;
+      --muted: #6a6f73;
+      --accent: #116466;
+      --accent-soft: #d9ece8;
+      --warning: #9b6b00;
+      --shadow: rgba(24, 36, 39, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "IBM Plex Sans", "Noto Sans", sans-serif;
+      background:
+        radial-gradient(circle at top left, #fff7dc 0, transparent 28rem),
+        linear-gradient(180deg, #f3f0e8 0%, #ebe5d7 100%);
+      color: var(--text);
+    }}
+    main {{
+      width: min(1200px, calc(100% - 2rem));
+      margin: 1.5rem auto 2rem;
+    }}
+    h1, h2 {{
+      margin: 0;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }}
+    .hero {{
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      align-items: end;
+      margin-bottom: 1rem;
+    }}
+    .hero p {{
+      margin: 0.5rem 0 0;
+      color: var(--muted);
+    }}
+    .pill {{
+      display: inline-block;
+      padding: 0.4rem 0.7rem;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 600;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 1rem;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 12px 30px var(--shadow);
+      padding: 1rem;
+    }}
+    .cards {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 0.75rem;
+    }}
+    .card {{
+      padding: 0.9rem;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fff 0%, #f6f4ed 100%);
+      border: 1px solid #e8e0d1;
+    }}
+    .card-label {{
+      color: var(--muted);
+      font-size: 0.85rem;
+    }}
+    .card-value {{
+      margin-top: 0.35rem;
+      font-size: 1.35rem;
+      font-weight: 700;
+    }}
+    .latest {{ grid-column: span 5; }}
+    .clients {{ grid-column: span 3; }}
+    .totals {{ grid-column: span 4; }}
+    .recent {{ grid-column: 1 / -1; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 0.7rem 0.5rem;
+      border-bottom: 1px solid #ece5d8;
+      vertical-align: top;
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+    .detail-row {{
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.55rem 0;
+      border-bottom: 1px solid #ece5d8;
+    }}
+    .detail-row:last-child {{ border-bottom: none; }}
+    .detail-label {{
+      color: var(--muted);
+      min-width: 6rem;
+    }}
+    .detail-value {{
+      text-align: right;
+      font-weight: 600;
+      word-break: break-word;
+    }}
+    .destination {{
+      max-width: 28rem;
+      word-break: break-word;
+    }}
+    .empty {{
+      color: var(--muted);
+      padding: 0.5rem 0 0.25rem;
+    }}
+    @media (max-width: 900px) {{
+      .latest, .clients, .totals {{ grid-column: 1 / -1; }}
+      .hero {{ flex-direction: column; align-items: start; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div>
+        <h1>proxy-local dashboard</h1>
+        <p>Current session view for traffic totals, active clients, and the latest completed request.</p>
+      </div>
+      <div class="pill">Auto refresh every 2 seconds</div>
+    </section>
+    <section class="grid">
+      <div class="cards">{render_summary_cards(snapshot)}</div>
+      <section class="panel latest">
+        <h2>Latest request</h2>
+        {render_latest_request(snapshot)}
+      </section>
+      <section class="panel clients">
+        <h2>Active clients</h2>
+        {render_active_clients(snapshot)}
+      </section>
+      <section class="panel totals">
+        <h2>By proxy</h2>
+        <table>
+          <thead>
+            <tr><th>Proxy</th><th>Handled</th><th>Active</th><th>Upload</th><th>Download</th><th>Total</th></tr>
+          </thead>
+          <tbody>{render_totals_table(snapshot)}</tbody>
+        </table>
+      </section>
+      <section class="panel recent">
+        <h2>Recent requests</h2>
+        {render_recent_requests(snapshot)}
+      </section>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+def start_dashboard_server(args):
+    if args.no_dashboard:
+        return None
+
+    server = ThreadedDashboardServer(
+        (args.dashboard_bind, args.dashboard_port),
+        DashboardRequestHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return RunningDashboard(
+        bind_ip=args.dashboard_bind,
+        port=args.dashboard_port,
+        server=server,
+        thread=thread,
+    )
+
+
 def build_ssl_context(cert_file: str, key_file: str) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=cert_file, keyfile=key_file)
@@ -724,6 +1695,7 @@ def start_servers(args, allowed_networks):
             allowed_networks=allowed_networks,
             timeout_seconds=args.timeout,
             verbose=args.verbose,
+            debug=args.debug,
             proxy_label="http",
         )
         servers.append(
@@ -749,6 +1721,7 @@ def start_servers(args, allowed_networks):
             allowed_networks=allowed_networks,
             timeout_seconds=args.timeout,
             verbose=args.verbose,
+            debug=args.debug,
             proxy_label="https",
         )
         servers.append(
@@ -769,6 +1742,7 @@ def start_servers(args, allowed_networks):
             allowed_networks=allowed_networks,
             timeout_seconds=args.timeout,
             verbose=args.verbose,
+            debug=args.debug,
         )
         servers.append(
             RunningServer(
@@ -787,7 +1761,14 @@ def start_servers(args, allowed_networks):
     return servers
 
 
-def print_startup_instructions(servers, allowed_networks, client_ips):
+def print_startup_instructions(
+    servers,
+    allowed_networks,
+    client_ips,
+    debug_log_path: Path | None,
+    usage_log_path: Path | None,
+    dashboard: RunningDashboard | None,
+):
     print_section("Proxy listeners")
     for item in servers:
         listener = f"{item.bind_ip}:{item.port}"
@@ -828,21 +1809,49 @@ def print_startup_instructions(servers, allowed_networks, client_ips):
         print_warning("Use --bind 0.0.0.0 or your LAN IP for phone access.")
 
     print()
-    print_info("Connection logs are printed automatically when devices connect or disconnect.")
+    if RUNTIME_LOG_ENABLED:
+        print_info("Connection logs are printed automatically when devices connect or disconnect.")
+    else:
+        print_info("Runtime console connection logs are disabled.")
+    if dashboard is not None:
+        print_info(f"Dashboard: http://{dashboard.bind_ip}:{dashboard.port}")
+        if RUNTIME_LOG_ENABLED:
+            print_info("Use --quiet if you want to watch the dashboard without runtime console logs.")
+    if usage_log_path is not None:
+        print_info(f"Usage log file: {usage_log_path}")
+        print_info(f"Analyze totals later with: {Path(sys.argv[0]).name} usage-analyze {usage_log_path}")
+    if debug_log_path is not None:
+        print_info(f"Debug log file: {debug_log_path}")
     print_success("Press Ctrl+C to stop.")
 
 
-def shutdown_servers(servers):
+def shutdown_servers(servers, dashboard: RunningDashboard | None):
     for item in servers:
         try:
             item.server.shutdown()
         finally:
             item.server.server_close()
 
+    if dashboard is not None:
+        try:
+            dashboard.server.shutdown()
+        finally:
+            dashboard.server.server_close()
+
 
 def main():
-    parser = build_parser()
+    if len(sys.argv) > 1 and sys.argv[1] == "usage-analyze":
+        run_usage_analyze(sys.argv[2:])
+        return
+
+    parser = build_proxy_parser()
     args = parser.parse_args()
+
+    if args.debug_log_file:
+        args.debug = True
+    if args.debug:
+        args.verbose = True
+    configure_runtime_logging(not args.quiet)
 
     try:
         ipaddress.ip_address(args.bind)
@@ -852,14 +1861,65 @@ def main():
     ensure_valid_port(args.http_port, "--http-port")
     ensure_valid_port(args.https_port, "--https-port")
     ensure_valid_port(args.socks5_port, "--socks5-port")
+    if not args.no_dashboard:
+        try:
+            ipaddress.ip_address(args.dashboard_bind)
+        except ValueError as exc:
+            raise SystemExit(f"Error: invalid --dashboard-bind address '{args.dashboard_bind}': {exc}") from exc
+        ensure_valid_port(args.dashboard_port, "--dashboard-port")
 
     if args.timeout <= 0:
         raise SystemExit("Error: --timeout must be greater than 0.")
 
+    debug_log_path = resolve_debug_log_path(args.debug_log_file) if args.debug else None
+    usage_log_path = resolve_usage_log_path(args.usage_log_file)
+    try:
+        configure_debug_logger(args.debug, debug_log_path)
+    except OSError as exc:
+        raise SystemExit(f"Error: could not open debug log file '{debug_log_path}': {exc}") from exc
+
+    try:
+        configure_usage_logger(usage_log_path)
+    except OSError as exc:
+        DEBUG_LOGGER.close()
+        raise SystemExit(f"Error: could not open usage log file '{usage_log_path}': {exc}") from exc
+
+    debug_log("system", f"argv={sys.argv!r}", level="INFO")
+    debug_log(
+        "system",
+        "configuration "
+        f"bind={args.bind} http_port={args.http_port} https_port={args.https_port} "
+        f"socks5_port={args.socks5_port} timeout={args.timeout}s verbose={args.verbose} debug={args.debug} "
+        f"usage_log={usage_log_path} dashboard={args.dashboard_bind}:{args.dashboard_port} "
+        f"dashboard_enabled={not args.no_dashboard} quiet={args.quiet}",
+        level="INFO",
+    )
+
     allowed_networks = parse_allowed_networks(args.allow_client)
     client_ips = detect_candidate_client_ips()
+    debug_log(
+        "system",
+        f"allowed_networks={[str(network) for network in allowed_networks]} detected_client_ips={client_ips}",
+        level="INFO",
+    )
     servers = start_servers(args, allowed_networks)
-    print_startup_instructions(servers, allowed_networks, client_ips)
+    dashboard = None
+    if not args.no_dashboard:
+        try:
+            dashboard = start_dashboard_server(args)
+        except OSError as exc:
+            print_warning(
+                f"Dashboard could not start on {args.dashboard_bind}:{args.dashboard_port}: {exc}"
+            )
+            debug_exception("dashboard", "failed to start dashboard", exc)
+    print_startup_instructions(
+        servers,
+        allowed_networks,
+        client_ips,
+        debug_log_path,
+        usage_log_path,
+        dashboard,
+    )
 
     try:
         while True:
@@ -867,7 +1927,9 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        shutdown_servers(servers)
+        shutdown_servers(servers, dashboard)
+        DEBUG_LOGGER.close()
+        USAGE_LOGGER.close()
 
 
 if __name__ == "__main__":
