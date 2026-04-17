@@ -7,6 +7,7 @@ This repository contains configuration files and scripts to set up and manage a 
 - `.aliases`, `.bashrc`, `.zshrc`, `.exports`: Shell configuration files for Bash and Zsh.
 - `.config/`: Application and desktop environment configuration files.
 - `.icons/`: Custom icons.
+- `agent-helpers/`: Git-backed prompts, skills, and shared agent instructions exposed through symlinks.
 - `docker-services/`: Docker-related service files.
 - `scripts/`: Utility and setup scripts.
 - `Templates/`: Document templates.
@@ -29,6 +30,7 @@ This repository contains configuration files and scripts to set up and manage a 
 
 - Edit `.aliases`, `.bashrc`, `.zshrc`, and `.exports` to add or modify shell settings.
 - Add application configs to `.config/` as needed.
+- Add agent prompts and skills under `agent-helpers/`, then run `./install.sh` to refresh symlinks into agent homes.
 - Place custom icons in `.icons/`.
 - Add scripts to `scripts/` for automation or setup tasks.
 
