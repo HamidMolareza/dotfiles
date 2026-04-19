@@ -35,11 +35,11 @@ HTTP_TIMEOUT_SECONDS = 8.0
 MAX_CONCURRENT_PROBES = 4
 STATUS_WIDTH = 10
 NAME_WIDTH = 12
-TIME_WIDTH = 16
 PRIMARY_LEFT_WIDTH = 16
 PRIMARY_RESET_WIDTH = 11
 SECONDARY_LEFT_WIDTH = 8
 SECONDARY_RESET_WIDTH = 11
+EMAIL_WIDTH = 28
 EMPTY_CELL = ""
 QUOTA_UNKNOWN = "unavailable"
 TOKEN_EXPIRED = "token expired"
@@ -163,6 +163,7 @@ class AuthFile:
     last_used_at: float
     size_bytes: int
     mtime_ns: int
+    email: str = EMPTY_CELL
     quota: QuotaView = field(default_factory=QuotaView)
 
     @property
@@ -172,16 +173,15 @@ class AuthFile:
     @property
     def label(self) -> str:
         status = "[active]" if self.is_active else f"[slot {self.suffix}]"
-        last_used = format_timestamp(self.last_used_at)
         quota = self.quota
         return (
             f"{status:<{STATUS_WIDTH}} "
             f"{self.name:<{NAME_WIDTH}} "
-            f"{last_used:<{TIME_WIDTH}} "
             f"{truncate_text(quota.primary_left, PRIMARY_LEFT_WIDTH):<{PRIMARY_LEFT_WIDTH}} "
             f"{truncate_text(quota.primary_reset, PRIMARY_RESET_WIDTH):<{PRIMARY_RESET_WIDTH}} "
             f"{truncate_text(quota.secondary_left, SECONDARY_LEFT_WIDTH):<{SECONDARY_LEFT_WIDTH}} "
-            f"{truncate_text(quota.secondary_reset, SECONDARY_RESET_WIDTH):<{SECONDARY_RESET_WIDTH}}"
+            f"{truncate_text(quota.secondary_reset, SECONDARY_RESET_WIDTH):<{SECONDARY_RESET_WIDTH}} "
+            f"{truncate_text(self.email, EMAIL_WIDTH):<{EMAIL_WIDTH}}"
         )
 
 
@@ -220,8 +220,8 @@ Rules:
   - {ACTIVE_NAME} is the active file
   - auth.json<number> files are inactive candidates
   - only one active file exists at a time
-  - the menu shows each file's last active time from its modified timestamp
   - the menu shows cached or live remaining quota and reset countdowns for each auth file
+  - the menu shows each auth file's user email from the local id_token or cache when available
   - quota probes use a direct read-only HTTPS request with the current auth token
   - quota probes never trigger token refresh or modify your real auth files
   - transient probe failures keep stale cached quota when available and mark it with *
@@ -335,11 +335,11 @@ def menu_header() -> str:
     return (
         f"{'Status':<{STATUS_WIDTH}} "
         f"{'File':<{NAME_WIDTH}} "
-        f"{'Last used':<{TIME_WIDTH}} "
         f"{'5h left':<{PRIMARY_LEFT_WIDTH}} "
         f"{'5h in':<{PRIMARY_RESET_WIDTH}} "
         f"{'7d left':<{SECONDARY_LEFT_WIDTH}} "
-        f"{'7d in':<{SECONDARY_RESET_WIDTH}}"
+        f"{'7d in':<{SECONDARY_RESET_WIDTH}} "
+        f"{'Email':<{EMAIL_WIDTH}}"
     )
 
 
@@ -371,6 +371,7 @@ def list_auth_files(directory: Path) -> list[AuthFile]:
                 last_used_at=stat_result.st_mtime,
                 size_bytes=stat_result.st_size,
                 mtime_ns=stat_result.st_mtime_ns,
+                email=extract_auth_email(path),
             )
         )
 
@@ -420,6 +421,23 @@ def cache_key(auth_file: AuthFile) -> str:
     return str(auth_file.path.resolve())
 
 
+def cache_entry_matches_auth_file(entry: object, auth_file: AuthFile) -> bool:
+    return (
+        isinstance(entry, dict)
+        and entry.get("mtime_ns") == auth_file.mtime_ns
+        and entry.get("size_bytes") == auth_file.size_bytes
+    )
+
+
+def cached_email(cache: dict[str, dict[str, Any]], auth_file: AuthFile) -> str:
+    entry = cache.get(cache_key(auth_file))
+    if not cache_entry_matches_auth_file(entry, auth_file):
+        return EMPTY_CELL
+
+    email = entry.get("email")
+    return email if isinstance(email, str) else EMPTY_CELL
+
+
 def cached_quota_view(
     cache: dict[str, dict[str, Any]],
     auth_file: AuthFile,
@@ -428,12 +446,7 @@ def cached_quota_view(
     allow_stale: bool,
 ) -> QuotaView | None:
     entry = cache.get(cache_key(auth_file))
-    if not isinstance(entry, dict):
-        return None
-
-    if entry.get("mtime_ns") != auth_file.mtime_ns:
-        return None
-    if entry.get("size_bytes") != auth_file.size_bytes:
+    if not cache_entry_matches_auth_file(entry, auth_file):
         return None
 
     quota = QuotaView.from_cache_value(entry.get("quota"))
@@ -450,15 +463,45 @@ def cached_quota_view(
     return quota
 
 
+def update_cached_email(cache: dict[str, dict[str, Any]], auth_file: AuthFile) -> bool:
+    if not auth_file.email:
+        return False
+
+    key = cache_key(auth_file)
+    existing = cache.get(key)
+    if cache_entry_matches_auth_file(existing, auth_file):
+        entry = dict(existing)
+    else:
+        entry = {
+            "mtime_ns": auth_file.mtime_ns,
+            "size_bytes": auth_file.size_bytes,
+        }
+
+    if entry.get("email") == auth_file.email:
+        return False
+
+    entry["email"] = auth_file.email
+    cache[key] = entry
+    return True
+
+
 def update_quota_cache_entry(
     cache: dict[str, dict[str, Any]], auth_file: AuthFile, quota: QuotaView, fetched_at: float
 ) -> None:
-    cache[cache_key(auth_file)] = {
-        "mtime_ns": auth_file.mtime_ns,
-        "size_bytes": auth_file.size_bytes,
-        "quota": quota.to_cache_value(),
-        "fetched_at": fetched_at,
-    }
+    key = cache_key(auth_file)
+    existing = cache.get(key)
+    entry = dict(existing) if cache_entry_matches_auth_file(existing, auth_file) else {}
+    entry.update(
+        {
+            "mtime_ns": auth_file.mtime_ns,
+            "size_bytes": auth_file.size_bytes,
+            "quota": quota.to_cache_value(),
+            "fetched_at": fetched_at,
+        }
+    )
+    if auth_file.email:
+        entry["email"] = auth_file.email
+    cache[key] = entry
 
 
 def load_chatgpt_base_url(directory: Path) -> str:
@@ -514,6 +557,32 @@ def is_access_token_expired(access_token: str) -> bool:
 
     exp = payload.get("exp")
     return isinstance(exp, (int, float)) and float(exp) <= time.time()
+
+
+def extract_auth_email(auth_file: Path) -> str:
+    try:
+        payload = load_auth_payload(auth_file)
+    except QuotaProbeError:
+        return EMPTY_CELL
+
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return EMPTY_CELL
+
+    id_token = tokens.get("id_token")
+    if not isinstance(id_token, str) or not id_token:
+        return EMPTY_CELL
+
+    claims = decode_jwt_payload(id_token)
+    if claims is None:
+        return EMPTY_CELL
+
+    for key in ("email", "preferred_username", "upn"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return EMPTY_CELL
 
 
 def format_window_left(window: object) -> str | None:
@@ -700,6 +769,12 @@ def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path
     stale_fallbacks: dict[Path, QuotaView] = {}
 
     for auth_file in auth_files:
+        fallback_email = cached_email(cache, auth_file)
+        if not auth_file.email and fallback_email:
+            auth_file = replace(auth_file, email=fallback_email)
+        if update_cached_email(updated_cache, auth_file):
+            cache_changed = True
+
         cached_quota = cached_quota_view(cache, auth_file, now, allow_stale=False)
         if cached_quota is not None:
             enriched_auth_files.append(replace(auth_file, quota=cached_quota))
