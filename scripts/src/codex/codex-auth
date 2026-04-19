@@ -63,6 +63,10 @@ class QuotaView:
     primary_reset: str = EMPTY_CELL
     secondary_left: str = EMPTY_CELL
     secondary_reset: str = EMPTY_CELL
+    primary_left_percent: int | None = None
+    primary_reset_at: float | None = None
+    secondary_left_percent: int | None = None
+    secondary_reset_at: float | None = None
 
     @classmethod
     def status(cls, value: str) -> "QuotaView":
@@ -78,20 +82,45 @@ class QuotaView:
         secondary_reset = value.get("secondary_reset", EMPTY_CELL)
         if not all(isinstance(item, str) for item in (primary_left, primary_reset, secondary_left, secondary_reset)):
             return None
+        primary_left_percent = parse_remaining_percent(value.get("primary_left_percent", primary_left))
+        primary_reset_at = parse_reset_timestamp_value(value.get("primary_reset_at"))
+        secondary_left_percent = parse_remaining_percent(value.get("secondary_left_percent", secondary_left))
+        secondary_reset_at = parse_reset_timestamp_value(value.get("secondary_reset_at"))
+
+        if primary_reset_at is None:
+            primary_reset_at = parse_reset_display(primary_reset)
+        if secondary_reset_at is None:
+            secondary_reset_at = parse_reset_display(secondary_reset)
+
         return cls(
             primary_left=primary_left,
-            primary_reset=primary_reset,
+            primary_reset=format_reset_timestamp(primary_reset_at) if primary_reset_at is not None else primary_reset,
             secondary_left=secondary_left,
-            secondary_reset=secondary_reset,
+            secondary_reset=(
+                format_reset_timestamp(secondary_reset_at) if secondary_reset_at is not None else secondary_reset
+            ),
+            primary_left_percent=primary_left_percent,
+            primary_reset_at=primary_reset_at,
+            secondary_left_percent=secondary_left_percent,
+            secondary_reset_at=secondary_reset_at,
         )
 
-    def to_cache_value(self) -> dict[str, str]:
-        return {
+    def to_cache_value(self) -> dict[str, str | int | float]:
+        value: dict[str, str | int | float] = {
             "primary_left": self.primary_left,
             "primary_reset": self.primary_reset,
             "secondary_left": self.secondary_left,
             "secondary_reset": self.secondary_reset,
         }
+        if self.primary_left_percent is not None:
+            value["primary_left_percent"] = self.primary_left_percent
+        if self.primary_reset_at is not None:
+            value["primary_reset_at"] = self.primary_reset_at
+        if self.secondary_left_percent is not None:
+            value["secondary_left_percent"] = self.secondary_left_percent
+        if self.secondary_reset_at is not None:
+            value["secondary_reset_at"] = self.secondary_reset_at
+        return value
 
     def with_stale_marker(self) -> "QuotaView":
         def mark(value: str) -> str:
@@ -253,6 +282,45 @@ def format_reset_timestamp(timestamp: float) -> str:
     if total_hours > 0:
         return f"{total_hours}h {minutes}m"
     return f"{total_minutes}m"
+
+
+def parse_reset_timestamp_value(value: object) -> float | None:
+    if isinstance(value, (int, float)) and float(value) > 0:
+        return float(value)
+    return None
+
+
+def parse_remaining_percent(value: object) -> int | None:
+    if isinstance(value, (int, float)):
+        percent = int(round(float(value)))
+        return max(0, min(100, percent))
+    if not isinstance(value, str):
+        return None
+
+    match = re.fullmatch(r"\s*(\d{1,3})%\*?\s*", value)
+    if match is None:
+        return None
+
+    percent = int(match.group(1))
+    return max(0, min(100, percent))
+
+
+def parse_reset_display(value: str) -> float | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if stripped == "now":
+        return time.time()
+
+    total_seconds = 0
+    for amount, unit in re.findall(r"(\d+)\s*([dhm])", stripped):
+        factor = {"d": 86400, "h": 3600, "m": 60}[unit]
+        total_seconds += int(amount) * factor
+
+    if total_seconds <= 0:
+        return None
+
+    return time.time() + total_seconds
 
 
 def truncate_text(value: str, width: int) -> str:
@@ -499,12 +567,20 @@ def format_quota_view(payload: dict[str, Any]) -> QuotaView:
 
     primary_left = format_window_left(snapshot.get("primary"))
     secondary_left = format_window_left(snapshot.get("secondary"))
+    primary_reset_at = extract_window_reset_timestamp(snapshot.get("primary"))
+    secondary_reset_at = extract_window_reset_timestamp(snapshot.get("secondary"))
     if primary_left or secondary_left:
         return QuotaView(
             primary_left=primary_left or EMPTY_CELL,
-            primary_reset=format_window_reset(snapshot.get("primary")) if primary_left else EMPTY_CELL,
+            primary_reset=format_reset_timestamp(primary_reset_at) if primary_left and primary_reset_at is not None else EMPTY_CELL,
             secondary_left=secondary_left or EMPTY_CELL,
-            secondary_reset=format_window_reset(snapshot.get("secondary")) if secondary_left else EMPTY_CELL,
+            secondary_reset=(
+                format_reset_timestamp(secondary_reset_at) if secondary_left and secondary_reset_at is not None else EMPTY_CELL
+            ),
+            primary_left_percent=parse_remaining_percent(primary_left),
+            primary_reset_at=primary_reset_at if primary_left else None,
+            secondary_left_percent=parse_remaining_percent(secondary_left),
+            secondary_reset_at=secondary_reset_at if secondary_left else None,
         )
 
     credits = snapshot.get("credits")
@@ -673,7 +749,45 @@ def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path
             quota = outcome.quota
         enriched_by_path[auth_file.path] = replace(auth_file, quota=quota)
 
-    return [enriched_by_path[auth_file.path] for auth_file in auth_files]
+    final_auth_files = [enriched_by_path[auth_file.path] for auth_file in auth_files]
+    return sorted(final_auth_files, key=auth_priority_key)
+
+
+def auth_priority_key(auth_file: AuthFile) -> tuple[int, float, int, int, float, int, int, int]:
+    quota = auth_file.quota
+    has_secondary_data = quota.secondary_reset_at is not None and quota.secondary_left_percent is not None
+    has_primary_data = quota.primary_reset_at is not None and quota.primary_left_percent is not None
+    if has_secondary_data:
+        return (
+            0,
+            quota.secondary_reset_at,
+            quota.secondary_left_percent,
+            0 if has_primary_data else 1,
+            quota.primary_reset_at if quota.primary_reset_at is not None else float("inf"),
+            quota.primary_left_percent if quota.primary_left_percent is not None else 101,
+            *auth_sort_key(auth_file.name),
+        )
+
+    if has_primary_data:
+        return (
+            1,
+            float("inf"),
+            101,
+            0,
+            quota.primary_reset_at,
+            quota.primary_left_percent,
+            *auth_sort_key(auth_file.name),
+        )
+
+    return (
+        2,
+        float("inf"),
+        101,
+        1,
+        float("inf"),
+        101,
+        *auth_sort_key(auth_file.name),
+    )
 
 
 def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthFile:
