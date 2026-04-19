@@ -1,0 +1,889 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import base64
+import concurrent.futures
+import json
+import os
+import re
+import secrets
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from dataclasses import field
+from dataclasses import replace
+from datetime import datetime
+from datetime import timedelta
+from pathlib import Path
+import tomllib
+from typing import Any
+from typing import Sequence
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+
+AUTH_DIR = Path.home() / ".codex"
+ACTIVE_NAME = "auth.json"
+AUTH_PATTERN = re.compile(r"^auth\.json(\d+)?$")
+CACHE_DIR = Path.home() / ".cache" / "codex-auth"
+CACHE_FILE = CACHE_DIR / "quota-cache.json"
+CACHE_VERSION = 1
+CACHE_TTL_SECONDS = 300
+HTTP_TIMEOUT_SECONDS = 8.0
+MAX_CONCURRENT_PROBES = 4
+STATUS_WIDTH = 10
+NAME_WIDTH = 12
+TIME_WIDTH = 16
+PRIMARY_LEFT_WIDTH = 16
+PRIMARY_RESET_WIDTH = 11
+SECONDARY_LEFT_WIDTH = 8
+SECONDARY_RESET_WIDTH = 11
+EMPTY_CELL = ""
+QUOTA_UNKNOWN = "unavailable"
+TOKEN_EXPIRED = "token expired"
+API_KEY_AUTH = "api-key auth"
+MISSING_TOKEN = "no token"
+INVALID_AUTH = "bad auth"
+UNAUTHORIZED = "unauthorized"
+FORBIDDEN = "forbidden"
+RATE_LIMITED = "rate limited"
+TIMEOUT = "timeout"
+NETWORK_ERROR = "network error"
+BAD_RESPONSE = "bad response"
+PROBE_ERROR = "probe error"
+MENU_TITLE = "Codex auth switcher"
+DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
+
+
+@dataclass(frozen=True)
+class QuotaView:
+    primary_left: str = EMPTY_CELL
+    primary_reset: str = EMPTY_CELL
+    secondary_left: str = EMPTY_CELL
+    secondary_reset: str = EMPTY_CELL
+
+    @classmethod
+    def status(cls, value: str) -> "QuotaView":
+        return cls(primary_left=value)
+
+    @classmethod
+    def from_cache_value(cls, value: object) -> "QuotaView | None":
+        if not isinstance(value, dict):
+            return None
+        primary_left = value.get("primary_left", EMPTY_CELL)
+        primary_reset = value.get("primary_reset", EMPTY_CELL)
+        secondary_left = value.get("secondary_left", EMPTY_CELL)
+        secondary_reset = value.get("secondary_reset", EMPTY_CELL)
+        if not all(isinstance(item, str) for item in (primary_left, primary_reset, secondary_left, secondary_reset)):
+            return None
+        return cls(
+            primary_left=primary_left,
+            primary_reset=primary_reset,
+            secondary_left=secondary_left,
+            secondary_reset=secondary_reset,
+        )
+
+    def to_cache_value(self) -> dict[str, str]:
+        return {
+            "primary_left": self.primary_left,
+            "primary_reset": self.primary_reset,
+            "secondary_left": self.secondary_left,
+            "secondary_reset": self.secondary_reset,
+        }
+
+    def with_stale_marker(self) -> "QuotaView":
+        def mark(value: str) -> str:
+            if not value or value.endswith("*"):
+                return value
+            return f"{value}*"
+
+        return replace(
+            self,
+            primary_left=mark(self.primary_left),
+            secondary_left=mark(self.secondary_left),
+        )
+
+    def is_data_view(self) -> bool:
+        return any(
+            value
+            for value in (
+                self.primary_reset,
+                self.secondary_left,
+                self.secondary_reset,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ProbeOutcome:
+    quota: QuotaView
+    cacheable: bool = True
+
+    @classmethod
+    def status(cls, value: str, *, cacheable: bool = True) -> "ProbeOutcome":
+        return cls(quota=QuotaView.status(value), cacheable=cacheable and is_cacheable_status(value))
+
+
+@dataclass(frozen=True)
+class AuthFile:
+    path: Path
+    suffix: str
+    is_active: bool
+    last_used_at: float
+    size_bytes: int
+    mtime_ns: int
+    quota: QuotaView = field(default_factory=QuotaView)
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def label(self) -> str:
+        status = "[active]" if self.is_active else f"[slot {self.suffix}]"
+        last_used = format_timestamp(self.last_used_at)
+        quota = self.quota
+        return (
+            f"{status:<{STATUS_WIDTH}} "
+            f"{self.name:<{NAME_WIDTH}} "
+            f"{last_used:<{TIME_WIDTH}} "
+            f"{truncate_text(quota.primary_left, PRIMARY_LEFT_WIDTH):<{PRIMARY_LEFT_WIDTH}} "
+            f"{truncate_text(quota.primary_reset, PRIMARY_RESET_WIDTH):<{PRIMARY_RESET_WIDTH}} "
+            f"{truncate_text(quota.secondary_left, SECONDARY_LEFT_WIDTH):<{SECONDARY_LEFT_WIDTH}} "
+            f"{truncate_text(quota.secondary_reset, SECONDARY_RESET_WIDTH):<{SECONDARY_RESET_WIDTH}}"
+        )
+
+
+class SwapError(RuntimeError):
+    pass
+
+
+class QuotaProbeError(RuntimeError):
+    def __init__(self, status: str, *, transient: bool = False):
+        super().__init__(status)
+        self.status = status
+        self.transient = transient
+
+
+def is_cacheable_status(status: str) -> bool:
+    return status in {
+        API_KEY_AUTH,
+        MISSING_TOKEN,
+        INVALID_AUTH,
+        TOKEN_EXPIRED,
+    }
+
+
+def fail(message: str, exit_code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def show_help() -> None:
+    print(
+        f"""Usage: codex-auth [OPTIONS]
+
+Switch the active Codex auth file inside {AUTH_DIR}.
+
+Rules:
+  - {ACTIVE_NAME} is the active file
+  - auth.json<number> files are inactive candidates
+  - only one active file exists at a time
+  - the menu shows each file's last active time from its modified timestamp
+  - the menu shows cached or live remaining quota and reset countdowns for each auth file
+  - quota probes use a direct read-only HTTPS request with the current auth token
+  - quota probes never trigger token refresh or modify your real auth files
+  - transient probe failures keep stale cached quota when available and mark it with *
+  - live probe failures can surface as statuses such as token expired, timeout, bad auth, or network error
+  - after a successful switch, the newly active file timestamp is updated
+
+Options:
+  -d, --dir PATH   Override the auth directory (default: {AUTH_DIR})
+  -h, --help       Show this help text
+"""
+    )
+
+
+def parse_args(argv: Sequence[str]) -> Path:
+    directory = AUTH_DIR
+    index = 0
+
+    while index < len(argv):
+        arg = argv[index]
+        if arg in {"-h", "--help"}:
+            show_help()
+            raise SystemExit(0)
+        if arg in {"-d", "--dir"}:
+            index += 1
+            if index >= len(argv):
+                fail("--dir requires a path value.")
+            directory = Path(argv[index]).expanduser()
+        else:
+            fail(f"Unknown argument: {arg}")
+        index += 1
+
+    return directory
+
+
+def auth_sort_key(name: str) -> tuple[int, int]:
+    if name == ACTIVE_NAME:
+        return (0, 0)
+
+    suffix = name.removeprefix(ACTIVE_NAME)
+    return (1, int(suffix))
+
+
+def format_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def format_reset_timestamp(timestamp: float) -> str:
+    remaining_seconds = max(0, int(round(timestamp - time.time())))
+    if remaining_seconds < 60:
+        return "now"
+
+    total_minutes, _ = divmod(remaining_seconds, 60)
+    total_hours, minutes = divmod(total_minutes, 60)
+    days, hours = divmod(total_hours, 24)
+
+    if days > 0:
+        return f"{days}d {hours}h"
+    if total_hours > 0:
+        return f"{total_hours}h {minutes}m"
+    return f"{total_minutes}m"
+
+
+def truncate_text(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return f"{value[: width - 3]}..."
+
+
+def menu_header() -> str:
+    return (
+        f"{'Status':<{STATUS_WIDTH}} "
+        f"{'File':<{NAME_WIDTH}} "
+        f"{'Last used':<{TIME_WIDTH}} "
+        f"{'5h left':<{PRIMARY_LEFT_WIDTH}} "
+        f"{'5h in':<{PRIMARY_RESET_WIDTH}} "
+        f"{'7d left':<{SECONDARY_LEFT_WIDTH}} "
+        f"{'7d in':<{SECONDARY_RESET_WIDTH}}"
+    )
+
+
+def menu_separator() -> str:
+    return "-" * len(menu_header())
+
+
+def list_auth_files(directory: Path) -> list[AuthFile]:
+    if not directory.exists():
+        fail(f"Directory does not exist: {directory}")
+    if not directory.is_dir():
+        fail(f"Not a directory: {directory}")
+
+    matched_paths = [
+        path
+        for path in directory.iterdir()
+        if path.is_file() and AUTH_PATTERN.fullmatch(path.name) is not None
+    ]
+
+    auth_files = []
+    for path in sorted(matched_paths, key=lambda item: auth_sort_key(item.name)):
+        suffix = path.name.removeprefix(ACTIVE_NAME)
+        stat_result = path.stat()
+        auth_files.append(
+            AuthFile(
+                path=path,
+                suffix=suffix,
+                is_active=path.name == ACTIVE_NAME,
+                last_used_at=stat_result.st_mtime,
+                size_bytes=stat_result.st_size,
+                mtime_ns=stat_result.st_mtime_ns,
+            )
+        )
+
+    if not auth_files:
+        fail(f"No auth files matching auth.json or auth.json<number> found in {directory}.")
+
+    active_count = sum(1 for auth_file in auth_files if auth_file.is_active)
+    if active_count != 1:
+        fail(
+            f"Expected exactly one active {ACTIVE_NAME} file in {directory}, found {active_count}."
+        )
+
+    return auth_files
+
+
+def load_quota_cache() -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if payload.get("version") != CACHE_VERSION:
+        return {}
+
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+
+    valid_entries: dict[str, dict[str, Any]] = {}
+    for key, value in entries.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            valid_entries[key] = value
+    return valid_entries
+
+
+def save_quota_cache(entries: dict[str, dict[str, Any]]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = CACHE_FILE.with_name(f"{CACHE_FILE.name}.tmp-{secrets.token_hex(4)}")
+    payload = {"version": CACHE_VERSION, "entries": entries}
+    temp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    os.replace(temp_path, CACHE_FILE)
+
+
+def cache_key(auth_file: AuthFile) -> str:
+    return str(auth_file.path.resolve())
+
+
+def cached_quota_view(
+    cache: dict[str, dict[str, Any]],
+    auth_file: AuthFile,
+    now: float,
+    *,
+    allow_stale: bool,
+) -> QuotaView | None:
+    entry = cache.get(cache_key(auth_file))
+    if not isinstance(entry, dict):
+        return None
+
+    if entry.get("mtime_ns") != auth_file.mtime_ns:
+        return None
+    if entry.get("size_bytes") != auth_file.size_bytes:
+        return None
+
+    quota = QuotaView.from_cache_value(entry.get("quota"))
+    fetched_at = entry.get("fetched_at")
+    if quota is None or not isinstance(fetched_at, (int, float)):
+        return None
+
+    if not quota.is_data_view() and not is_cacheable_status(quota.primary_left):
+        return None
+
+    if not allow_stale and now - float(fetched_at) > CACHE_TTL_SECONDS:
+        return None
+
+    return quota
+
+
+def update_quota_cache_entry(
+    cache: dict[str, dict[str, Any]], auth_file: AuthFile, quota: QuotaView, fetched_at: float
+) -> None:
+    cache[cache_key(auth_file)] = {
+        "mtime_ns": auth_file.mtime_ns,
+        "size_bytes": auth_file.size_bytes,
+        "quota": quota.to_cache_value(),
+        "fetched_at": fetched_at,
+    }
+
+
+def load_chatgpt_base_url(directory: Path) -> str:
+    config_file = directory / "config.toml"
+    if not config_file.exists():
+        return DEFAULT_CHATGPT_BASE_URL
+
+    try:
+        config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return DEFAULT_CHATGPT_BASE_URL
+
+    base_url = config.get("chatgpt_base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return DEFAULT_CHATGPT_BASE_URL
+
+    normalized = base_url.rstrip("/")
+    if (
+        normalized.startswith("https://chatgpt.com")
+        or normalized.startswith("https://chat.openai.com")
+    ) and "/backend-api" not in normalized:
+        normalized = f"{normalized}/backend-api"
+
+    return normalized
+
+
+def usage_endpoint_for_base_url(base_url: str) -> str:
+    if "/backend-api" in base_url:
+        return f"{base_url}/wham/usage"
+    return f"{base_url}/api/codex/usage"
+
+
+def decode_jwt_payload(jwt: str) -> dict[str, Any] | None:
+    parts = jwt.split(".")
+    if len(parts) != 3:
+        return None
+
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(f"{payload}{padding}")
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def is_access_token_expired(access_token: str) -> bool:
+    payload = decode_jwt_payload(access_token)
+    if payload is None:
+        return False
+
+    exp = payload.get("exp")
+    return isinstance(exp, (int, float)) and float(exp) <= time.time()
+
+
+def format_window_left(window: object) -> str | None:
+    if not isinstance(window, dict):
+        return None
+
+    used_percent = window.get("used_percent", window.get("usedPercent"))
+    if not isinstance(used_percent, (int, float)):
+        return None
+
+    remaining_percent = max(0, 100 - int(round(float(used_percent))))
+    return f"{remaining_percent}%"
+
+
+def extract_window_reset_timestamp(window: object) -> float | None:
+    if not isinstance(window, dict):
+        return None
+
+    reset_at = window.get("reset_at", window.get("resetAt", window.get("resets_at", window.get("resetsAt"))))
+    if isinstance(reset_at, (int, float)) and float(reset_at) > 0:
+        return float(reset_at)
+
+    reset_after = window.get("reset_after_seconds", window.get("resetAfterSeconds"))
+    if isinstance(reset_after, (int, float)) and float(reset_after) > 0:
+        return time.time() + float(reset_after)
+
+    return None
+
+
+def format_window_reset(window: object) -> str:
+    timestamp = extract_window_reset_timestamp(window)
+    if timestamp is None:
+        return EMPTY_CELL
+    return format_reset_timestamp(timestamp)
+
+
+def select_rate_limit_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    rate_limit = payload.get("rate_limit")
+    if isinstance(rate_limit, dict):
+        return {
+            "primary": rate_limit.get("primary_window"),
+            "secondary": rate_limit.get("secondary_window"),
+            "credits": payload.get("credits"),
+        }
+
+    raise QuotaProbeError(BAD_RESPONSE, transient=True)
+
+
+def format_quota_view(payload: dict[str, Any]) -> QuotaView:
+    snapshot = select_rate_limit_snapshot(payload)
+
+    primary_left = format_window_left(snapshot.get("primary"))
+    secondary_left = format_window_left(snapshot.get("secondary"))
+    if primary_left or secondary_left:
+        return QuotaView(
+            primary_left=primary_left or EMPTY_CELL,
+            primary_reset=format_window_reset(snapshot.get("primary")) if primary_left else EMPTY_CELL,
+            secondary_left=secondary_left or EMPTY_CELL,
+            secondary_reset=format_window_reset(snapshot.get("secondary")) if secondary_left else EMPTY_CELL,
+        )
+
+    credits = snapshot.get("credits")
+    if isinstance(credits, dict):
+        if credits.get("unlimited") is True:
+            return QuotaView.status("unlimited")
+
+        balance = credits.get("balance")
+        if isinstance(balance, str) and balance.strip() and balance.strip() not in {"0", "0.0"}:
+            return QuotaView.status(f"credits {balance.strip()}")
+
+    return QuotaView.status(QUOTA_UNKNOWN)
+
+
+def load_auth_payload(auth_file: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(auth_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise QuotaProbeError(INVALID_AUTH) from error
+    if not isinstance(payload, dict):
+        raise QuotaProbeError(INVALID_AUTH)
+    return payload
+
+
+def auth_mode_from_payload(payload: dict[str, Any]) -> str:
+    mode = payload.get("auth_mode")
+    if isinstance(mode, str) and mode:
+        return mode
+    if payload.get("OPENAI_API_KEY"):
+        return "api_key"
+    return "chatgpt"
+
+
+def usage_request_headers(access_token: str, account_id: str | None) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "codex-cli",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    return headers
+
+
+def fetch_usage_payload(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    request = urllib_request.Request(url, headers=headers)
+    try:
+        with urllib_request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8")
+    except urllib_error.HTTPError as error:
+        if error.code == 401:
+            raise QuotaProbeError(UNAUTHORIZED) from error
+        if error.code == 403:
+            raise QuotaProbeError(QUOTA_UNKNOWN, transient=True) from error
+        if error.code == 429:
+            raise QuotaProbeError(RATE_LIMITED, transient=True) from error
+        raise QuotaProbeError(f"http {error.code}", transient=error.code >= 500) from error
+    except urllib_error.URLError as error:
+        reason = error.reason
+        if isinstance(reason, TimeoutError | socket.timeout):
+            raise QuotaProbeError(TIMEOUT, transient=True) from error
+        raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise QuotaProbeError(BAD_RESPONSE, transient=True) from error
+
+    if isinstance(payload, dict):
+        return payload
+
+    raise QuotaProbeError(BAD_RESPONSE, transient=True)
+
+
+def probe_quota_view(auth_file: AuthFile, directory: Path) -> ProbeOutcome:
+    access_token = ""
+    try:
+        auth_payload = load_auth_payload(auth_file.path)
+        auth_mode = auth_mode_from_payload(auth_payload)
+        if auth_mode == "api_key":
+            return ProbeOutcome.status(API_KEY_AUTH)
+
+        tokens = auth_payload.get("tokens")
+        if not isinstance(tokens, dict):
+            return ProbeOutcome.status(MISSING_TOKEN)
+
+        access_token = tokens.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            return ProbeOutcome.status(MISSING_TOKEN)
+
+        if is_access_token_expired(access_token):
+            return ProbeOutcome.status(TOKEN_EXPIRED)
+
+        base_url = load_chatgpt_base_url(directory)
+        endpoint = usage_endpoint_for_base_url(base_url)
+        account_id = tokens.get("account_id")
+        account_id = account_id if isinstance(account_id, str) and account_id else None
+
+        payload = fetch_usage_payload(endpoint, usage_request_headers(access_token, account_id))
+        return ProbeOutcome(format_quota_view(payload))
+    except QuotaProbeError as error:
+        status = error.status
+        if status == UNAUTHORIZED and is_access_token_expired(access_token):
+            status = TOKEN_EXPIRED
+        return ProbeOutcome.status(status, cacheable=not error.transient)
+    except Exception:
+        return ProbeOutcome.status(PROBE_ERROR, cacheable=False)
+
+
+def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path) -> list[AuthFile]:
+    cache = load_quota_cache()
+    now = time.time()
+    updated_cache = dict(cache)
+    cache_changed = False
+
+    enriched_auth_files: list[AuthFile] = []
+    files_to_probe: list[AuthFile] = []
+    stale_fallbacks: dict[Path, QuotaView] = {}
+
+    for auth_file in auth_files:
+        cached_quota = cached_quota_view(cache, auth_file, now, allow_stale=False)
+        if cached_quota is not None:
+            enriched_auth_files.append(replace(auth_file, quota=cached_quota))
+            continue
+
+        stale_quota = cached_quota_view(cache, auth_file, now, allow_stale=True)
+        if stale_quota is not None:
+            stale_fallbacks[auth_file.path] = stale_quota
+
+        files_to_probe.append(auth_file)
+
+    probed_outcomes: dict[Path, ProbeOutcome] = {}
+    if files_to_probe:
+        max_workers = min(MAX_CONCURRENT_PROBES, len(files_to_probe))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_auth = {
+                executor.submit(probe_quota_view, auth_file, directory): auth_file
+                for auth_file in files_to_probe
+            }
+            for future in concurrent.futures.as_completed(future_to_auth):
+                auth_file = future_to_auth[future]
+                try:
+                    outcome = future.result()
+                except Exception:
+                    outcome = ProbeOutcome.status(PROBE_ERROR, cacheable=False)
+
+                probed_outcomes[auth_file.path] = outcome
+                if outcome.cacheable:
+                    update_quota_cache_entry(updated_cache, auth_file, outcome.quota, time.time())
+                    cache_changed = True
+
+    if cache_changed:
+        try:
+            save_quota_cache(updated_cache)
+        except OSError:
+            pass
+
+    enriched_by_path = {auth_file.path: auth_file for auth_file in enriched_auth_files}
+    for auth_file in files_to_probe:
+        outcome = probed_outcomes.get(auth_file.path)
+        stale_quota = stale_fallbacks.get(auth_file.path)
+        if outcome is None:
+            quota = stale_quota.with_stale_marker() if stale_quota is not None else QuotaView.status(PROBE_ERROR)
+        elif not outcome.cacheable and stale_quota is not None:
+            quota = stale_quota.with_stale_marker()
+        else:
+            quota = outcome.quota
+        enriched_by_path[auth_file.path] = replace(auth_file, quota=quota)
+
+    return [enriched_by_path[auth_file.path] for auth_file in auth_files]
+
+
+def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthFile:
+    tty_output.write(f"{MENU_TITLE}\n\n")
+    tty_output.write(f"      {menu_header()}\n")
+    tty_output.write(f"      {menu_separator()}\n")
+    for index, auth_file in enumerate(auth_files, start=1):
+        tty_output.write(f"  {index:>2}. {auth_file.label}\n")
+    tty_output.write("\n")
+    tty_output.write("      * stale cache, reset columns show time remaining\n\n")
+    tty_output.flush()
+
+    while True:
+        tty_output.write(
+            f"Select an auth file [1-{len(auth_files)}] (Enter keeps current, Ctrl-C cancels): "
+        )
+        tty_output.flush()
+        selection = tty_input.readline()
+        if selection == "":
+            fail("Interactive auth picker was interrupted.", exit_code=130)
+
+        selection = selection.strip()
+        if not selection:
+            for auth_file in auth_files:
+                if auth_file.is_active:
+                    return auth_file
+
+        if selection.isdigit():
+            selected_index = int(selection)
+            if 1 <= selected_index <= len(auth_files):
+                return auth_files[selected_index - 1]
+
+        tty_output.write("Invalid selection. Please enter one of the listed numbers.\n")
+        tty_output.flush()
+
+
+def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthFile:
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input.defaults import create_input
+    from prompt_toolkit.output.defaults import create_output
+    from prompt_toolkit.shortcuts import choice
+    from prompt_toolkit.styles import Style
+
+    style = Style.from_dict(
+        {
+            "frame.border": "#334155",
+            "frame.label": "bold #93c5fd",
+            "text-area": "bg:#111827 #e5e7eb",
+            "text-area.prompt": "bold #fbbf24",
+            "selected-option": "bg:#22c55e #052e16 bold",
+            "line": "#94a3b8",
+            "bottom-toolbar": "bg:#0f172a #cbd5e1",
+        }
+    )
+
+    tty_ui_input = create_input(stdin=tty_input, always_prefer_tty=True)
+    tty_ui_output = create_output(stdout=tty_output, always_prefer_tty=True)
+
+    try:
+        with create_app_session(input=tty_ui_input, output=tty_ui_output):
+            result = choice(
+                message=f"{MENU_TITLE}\n\n{menu_header()}\n{menu_separator()}",
+                options=[(auth_file, auth_file.label) for auth_file in auth_files],
+                default=next(auth_file for auth_file in auth_files if auth_file.is_active),
+                style=style,
+                symbol=">",
+                show_frame=True,
+                bottom_toolbar="Enter selects  Ctrl-C cancels  * stale cache  Reset columns show time remaining",
+            )
+    except KeyboardInterrupt:
+        fail("Interactive auth picker was cancelled.", exit_code=130)
+    finally:
+        tty_ui_input.close()
+
+    if result is None:
+        fail("Interactive auth picker was cancelled.", exit_code=130)
+
+    return result
+
+
+def choose_auth_file(auth_files: Sequence[AuthFile]) -> AuthFile:
+    try:
+        tty_input = open("/dev/tty", "r", encoding="utf-8")
+        tty_output = open("/dev/tty", "w", encoding="utf-8")
+    except OSError:
+        fail("Interactive auth picker requires a terminal.")
+
+    try:
+        try:
+            return prompt_toolkit_choice(auth_files, tty_input, tty_output)
+        except ImportError:
+            return fallback_choice(auth_files, tty_input, tty_output)
+    finally:
+        tty_input.close()
+        tty_output.close()
+
+
+def unique_temp_path(directory: Path) -> Path:
+    while True:
+        candidate = directory / f"{ACTIVE_NAME}.swap-{secrets.token_hex(4)}"
+        if not candidate.exists():
+            return candidate
+
+
+def ensure_regular_file(path: Path, role: str) -> None:
+    if not path.exists():
+        raise SwapError(f"{role} file does not exist: {path}")
+    if not path.is_file():
+        raise SwapError(f"{role} path is not a regular file: {path}")
+
+
+def fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def mark_as_recently_active(path: Path) -> None:
+    os.utime(path, None)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def rollback_swap(active_path: Path, selected_path: Path, temp_path: Path) -> tuple[bool, str]:
+    notes: list[str] = []
+
+    try:
+        if temp_path.exists() and not active_path.exists() and selected_path.exists():
+            os.replace(temp_path, active_path)
+            fsync_directory(active_path.parent)
+            return True, "Rolled back after moving the active file to a temporary name."
+
+        if temp_path.exists() and active_path.exists() and not selected_path.exists():
+            os.replace(active_path, selected_path)
+            os.replace(temp_path, active_path)
+            fsync_directory(active_path.parent)
+            return True, "Rolled back after moving the selected file into the active slot."
+    except OSError as error:
+        notes.append(f"rollback failed: {error}")
+
+    if temp_path.exists():
+        notes.append(f"temporary backup remains at {temp_path}")
+    if active_path.exists():
+        notes.append(f"active path currently exists at {active_path}")
+    if selected_path.exists():
+        notes.append(f"selected path currently exists at {selected_path}")
+
+    if not notes:
+        notes.append("current on-disk state could not be determined automatically")
+
+    return False, "; ".join(notes)
+
+
+def swap_auth_files(active_path: Path, selected_path: Path) -> None:
+    if active_path == selected_path:
+        return
+
+    if active_path.parent != selected_path.parent:
+        raise SwapError("Refusing to swap auth files across different directories.")
+
+    ensure_regular_file(active_path, "Active")
+    ensure_regular_file(selected_path, "Selected")
+
+    temp_path = unique_temp_path(active_path.parent)
+
+    try:
+        os.replace(active_path, temp_path)
+        os.replace(selected_path, active_path)
+        os.replace(temp_path, selected_path)
+        fsync_directory(active_path.parent)
+    except OSError as error:
+        rolled_back, recovery_message = rollback_swap(active_path, selected_path, temp_path)
+        if rolled_back:
+            raise SwapError(f"Auth swap failed and was rolled back safely: {error}") from error
+        raise SwapError(
+            f"Auth swap failed and automatic recovery was incomplete: {error}. {recovery_message}"
+        ) from error
+
+    try:
+        mark_as_recently_active(active_path)
+    except OSError as error:
+        raise SwapError(
+            f"Auth switch completed, but updating the last active timestamp failed: {error}"
+        ) from error
+
+
+def main() -> None:
+    directory = parse_args(sys.argv[1:])
+    auth_files = list_auth_files(directory)
+    auth_files = enrich_auth_files_with_quota(auth_files, directory)
+
+    active_auth = next(auth_file for auth_file in auth_files if auth_file.is_active)
+    selected_auth = choose_auth_file(auth_files)
+
+    if selected_auth.is_active:
+        print(f"{selected_auth.name} is already active.")
+        return
+
+    try:
+        swap_auth_files(active_auth.path, selected_auth.path)
+    except SwapError as error:
+        fail(str(error))
+
+    print(f"Active auth switched: {active_auth.name} <-> {selected_auth.name}")
+
+
+if __name__ == "__main__":
+    main()
