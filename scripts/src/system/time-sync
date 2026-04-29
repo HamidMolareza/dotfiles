@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+WAIT_SECONDS=30
+RETRY_COUNT=5
+RETRY_DELAY_SECONDS=15
+ENABLE_NTP=1
+UPDATE_HWCLOCK=1
+OFFLINE_FALLBACK=1
+TIMEIR_FALLBACK=1
+STATUS_ONLY=0
+SAVE_NOW=0
+ORIG_HOME="${TIME_SYNC_ORIG_HOME:-$HOME}"
+ORIG_XDG_STATE_HOME="${TIME_SYNC_ORIG_XDG_STATE_HOME:-${XDG_STATE_HOME:-}}"
+STATE_DIR="${ORIG_XDG_STATE_HOME:-$ORIG_HOME/.local/state}/time-sync"
+STATE_FILE="$STATE_DIR/last-known-good-epoch"
+TIMEIR_URL="https://www.time.ir/"
+TIMEIR_HTTP_URL="http://www.time.ir/"
+FETCH_TIMEOUT=20
+TIMEIR_LAST_ERROR=""
+ROOT_REQUIRED=0
+
+usage() {
+    cat <<'EOF'
+Usage: time-sync [options]
+
+Repair system date/time after bad RTC state or power loss.
+
+By default this command:
+  - enables network time sync when possible
+  - waits for synchronization
+  - falls back to https://www.time.ir/ when NTP cannot sync
+  - writes the corrected system time back to the hardware clock when possible
+  - falls back to the last trusted local timestamp if the network is unavailable
+
+Options:
+  --status           Show current time sync status and exit.
+  --wait SECONDS     Seconds to wait for synchronization. Default: 30.
+  --retries COUNT    Retry the full sync workflow this many times after the
+                     first failed attempt. Default: 5.
+  --retry-delay SECONDS
+                     Seconds to wait between retry attempts. Default: 15.
+  --save-now         Save the current system time as trusted without waiting for NTP.
+  --no-enable-ntp    Do not attempt to enable NTP/time sync.
+  --no-hwclock       Do not write the synchronized time to the hardware clock.
+  --no-timeir        Do not try the https://www.time.ir/ fallback.
+  --no-offline-fallback
+                     Do not restore time from the last trusted local timestamp.
+  -h, --help         Show this help text.
+
+Examples:
+  time-sync
+  time-sync --wait 90
+  time-sync --retries 5 --retry-delay 20
+  time-sync --status
+  time-sync --save-now
+  time-sync --no-timeir
+
+Notes:
+  - If the clock keeps breaking after full power loss, the RTC/CMOS battery is
+    probably weak and should be replaced.
+  - The time.ir fallback uses Iran time. It tries HTTPS first, then insecure
+    HTTPS, then plain HTTP headers for clock-skew recovery.
+  - Network fetches honor the current proxy environment, including after sudo
+    re-exec.
+  - The repair path re-executes itself with sudo when needed.
+  - Offline fallback can only restore a recent trusted timestamp. It cannot know
+    the exact current time without a network or another trusted external source.
+  - For automatic repair at boot, first enable NTP once with:
+      sudo timedatectl set-ntp true
+    Then install the root boot service:
+      sudo time-sync-install-service
+EOF
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+have_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+record_timeir_error() {
+    local message="$1"
+    if [[ -n "$message" ]]; then
+        TIMEIR_LAST_ERROR="$message"
+    fi
+}
+
+resolve_script_path() {
+    local candidate="$0"
+
+    if [[ "$candidate" == */* ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    command -v -- "$candidate"
+}
+
+ensure_root_for_repair() {
+    local script_path=""
+    local env_args=()
+    local name=""
+
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        return 0
+    fi
+
+    if (( STATUS_ONLY )); then
+        return 0
+    fi
+
+    if ! have_command sudo; then
+        die "sudo is required to repair the system clock."
+    fi
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        die "Interactive sudo is required to repair the system clock. Re-run with sudo."
+    fi
+
+    script_path="$(resolve_script_path)" || die "Could not resolve script path for sudo re-exec."
+
+    for name in \
+        ALL_PROXY \
+        all_proxy \
+        HTTP_PROXY \
+        http_proxy \
+        HTTPS_PROXY \
+        https_proxy \
+        FTP_PROXY \
+        ftp_proxy \
+        NO_PROXY \
+        no_proxy
+    do
+        if [[ -v "$name" ]]; then
+            env_args+=("$name=${!name}")
+        fi
+    done
+
+    exec sudo env \
+        "TIME_SYNC_ORIG_HOME=$ORIG_HOME" \
+        "TIME_SYNC_ORIG_XDG_STATE_HOME=$ORIG_XDG_STATE_HOME" \
+        "${env_args[@]}" \
+        "$script_path" "$@"
+}
+
+run_as_root() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+        return
+    fi
+
+    if ! have_command sudo; then
+        return 1
+    fi
+
+    if [[ -t 0 && -t 1 ]]; then
+        sudo "$@"
+        return
+    fi
+
+    return 1
+}
+
+show_status() {
+    date '+Current time: %Y-%m-%d %H:%M:%S %Z'
+    echo
+    if ! timedatectl status; then
+        echo "timedatectl status is unavailable in this session."
+    fi
+
+    if [[ -f "$STATE_FILE" ]]; then
+        echo
+        echo "Last trusted local timestamp: $(date -d "@$(cat "$STATE_FILE")" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || cat "$STATE_FILE")"
+    fi
+}
+
+is_synchronized() {
+    [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]
+}
+
+enable_ntp() {
+    if ! timedatectl show -p CanNTP --value >/dev/null 2>&1; then
+        echo "This system does not expose timedatectl NTP controls."
+        return 1
+    fi
+
+    if [[ "$(timedatectl show -p NTP --value 2>/dev/null || true)" == "yes" ]]; then
+        echo "NTP is already enabled."
+        return 0
+    fi
+
+    if run_as_root timedatectl set-ntp true; then
+        echo "Enabled NTP synchronization."
+        return 0
+    fi
+
+    echo "Could not enable NTP automatically. Run this once manually:"
+    echo "  sudo timedatectl set-ntp true"
+    return 1
+}
+
+wait_for_sync() {
+    local waited=0
+
+    while (( waited < WAIT_SECONDS )); do
+        if is_synchronized; then
+            return 0
+        fi
+
+        sleep 1
+        ((waited += 1))
+    done
+
+    return 1
+}
+
+save_trusted_time() {
+    save_trusted_epoch "$(date +%s)"
+}
+
+save_trusted_epoch() {
+    local epoch="$1"
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$epoch" >"$STATE_FILE"
+    echo "Saved trusted local timestamp: $(date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "$epoch")"
+}
+
+set_system_time_from_epoch() {
+    local epoch="$1"
+
+    if run_as_root date -s "@$epoch" >/dev/null; then
+        ROOT_REQUIRED=0
+        return 0
+    fi
+
+    ROOT_REQUIRED=1
+    return 1
+}
+
+restore_from_saved_time() {
+    local saved_epoch=""
+    local current_epoch=""
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "No saved trusted timestamp is available for offline fallback."
+        return 1
+    fi
+
+    saved_epoch="$(tr -d '[:space:]' <"$STATE_FILE")"
+    [[ "$saved_epoch" =~ ^[0-9]+$ ]] || die "Saved state file is invalid: $STATE_FILE"
+
+    current_epoch="$(date +%s)"
+
+    if (( current_epoch >= saved_epoch )); then
+        echo "Current time is not behind the saved trusted timestamp. Leaving it unchanged."
+        return 1
+    fi
+
+    if set_system_time_from_epoch "$saved_epoch"; then
+        echo "Restored system time from last trusted local timestamp."
+        return 0
+    fi
+
+    echo "Setting system time from the saved timestamp needs root access."
+    return 1
+}
+
+fetch_time_ir_html() {
+    local output=""
+
+    if have_command curl; then
+        if output="$(curl -fsSL --connect-timeout 10 --max-time "$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "HTTPS HTML fetch via curl failed: $(printf '%s' "$output" | tail -n 1)"
+
+        if output="$(curl -k -fsSL --connect-timeout 10 --max-time "$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "Insecure HTTPS HTML fetch via curl failed: $(printf '%s' "$output" | tail -n 1)"
+
+    fi
+
+    if have_command wget; then
+        if output="$(wget -qO- --timeout="$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "HTTPS HTML fetch via wget failed: $(printf '%s' "$output" | tail -n 1)"
+
+        if output="$(wget --no-check-certificate -qO- --timeout="$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "Insecure HTTPS HTML fetch via wget failed: $(printf '%s' "$output" | tail -n 1)"
+
+    fi
+
+    return 1
+}
+
+fetch_time_ir_headers() {
+    local output=""
+
+    if have_command curl; then
+        if output="$(curl -sS -D - -o /dev/null --connect-timeout 10 --max-time "$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "HTTPS header fetch via curl failed: $(printf '%s' "$output" | tail -n 1)"
+
+        if output="$(curl -k -sS -D - -o /dev/null --connect-timeout 10 --max-time "$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "Insecure HTTPS header fetch via curl failed: $(printf '%s' "$output" | tail -n 1)"
+
+        if output="$(curl -sS -D - -o /dev/null --connect-timeout 10 --max-time "$FETCH_TIMEOUT" "$TIMEIR_HTTP_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "Plain HTTP header fetch via curl failed: $(printf '%s' "$output" | tail -n 1)"
+    fi
+
+    if have_command wget; then
+        if output="$(wget -S --spider -T "$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "HTTPS header fetch via wget failed: $(printf '%s' "$output" | tail -n 1)"
+
+        if output="$(wget --no-check-certificate -S --spider -T "$FETCH_TIMEOUT" "$TIMEIR_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "Insecure HTTPS header fetch via wget failed: $(printf '%s' "$output" | tail -n 1)"
+
+        if output="$(wget -S --spider -T "$FETCH_TIMEOUT" "$TIMEIR_HTTP_URL" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        record_timeir_error "Plain HTTP header fetch via wget failed: $(printf '%s' "$output" | tail -n 1)"
+    fi
+
+    return 1
+}
+
+parse_time_ir_header_epoch() {
+    python3 -c "$(cat <<'PY'
+import email.utils
+import sys
+
+headers = sys.stdin.read()
+for line in headers.splitlines():
+    if line.lower().startswith("date:"):
+        value = line.split(":", 1)[1].strip()
+        dt = email.utils.parsedate_to_datetime(value)
+        if dt is None:
+            raise SystemExit(1)
+        print(int(dt.timestamp()))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)"
+}
+
+parse_time_ir_epoch() {
+    python3 -c "$(cat <<'PY'
+import datetime as dt
+import re
+import sys
+from zoneinfo import ZoneInfo
+
+html = sys.stdin.read()
+
+date_match = re.search(r'تاریخ میلادی</p>\s*<p[^>]*>\s*(\d{4}-\d{2}-\d{2})\s*</p>', html)
+if not date_match:
+    date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', html)
+
+time_match = re.search(
+    r'ClockDigital_root__digital[^>]*>\s*<div>\s*([0-9]{1,2}\s*:\s*[0-9]{2}\s*:\s*[0-9]{2})\s*</div>\s*<div[^>]*>\s*(AM|PM)\s*</div>',
+    html,
+    re.IGNORECASE,
+)
+if not time_match:
+    time_match = re.search(r'\b([0-9]{1,2}\s*:\s*[0-9]{2}\s*:\s*[0-9]{2})\b', html)
+
+if not date_match or not time_match:
+    raise SystemExit(1)
+
+date_text = date_match.group(1)
+time_text = re.sub(r'\s+', '', time_match.group(1))
+ampm = time_match.group(2).upper() if time_match.lastindex and time_match.lastindex >= 2 else None
+
+year, month, day = map(int, date_text.split('-'))
+hour, minute, second = map(int, time_text.split(':'))
+
+if ampm == 'AM' and hour == 12:
+    hour = 0
+elif ampm == 'PM' and hour != 12:
+    hour += 12
+
+epoch = int(dt.datetime(year, month, day, hour, minute, second, tzinfo=ZoneInfo('Asia/Tehran')).timestamp())
+print(epoch)
+PY
+)"
+}
+
+restore_from_time_ir() {
+    local headers=""
+    local html=""
+    local epoch=""
+    TIMEIR_LAST_ERROR=""
+
+    if ! have_command python3; then
+        echo "Skipping time.ir fallback: python3 is required."
+        return 1
+    fi
+
+    if headers="$(fetch_time_ir_headers)"; then
+        if epoch="$(printf '%s' "$headers" | parse_time_ir_header_epoch)"; then
+            if [[ "$epoch" =~ ^[0-9]+$ ]] && set_system_time_from_epoch "$epoch"; then
+                echo "Restored system time from the HTTP Date header at $TIMEIR_URL."
+                save_trusted_epoch "$epoch"
+                return 0
+            fi
+
+            echo "Fetched time from $TIMEIR_URL, but setting system time needs root access."
+            return 2
+        fi
+    fi
+
+    if ! html="$(fetch_time_ir_html)"; then
+        echo "Could not fetch $TIMEIR_URL."
+        [[ -n "$TIMEIR_LAST_ERROR" ]] && echo "Last website fetch error: $TIMEIR_LAST_ERROR"
+        echo "If the system clock is far off, HTTPS certificate checks may fail. The script already retries with insecure HTTPS and plain HTTP headers."
+        return 1
+    fi
+
+    if ! epoch="$(printf '%s' "$html" | parse_time_ir_epoch)"; then
+        echo "Could not parse date/time from $TIMEIR_URL."
+        [[ -n "$TIMEIR_LAST_ERROR" ]] && echo "Last website fetch error: $TIMEIR_LAST_ERROR"
+        return 1
+    fi
+
+    if ! [[ "$epoch" =~ ^[0-9]+$ ]]; then
+        echo "Parsed invalid epoch from $TIMEIR_URL."
+        return 1
+    fi
+
+    if set_system_time_from_epoch "$epoch"; then
+        echo "Restored system time from $TIMEIR_URL."
+        save_trusted_epoch "$epoch"
+        return 0
+    fi
+
+    echo "Parsed time from $TIMEIR_URL, but setting system time needs root access."
+    return 2
+}
+
+update_hwclock() {
+    local hwclock_cmd=""
+
+    if have_command hwclock; then
+        hwclock_cmd="hwclock"
+    elif [[ -x /usr/sbin/hwclock ]]; then
+        hwclock_cmd="/usr/sbin/hwclock"
+    elif [[ -x /sbin/hwclock ]]; then
+        hwclock_cmd="/sbin/hwclock"
+    else
+        echo "Skipping hardware clock update: hwclock was not found."
+        return 0
+    fi
+
+    if run_as_root "$hwclock_cmd" --systohc; then
+        echo "Hardware clock updated from system time."
+        return 0
+    fi
+
+    echo "Skipping hardware clock update: root access is required."
+    return 1
+}
+
+attempt_time_repair() {
+    local timeir_status=1
+
+    echo "Checking time synchronization..."
+    show_status
+    echo
+
+    if (( ENABLE_NTP )); then
+        enable_ntp || true
+    fi
+
+    if wait_for_sync; then
+        echo "Time synchronization succeeded."
+        show_status
+        echo
+        save_trusted_time
+
+        if (( UPDATE_HWCLOCK )); then
+            echo
+            update_hwclock || true
+        fi
+
+        return 0
+    fi
+
+    echo "Time synchronization did not complete within ${WAIT_SECONDS}s."
+
+    if (( TIMEIR_FALLBACK )); then
+        echo "Trying website fallback from $TIMEIR_URL ..."
+
+        if restore_from_time_ir; then
+            timeir_status=0
+        else
+            timeir_status=$?
+        fi
+
+        if (( timeir_status == 0 )); then
+            show_status
+
+            if (( UPDATE_HWCLOCK )); then
+                echo
+                update_hwclock || true
+            fi
+
+            return 0
+        elif (( timeir_status == 2 )); then
+            echo "Re-run with root privileges to apply the fetched time:"
+            echo "  sudo time-sync"
+            return 2
+        fi
+    fi
+
+    if (( OFFLINE_FALLBACK )); then
+        echo "Trying offline fallback from the last trusted local timestamp..."
+
+        if restore_from_saved_time; then
+            show_status
+
+            if (( UPDATE_HWCLOCK )); then
+                echo
+                update_hwclock || true
+            fi
+
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --status)
+            STATUS_ONLY=1
+            shift
+            ;;
+        --wait)
+            [[ $# -ge 2 ]] || die "--wait requires a value."
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--wait must be an integer."
+            WAIT_SECONDS="$2"
+            shift 2
+            ;;
+        --retries)
+            [[ $# -ge 2 ]] || die "--retries requires a value."
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--retries must be an integer."
+            RETRY_COUNT="$2"
+            shift 2
+            ;;
+        --retry-delay)
+            [[ $# -ge 2 ]] || die "--retry-delay requires a value."
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--retry-delay must be an integer."
+            RETRY_DELAY_SECONDS="$2"
+            shift 2
+            ;;
+        --save-now)
+            SAVE_NOW=1
+            shift
+            ;;
+        --no-enable-ntp)
+            ENABLE_NTP=0
+            shift
+            ;;
+        --no-hwclock)
+            UPDATE_HWCLOCK=0
+            shift
+            ;;
+        --no-timeir)
+            TIMEIR_FALLBACK=0
+            shift
+            ;;
+        --no-offline-fallback)
+            OFFLINE_FALLBACK=0
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+have_command timedatectl || die "timedatectl is required."
+ensure_root_for_repair "$@"
+
+if (( STATUS_ONLY )); then
+    show_status
+    exit 0
+fi
+
+if (( SAVE_NOW )); then
+    save_trusted_time
+
+    if (( UPDATE_HWCLOCK )); then
+        update_hwclock || true
+    fi
+
+    exit 0
+fi
+
+total_attempts=$((RETRY_COUNT + 1))
+attempt_number=1
+
+while (( attempt_number <= total_attempts )); do
+    echo "Time sync attempt ${attempt_number}/${total_attempts}"
+    echo
+
+    if attempt_time_repair; then
+        exit 0
+    else
+        attempt_status=$?
+    fi
+
+    if (( attempt_status == 2 )); then
+        exit 1
+    fi
+
+    if (( attempt_number < total_attempts )); then
+        echo
+        echo "Waiting ${RETRY_DELAY_SECONDS}s before retrying..."
+        sleep "$RETRY_DELAY_SECONDS"
+        echo
+    fi
+
+    ((attempt_number += 1))
+done
+
+echo "Check internet connectivity and inspect:"
+echo "  timedatectl status"
+echo "If only limited web access is available, verify that this is reachable:"
+echo "  $TIMEIR_URL"
+echo "If the current clock is trustworthy right now, save it for future offline use:"
+echo "  time-sync --save-now"
+exit 1

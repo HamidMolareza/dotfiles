@@ -1,11 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # Define color codes
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
+RED='\033[1;31m'
 NC='\033[0m' # No Color
+
+NETWORK_MODE='current'
+RESET_UBUNTU_SOURCES=false
+RESET_ONLY=false
+RESET_SNAP_PROXY=false
+FAILED_STEPS=()
 
 # Helper to print steps with color
 function step() {
@@ -22,31 +29,263 @@ function info() {
     echo -e "${GREEN}ℹ️ $1${NC}"
 }
 
-step "Updating APT package lists..."
-sudo apt update
+function warn() {
+    echo -e "${RED}❌ $1${NC}" >&2
+}
 
-step "Upgrading installed APT packages..."
-sudo apt upgrade -y
+function run_step() {
+    local description="$1"
+    shift
 
-step "Performing APT distribution upgrade..."
-sudo apt dist-upgrade -y
+    step "$description"
 
-step "Cleaning up unnecessary APT packages..."
-sudo apt autoremove -y
-sudo apt autoclean -y
+    local status
+    if "$@"; then
+        return 0
+    else
+        status=$?
+        FAILED_STEPS+=("$description (exit $status)")
+        warn "$description failed with exit code $status. Continuing..."
+    fi
 
-step "Refreshing Snap packages..."
-sudo snap refresh
+    return 0
+}
+
+function finish() {
+    if [[ ${#FAILED_STEPS[@]} -eq 0 ]]; then
+        success "System update complete!"
+        exit 0
+    fi
+
+    warn "System update finished with failed steps:"
+    local failed_step
+    for failed_step in "${FAILED_STEPS[@]}"; do
+        echo "  - $failed_step" >&2
+    done
+
+    exit 1
+}
+
+function usage() {
+    cat <<'EOF'
+Usage: update [options]
+
+Update Ubuntu packages, snaps, and flatpaks.
+
+Options:
+  --reset-ubuntu-sources  Reset Ubuntu base APT sources to Canonical defaults
+                          before updating. Existing edited files are backed up.
+  --reset-snap-proxy      Clear persisted snapd system proxy settings.
+                          Do not use this if you want to keep snapd's proxy.
+  --reset-only            Reset requested settings and exit without updating.
+  --direct                Ignore proxy environment variables for this run.
+  --proxy                 Use the current shell proxy environment. This is the
+                          default and does not write proxy configuration.
+  -h, --help              Show this help text.
+EOF
+}
+
+function run_direct() {
+    env \
+        -u ALL_PROXY \
+        -u all_proxy \
+        -u HTTP_PROXY \
+        -u http_proxy \
+        -u HTTPS_PROXY \
+        -u https_proxy \
+        -u FTP_PROXY \
+        -u ftp_proxy \
+        -u NO_PROXY \
+        -u no_proxy \
+        "$@"
+}
+
+function run_current_env() {
+    if [[ "${1:-}" != sudo ]]; then
+        "$@"
+        return
+    fi
+
+    shift
+
+    local env_args=()
+    local name
+
+    for name in \
+        ALL_PROXY \
+        all_proxy \
+        HTTP_PROXY \
+        http_proxy \
+        HTTPS_PROXY \
+        https_proxy \
+        FTP_PROXY \
+        ftp_proxy \
+        NO_PROXY \
+        no_proxy
+    do
+        if [[ -v "$name" ]]; then
+            env_args+=("$name=${!name}")
+        fi
+    done
+
+    if [[ ${#env_args[@]} -gt 0 ]]; then
+        sudo env "${env_args[@]}" "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+function run_cmd() {
+    case "$NETWORK_MODE" in
+        direct)
+            run_direct "$@"
+            ;;
+        current)
+            run_current_env "$@"
+            ;;
+        *)
+            echo "Unknown network mode: $NETWORK_MODE" >&2
+            exit 1
+            ;;
+    esac
+}
+
+function detect_ubuntu_codename() {
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+        return
+    fi
+
+    lsb_release -cs
+}
+
+function reset_ubuntu_sources() {
+    local codename
+    codename="$(detect_ubuntu_codename)" || return $?
+
+    if [[ -z "$codename" ]]; then
+        echo "Could not detect Ubuntu codename." >&2
+        return 1
+    fi
+
+    local backup_dir
+    backup_dir="/etc/apt/backup-update-$(date +%Y%m%d-%H%M%S)"
+
+    info "Backing up current Ubuntu APT source files to $backup_dir..."
+    sudo install -d -m 0755 "$backup_dir" || return $?
+
+    if [[ -f /etc/apt/sources.list ]]; then
+        sudo cp -a /etc/apt/sources.list "$backup_dir/" || return $?
+    fi
+
+    if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+        sudo cp -a /etc/apt/sources.list.d/ubuntu.sources "$backup_dir/" || return $?
+    fi
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)" || return $?
+    trap 'rm -rf "$tmp_dir"' RETURN
+
+    cat >"$tmp_dir/sources.list" <<'EOF'
+# Ubuntu sources have moved to /etc/apt/sources.list.d/ubuntu.sources
+EOF
+    [[ -s "$tmp_dir/sources.list" ]] || return $?
+
+    cat >"$tmp_dir/ubuntu.sources" <<EOF
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: $codename $codename-updates $codename-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu/
+Suites: $codename-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+    [[ -s "$tmp_dir/ubuntu.sources" ]] || return $?
+
+    info "Writing official Ubuntu APT sources for $codename..."
+    sudo install -m 0644 "$tmp_dir/sources.list" /etc/apt/sources.list || return $?
+    sudo install -m 0644 "$tmp_dir/ubuntu.sources" /etc/apt/sources.list.d/ubuntu.sources || return $?
+
+    success "Ubuntu APT sources reset to archive.ubuntu.com and security.ubuntu.com."
+}
+
+function reset_snap_proxy() {
+    info "Clearing snapd system proxy settings..."
+    sudo snap unset system proxy.http proxy.https proxy.ftp || return $?
+    success "Snap proxy settings cleared."
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reset-ubuntu-sources)
+            RESET_UBUNTU_SOURCES=true
+            shift
+            ;;
+        --reset-snap-proxy)
+            RESET_SNAP_PROXY=true
+            shift
+            ;;
+        --reset-only)
+            RESET_ONLY=true
+            shift
+            ;;
+        --direct)
+            NETWORK_MODE='direct'
+            shift
+            ;;
+        --proxy)
+            NETWORK_MODE='current'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$RESET_UBUNTU_SOURCES" == true ]]; then
+    run_step "Resetting Ubuntu APT sources" reset_ubuntu_sources
+fi
+
+if [[ "$RESET_SNAP_PROXY" == true ]]; then
+    run_step "Resetting snapd proxy settings" reset_snap_proxy
+fi
+
+if [[ "$RESET_ONLY" == true ]]; then
+    finish
+fi
+
+run_step "Updating APT package lists" run_cmd sudo apt update
+
+run_step "Upgrading installed APT packages" run_cmd sudo apt upgrade -y
+
+run_step "Performing APT distribution upgrade" run_cmd sudo apt dist-upgrade -y
+
+run_step "Removing unnecessary APT packages" run_cmd sudo apt autoremove -y
+run_step "Cleaning APT package cache" run_cmd sudo apt autoclean -y
+
+run_step "Refreshing Snap packages" run_cmd sudo snap refresh
 
 # Update Flatpak if installed
 if command -v flatpak &>/dev/null; then
-    step "Updating Flatpak packages..."
-    flatpak update -y
+    run_step "Updating Flatpak packages" run_cmd flatpak update -y
 
-    step "Removing unused Flatpak runtimes..."
-    flatpak uninstall --unused -y
+    run_step "Removing unused Flatpak runtimes" run_cmd flatpak uninstall --unused -y
 else
     info "Flatpak is not installed. Skipping Flatpak updates."
 fi
 
-success "System update complete!"
+finish

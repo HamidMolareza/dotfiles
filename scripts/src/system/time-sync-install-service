@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SERVICE_NAME="time-sync.service"
+SERVICE_DIR="/etc/systemd/system"
+WAIT_SECONDS=60
+RETRY_COUNT=5
+RETRY_DELAY_SECONDS=15
+INSTALL_ACTION="install"
+
+usage() {
+    cat <<'EOF'
+Usage: time-sync-install-service [options]
+
+Install a root systemd boot service for `time-sync`.
+
+This is the recommended startup mechanism for clock repair because desktop
+autostart cannot reliably provide interactive sudo at login.
+
+Options:
+  --wait SECONDS   Pass --wait to time-sync. Default: 60.
+  --retries COUNT  Retry the boot service and time-sync this many times after
+                   the first failed attempt. Default: 5.
+  --retry-delay SECONDS
+                   Seconds to wait between retries. Default: 15.
+  --uninstall      Remove the installed service.
+  -h, --help       Show this help text.
+
+Examples:
+  sudo time-sync-install-service
+  sudo time-sync-install-service --wait 90
+  sudo time-sync-install-service --retries 5 --retry-delay 20
+  sudo time-sync-install-service --uninstall
+EOF
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+have_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+resolve_time_sync_path() {
+    local script_dir
+    script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+
+    if [[ -x "$script_dir/time-sync" ]]; then
+        printf '%s\n' "$script_dir/time-sync"
+        return 0
+    fi
+
+    command -v time-sync
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --wait)
+            [[ $# -ge 2 ]] || die "--wait requires a value."
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--wait must be an integer."
+            WAIT_SECONDS="$2"
+            shift 2
+            ;;
+        --retries)
+            [[ $# -ge 2 ]] || die "--retries requires a value."
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--retries must be an integer."
+            RETRY_COUNT="$2"
+            shift 2
+            ;;
+        --retry-delay)
+            [[ $# -ge 2 ]] || die "--retry-delay requires a value."
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--retry-delay must be an integer."
+            RETRY_DELAY_SECONDS="$2"
+            shift 2
+            ;;
+        --uninstall)
+            INSTALL_ACTION="uninstall"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+[[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Please run as root: sudo $(basename "$0")"
+have_command systemctl || die "systemctl is required."
+
+SERVICE_PATH="$SERVICE_DIR/$SERVICE_NAME"
+
+if [[ "$INSTALL_ACTION" == "uninstall" ]]; then
+    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$SERVICE_PATH"
+    systemctl daemon-reload
+    echo "Removed $SERVICE_PATH"
+    exit 0
+fi
+
+TIME_SYNC_PATH="$(resolve_time_sync_path)" || die "Could not resolve time-sync path."
+INSTALL_USER="${SUDO_USER:-${USER:-root}}"
+INSTALL_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
+START_LIMIT_BURST=$((RETRY_COUNT + 1))
+START_LIMIT_INTERVAL_SECONDS=$(((WAIT_SECONDS + RETRY_DELAY_SECONDS + 90) * (RETRY_COUNT + 1)))
+
+if [[ -z "$INSTALL_HOME" ]]; then
+    die "Could not resolve home directory for user: $INSTALL_USER"
+fi
+
+cat >"$SERVICE_PATH" <<EOF
+[Unit]
+Description=Repair system clock at boot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=$START_LIMIT_INTERVAL_SECONDS
+StartLimitBurst=$START_LIMIT_BURST
+
+[Service]
+Type=oneshot
+Environment=TIME_SYNC_ORIG_HOME=$INSTALL_HOME
+ExecStart=$TIME_SYNC_PATH --wait $WAIT_SECONDS --retries $RETRY_COUNT --retry-delay $RETRY_DELAY_SECONDS
+Restart=on-failure
+RestartSec=$RETRY_DELAY_SECONDS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME" >/dev/null
+
+echo "Installed $SERVICE_PATH"
+echo "Enabled $SERVICE_NAME"
+echo "Test it now with:"
+echo "  sudo systemctl start $SERVICE_NAME"
+echo "Inspect logs with:"
+echo "  journalctl -u $SERVICE_NAME -b"
