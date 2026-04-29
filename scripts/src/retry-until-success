@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+usage() {
+    echo "Usage: $0 <delay_between_retries_in_seconds> <command> [args...]"
+    exit 1
+}
+
+if [ $# -lt 2 ]; then
+    usage
+fi
+
+delay=$1
+shift
+cmd="$@"
+
+while true; do
+    echo "Running command: $cmd"
+    $cmd
+    exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        echo "Command succeeded."
+        break
+    else
+        echo "Command failed with exit code $exit_code. Retrying in $delay seconds..."
+        sleep "$delay"
+    fi
+done

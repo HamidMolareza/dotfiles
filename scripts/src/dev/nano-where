@@ -1,0 +1,128 @@
+#!/bin/bash
+
+set -o pipefail
+
+print_usage() {
+    cat <<'EOF'
+Usage: nano-where [options] <command-or-path> [more...]
+
+Open the resolved path(s) in nano.
+
+Options:
+  -p, --print   Print resolved path(s) without opening nano
+  -h, --help    Show this help
+EOF
+}
+
+resolve_path() {
+    local input="$1"
+    local path=""
+
+    if [[ "$input" == */* ]]; then
+        if [[ -e "$input" ]]; then
+            echo "$input"
+            return 0
+        fi
+        echo "Error: path not found: $input" >&2
+        return 1
+    fi
+
+    path=$(type -P -- "$input" 2>/dev/null || true)
+    if [[ -n "$path" && -e "$path" ]]; then
+        echo "$path"
+        return 0
+    fi
+
+    local kind=""
+    kind=$(type -t -- "$input" 2>/dev/null || true)
+    if [[ -n "$kind" ]]; then
+        echo "Error: '$input' is a shell $kind, not an external file." >&2
+    else
+        echo "Error: '$input' not found in PATH." >&2
+    fi
+    return 1
+}
+
+canonicalize_path() {
+    local input="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -- "$input"
+        return 0
+    fi
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f -- "$input" 2>/dev/null || echo "$input"
+        return 0
+    fi
+    echo "$input"
+}
+
+print_only=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--print)
+            print_only=1
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            print_usage >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    print_usage >&2
+    exit 1
+fi
+
+if [[ $print_only -eq 0 ]] && ! command -v nano >/dev/null 2>&1; then
+    echo "Error: 'nano' command not found. Use --print to get paths." >&2
+    exit 1
+fi
+
+exit_code=0
+declare -a paths=()
+
+for input in "$@"; do
+    resolved=$(resolve_path "$input") || {
+        exit_code=1
+        continue
+    }
+    resolved=$(canonicalize_path "$resolved")
+
+    if [[ $print_only -eq 1 ]]; then
+        echo "$resolved"
+        continue
+    fi
+
+    if [[ -d "$resolved" ]]; then
+        echo "Error: '$input' resolved to a directory: $resolved" >&2
+        exit_code=1
+        continue
+    fi
+
+    paths+=("$resolved")
+done
+
+if [[ $print_only -eq 1 ]]; then
+    exit "$exit_code"
+fi
+
+if [[ ${#paths[@]} -gt 0 ]]; then
+    nano -- "${paths[@]}" || exit_code=1
+fi
+
+exit "$exit_code"

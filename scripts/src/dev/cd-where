@@ -1,0 +1,121 @@
+#!/bin/bash
+
+set -o pipefail
+
+print_usage() {
+    cat <<'EOF'
+Usage: cd-where [options] <command-or-path>
+
+Resolve the directory for a command or path.
+
+If loaded through the shell function from `exports`, cd-where changes the
+current shell directory. When run as a standalone script, it prints the
+resolved directory.
+
+Options:
+  -p, --print   Print the resolved directory
+  -h, --help    Show this help
+EOF
+}
+
+resolve_path() {
+    local input="$1"
+    local path=""
+
+    if [[ "$input" == */* ]]; then
+        if [[ -e "$input" ]]; then
+            echo "$input"
+            return 0
+        fi
+        echo "Error: path not found: $input" >&2
+        return 1
+    fi
+
+    path=$(type -P -- "$input" 2>/dev/null || true)
+    if [[ -n "$path" && -e "$path" ]]; then
+        echo "$path"
+        return 0
+    fi
+
+    local kind=""
+    kind=$(type -t -- "$input" 2>/dev/null || true)
+    if [[ -n "$kind" ]]; then
+        echo "Error: '$input' is a shell $kind, not an external file." >&2
+    else
+        echo "Error: '$input' not found in PATH." >&2
+    fi
+    return 1
+}
+
+canonicalize_path() {
+    local input="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -- "$input"
+        return 0
+    fi
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f -- "$input" 2>/dev/null || echo "$input"
+        return 0
+    fi
+    echo "$input"
+}
+
+resolve_directory() {
+    local input="$1"
+    local resolved=""
+
+    resolved=$(resolve_path "$input") || return 1
+    resolved=$(canonicalize_path "$resolved")
+
+    if [[ -d "$resolved" ]]; then
+        echo "$resolved"
+    else
+        dirname -- "$resolved"
+    fi
+}
+
+print_only=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--print)
+            print_only=1
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            print_usage >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    print_usage >&2
+    exit 1
+fi
+
+target=$(resolve_directory "$1") || exit 1
+
+if [[ $print_only -eq 1 ]]; then
+    echo "$target"
+    exit 0
+fi
+
+if (return 0 2>/dev/null); then
+    builtin cd -- "$target"
+    return $?
+fi
+
+echo "$target"

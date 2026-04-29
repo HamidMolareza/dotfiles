@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: slugify <text>
+       echo <text> | slugify
+
+Convert text into a lowercase hyphen-separated slug.
+EOF
+}
+
+if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+    usage
+    exit 0
+fi
+
+if ! command -v iconv >/dev/null 2>&1; then
+    echo "Error: iconv is required but not installed." >&2
+    exit 1
+fi
+
+if [ "$#" -gt 0 ]; then
+    input="$*"
+elif [ ! -t 0 ]; then
+    input="$(cat)"
+else
+    usage >&2
+    exit 1
+fi
+
+slug="$(
+    printf '%s' "$input" |
+        iconv -t ASCII//TRANSLIT 2>/dev/null |
+        sed -E 's/[^[:alnum:]]+/-/g; s/^-+//; s/-+$//' |
+        tr '[:upper:]' '[:lower:]'
+)"
+
+printf '%s\n' "$slug"

@@ -47,3 +47,10 @@ add_to_path_if_missing "$SRC_DIR/web"
 add_to_path_if_missing "$SRC_DIR/npm"
 
 export PATH
+
+cd-where() {
+    local target=""
+
+    target=$(command cd-where --print "$@") || return $?
+    builtin cd -- "$target"
+}
