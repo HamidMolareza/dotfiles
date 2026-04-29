@@ -8,5 +8,6 @@
 # Ignore IDE files
 .vscode
 .idea
+.codex
 
 *.pyc
