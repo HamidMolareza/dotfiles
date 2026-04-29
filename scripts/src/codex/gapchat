@@ -2,26 +2,27 @@
 
 set -Eeuo pipefail
 
+ADAPTER_BASE_URL="${GAPGPT_ADAPTER_BASE_URL:-http://127.0.0.1:8085}"
+MODELS_ENDPOINT="${GAPGPT_ADAPTER_MODELS_URL:-${ADAPTER_BASE_URL%/}/v1/models}"
+
 show_help() {
   cat <<'EOF'
-Usage: gapcodex [OPTIONS] [PROMPT]
+Usage: gapchat [OPTIONS] [PROMPT]
 
 Special behavior:
   Without --model, the model picker opens by default
-  --model, -m    Open an interactive picker for a supported model
-
-Supported models:
-  gpt-5.4
-  claude-sonnet-4-6
-  claude-opus-4-6
-  qwen3-coder
-  gemini-2.5-pro
+  --model, -m    Fetch models from the GapGPT adapter and open an interactive picker
 
 Examples:
-  gapcodex
-  gapcodex --model
-  gapcodex -m
-  gapcodex --model gpt-5.4
+  gapchat
+  gapchat --model
+  gapchat -m
+  gapchat --model claude-sonnet-4-6
+
+Environment:
+  GAPGPT_ADAPTER_API_KEY    Required for fetching models when no explicit model is passed
+  GAPGPT_ADAPTER_BASE_URL   Optional, defaults to http://127.0.0.1:8085
+  GAPGPT_ADAPTER_MODELS_URL Optional full override for the models endpoint
 EOF
 }
 
@@ -31,22 +32,83 @@ pick_model() {
     exit 1
   fi
 
-  python3 /dev/fd/3 3<<'PY'
+  python3 /dev/fd/3 "$MODELS_ENDPOINT" "${GAPGPT_ADAPTER_API_KEY:-}" 3<<'PY'
+import json
+import os
+import socket
 import sys
+import urllib.error
+import urllib.request
 from typing import List
-
-MODELS = [
-    "gpt-5.4",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-    "qwen3-coder",
-    "gemini-2.5-pro",
-]
 
 
 def fail(message: str, exit_code: int = 1) -> None:
     print(message, file=sys.stderr)
     raise SystemExit(exit_code)
+
+
+def fetch_models(endpoint: str, api_key: str) -> List[str]:
+    if not api_key:
+        fail(
+            "GAPGPT_ADAPTER_API_KEY is not set. Export it before using gapchat without an explicit --model value."
+        )
+
+    timeout = float(os.environ.get("GAPGPT_ADAPTER_TIMEOUT", "5"))
+    request = urllib.request.Request(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        detail = f" Response: {body[:200]}" if body else ""
+        fail(
+            f"Failed to fetch models from {endpoint}: HTTP {exc.code} {exc.reason}.{detail}"
+        )
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, ConnectionRefusedError):
+            fail(
+                f"Could not reach the GapGPT adapter at {endpoint}. Is the local adapter running?"
+            )
+        if isinstance(reason, socket.timeout) or "timed out" in str(reason).lower():
+            fail(f"Timed out while fetching models from {endpoint}.")
+        fail(f"Failed to fetch models from {endpoint}: {reason}")
+    except TimeoutError:
+        fail(f"Timed out while fetching models from {endpoint}.")
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        fail(f"Adapter returned invalid JSON from {endpoint}: {exc}")
+
+    entries = data.get("data")
+    if not isinstance(entries, list):
+        fail(f"Adapter response from {endpoint} is missing a valid data list.")
+
+    models: List[str] = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if isinstance(model_id, str):
+            model_id = model_id.strip()
+            if model_id and model_id not in seen:
+                models.append(model_id)
+                seen.add(model_id)
+
+    if not models:
+        fail(f"No model ids were returned from {endpoint}.")
+
+    return models
 
 
 def fallback_choice(models: List[str], tty_input, tty_output) -> str:
@@ -121,19 +183,23 @@ def prompt_toolkit_choice(models: List[str], tty_input, tty_output) -> str:
 
 
 def main() -> None:
+    endpoint = sys.argv[1]
+    api_key = sys.argv[2]
+    models = fetch_models(endpoint, api_key)
+
     try:
         tty_input = open("/dev/tty", "r", encoding="utf-8")
         tty_output = open("/dev/tty", "w", encoding="utf-8")
     except OSError:
         fail(
-            "Interactive model picker requires a terminal. Run gapcodex from an interactive shell or pass an explicit --model value."
+            "Interactive model picker requires a terminal. Run gapchat from an interactive shell or pass an explicit --model value."
         )
 
     try:
         try:
-            selected_model = prompt_toolkit_choice(MODELS, tty_input, tty_output)
+            selected_model = prompt_toolkit_choice(models, tty_input, tty_output)
         except ImportError:
-            selected_model = fallback_choice(MODELS, tty_input, tty_output)
+            selected_model = fallback_choice(models, tty_input, tty_output)
     finally:
         tty_input.close()
         tty_output.close()
@@ -171,7 +237,7 @@ while (($# > 0)); do
       show_help
       echo
       exec env \
-        codex --profile gapcode "$@"
+        codex --profile gapchat "$@"
       ;;
     *)
       args+=("$1")
@@ -190,4 +256,4 @@ if [[ "$pick_requested" == true ]]; then
 fi
 
 exec env \
-  codex --profile gapcode "${args[@]}"
+  codex --profile gapchat "${args[@]}"

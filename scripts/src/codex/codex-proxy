@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 
-export https_proxy="http://localhost:10808"
-export http_proxy="http://localhost:10808"
-
-export CODEX_HOME="$HOME/.codex"
-exec codex "$@"
+exec env \
+  ALL_PROXY="socks5h://127.0.0.1:8900" \
+  all_proxy="socks5h://127.0.0.1:8900" \
+  http_proxy="http://127.0.0.1:8900" \
+  https_proxy="http://127.0.0.1:8900" \
+  HTTP_PROXY="http://127.0.0.1:8900" \
+  HTTPS_PROXY="http://127.0.0.1:8900" \
+  no_proxy="localhost,127.0.0.1,::1" \
+  NO_PROXY="localhost,127.0.0.1,::1" \
+  codex "$@"

@@ -9,8 +9,10 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
@@ -20,6 +22,7 @@ from pathlib import Path
 import tomllib
 from typing import Any
 from typing import Sequence
+from typing import TextIO
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -32,6 +35,8 @@ CACHE_FILE = CACHE_DIR / "quota-cache.json"
 CACHE_VERSION = 1
 CACHE_TTL_SECONDS = 300
 HTTP_TIMEOUT_SECONDS = 8.0
+HTTP_RETRY_ATTEMPTS = 3
+HTTP_RETRY_BASE_DELAY_SECONDS = 0.4
 MAX_CONCURRENT_PROBES = 4
 STATUS_WIDTH = 10
 NAME_WIDTH = 12
@@ -41,6 +46,10 @@ SECONDARY_LEFT_WIDTH = 8
 SECONDARY_RESET_WIDTH = 11
 EMAIL_WIDTH = 28
 EMPTY_CELL = ""
+ANSI_RESET = "\x1b[0m"
+ANSI_RED = "\x1b[31m"
+ANSI_YELLOW = "\x1b[33m"
+ANSI_GREEN = "\x1b[32m"
 QUOTA_UNKNOWN = "unavailable"
 TOKEN_EXPIRED = "token expired"
 API_KEY_AUTH = "api-key auth"
@@ -55,6 +64,29 @@ BAD_RESPONSE = "bad response"
 PROBE_ERROR = "probe error"
 MENU_TITLE = "Codex auth switcher"
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
+DEFAULT_USAGE_PROXY_URL: str | None = None
+DEFAULT_USAGE_PROXY_DISPLAY = "current environment"
+DEBUG_ENV_VAR = "CODEX_AUTH_DEBUG"
+DEBUG_LOG_ENV_VAR = "CODEX_AUTH_DEBUG_LOG"
+PROXY_ENV_VAR = "CODEX_AUTH_PROXY"
+DEBUG_BODY_PREVIEW_LIMIT = 240
+DEBUG_STREAM: TextIO | None = None
+DEBUG_STREAM_OWNED = False
+
+
+@dataclass(frozen=True)
+class CliOptions:
+    directory: Path
+    debug: bool = False
+    debug_log_path: Path | None = None
+    proxy_url: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageProxyConfig:
+    proxy_url: str | None = None
+    use_environment: bool = False
+    display: str = "direct"
 
 
 @dataclass(frozen=True)
@@ -184,6 +216,46 @@ class AuthFile:
             f"{truncate_text(self.email, EMAIL_WIDTH):<{EMAIL_WIDTH}}"
         )
 
+    def fallback_label(self) -> str:
+        status = "[active]" if self.is_active else f"[slot {self.suffix}]"
+        quota = self.quota
+        return "".join(
+            (
+                format_plain_cell(status, STATUS_WIDTH),
+                " ",
+                format_plain_cell(self.name, NAME_WIDTH),
+                " ",
+                format_ansi_percent_cell(quota.primary_left, quota.primary_left_percent, PRIMARY_LEFT_WIDTH),
+                " ",
+                format_plain_cell(quota.primary_reset, PRIMARY_RESET_WIDTH),
+                " ",
+                format_ansi_percent_cell(quota.secondary_left, quota.secondary_left_percent, SECONDARY_LEFT_WIDTH),
+                " ",
+                format_plain_cell(quota.secondary_reset, SECONDARY_RESET_WIDTH),
+                " ",
+                format_plain_cell(self.email, EMAIL_WIDTH),
+            )
+        )
+
+    def prompt_toolkit_label(self) -> list[tuple[str, str]]:
+        status = "[active]" if self.is_active else f"[slot {self.suffix}]"
+        quota = self.quota
+        fragments: list[tuple[str, str]] = []
+        fragments.extend(format_prompt_fragments(status, STATUS_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_fragments(self.name, NAME_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_percent_fragments(quota.primary_left, quota.primary_left_percent, PRIMARY_LEFT_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_fragments(quota.primary_reset, PRIMARY_RESET_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_percent_fragments(quota.secondary_left, quota.secondary_left_percent, SECONDARY_LEFT_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_fragments(quota.secondary_reset, SECONDARY_RESET_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_fragments(self.email, EMAIL_WIDTH))
+        return fragments
+
 
 class SwapError(RuntimeError):
     pass
@@ -210,6 +282,131 @@ def fail(message: str, exit_code: int = 1) -> None:
     raise SystemExit(exit_code)
 
 
+def env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on", "debug"}
+
+
+def configure_debug_logging(enabled: bool, log_path: Path | None) -> None:
+    global DEBUG_STREAM
+    global DEBUG_STREAM_OWNED
+
+    if DEBUG_STREAM_OWNED and DEBUG_STREAM is not None:
+        DEBUG_STREAM.close()
+
+    DEBUG_STREAM = None
+    DEBUG_STREAM_OWNED = False
+
+    if not enabled:
+        return
+
+    if log_path is None:
+        DEBUG_STREAM = sys.stderr
+        return
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    DEBUG_STREAM = log_path.open("a", encoding="utf-8")
+    DEBUG_STREAM_OWNED = True
+
+
+def close_debug_logging() -> None:
+    global DEBUG_STREAM
+    global DEBUG_STREAM_OWNED
+
+    if DEBUG_STREAM_OWNED and DEBUG_STREAM is not None:
+        DEBUG_STREAM.close()
+    DEBUG_STREAM = None
+    DEBUG_STREAM_OWNED = False
+
+
+def debug_enabled() -> bool:
+    return DEBUG_STREAM is not None
+
+
+def summarize_debug_value(value: object) -> str:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, BaseException):
+        return f"{type(value).__name__}({value})"
+    if isinstance(value, str):
+        text = value.replace("\n", "\\n")
+    else:
+        try:
+            text = json.dumps(value, sort_keys=True, default=str)
+        except TypeError:
+            text = repr(value)
+    if len(text) > DEBUG_BODY_PREVIEW_LIMIT:
+        return f"{text[:DEBUG_BODY_PREVIEW_LIMIT]}..."
+    return text
+
+
+def debug_log(message: str, **fields: object) -> None:
+    stream = DEBUG_STREAM
+    if stream is None:
+        return
+
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    suffix = ""
+    if fields:
+        parts = [f"{key}={summarize_debug_value(value)}" for key, value in sorted(fields.items())]
+        suffix = " | " + " ".join(parts)
+    print(f"[codex-auth debug] {timestamp} | {message}{suffix}", file=stream, flush=True)
+
+
+def debug_exception(message: str, error: BaseException, **fields: object) -> None:
+    debug_log(message, error=error, **fields)
+    if not debug_enabled():
+        return
+    for line in traceback.format_exception(type(error), error, error.__traceback__):
+        DEBUG_STREAM.write(line)
+    DEBUG_STREAM.flush()
+
+
+def error_body_preview(error: urllib_error.HTTPError) -> str:
+    try:
+        body = error.read()
+    except OSError:
+        return EMPTY_CELL
+    if not body:
+        return EMPTY_CELL
+    try:
+        return body.decode("utf-8", errors="replace")
+    except Exception:
+        return repr(body[:DEBUG_BODY_PREVIEW_LIMIT])
+
+
+def normalize_proxy_value(value: str | None) -> str | None:
+    if value is None:
+        return DEFAULT_USAGE_PROXY_URL
+
+    normalized = value.strip()
+    if not normalized:
+        return DEFAULT_USAGE_PROXY_URL
+
+    lowered = normalized.lower()
+    if lowered in {"direct", "none", "off", "disable", "disabled"}:
+        return None
+
+    if re.fullmatch(r"\d+", normalized):
+        return f"http://127.0.0.1:{normalized}"
+
+    if "://" not in normalized:
+        return f"http://{normalized}"
+
+    return normalized
+
+
+def usage_proxy_from_value(value: str) -> UsageProxyConfig:
+    normalized = normalize_proxy_value(value)
+    if normalized is None:
+        return UsageProxyConfig(display="direct")
+    return UsageProxyConfig(proxy_url=normalized, display=normalized)
+
+
+def default_usage_proxy_config() -> UsageProxyConfig:
+    return UsageProxyConfig(use_environment=True, display=DEFAULT_USAGE_PROXY_DISPLAY)
+
+
 def show_help() -> None:
     print(
         f"""Usage: codex-auth [OPTIONS]
@@ -222,7 +419,7 @@ Rules:
   - only one active file exists at a time
   - the menu shows cached or live remaining quota and reset countdowns for each auth file
   - the menu shows each auth file's user email from the local id_token or cache when available
-  - quota probes use a direct read-only HTTPS request with the current auth token
+  - quota probes use a read-only HTTPS request with the current auth token
   - quota probes never trigger token refresh or modify your real auth files
   - transient probe failures keep stale cached quota when available and mark it with *
   - live probe failures can surface as statuses such as token expired, timeout, bad auth, or network error
@@ -230,13 +427,21 @@ Rules:
 
 Options:
   -d, --dir PATH   Override the auth directory (default: {AUTH_DIR})
+  --proxy VALUE    Proxy for usage probes. Accepts URL, host:port, port, or 'direct'.
+                   Default: {DEFAULT_USAGE_PROXY_DISPLAY}
+  --debug          Enable probe debug logging
+  --debug-log PATH Write debug logs to PATH instead of stderr
   -h, --help       Show this help text
 """
     )
 
 
-def parse_args(argv: Sequence[str]) -> Path:
+def parse_args(argv: Sequence[str]) -> CliOptions:
     directory = AUTH_DIR
+    debug = env_flag_enabled(DEBUG_ENV_VAR)
+    debug_log_value = os.environ.get(DEBUG_LOG_ENV_VAR, "").strip()
+    debug_log_path = Path(debug_log_value).expanduser() if debug_log_value else None
+    proxy_url = os.environ.get(PROXY_ENV_VAR, "").strip() or None
     index = 0
 
     while index < len(argv):
@@ -249,11 +454,24 @@ def parse_args(argv: Sequence[str]) -> Path:
             if index >= len(argv):
                 fail("--dir requires a path value.")
             directory = Path(argv[index]).expanduser()
+        elif arg == "--debug":
+            debug = True
+        elif arg == "--debug-log":
+            index += 1
+            if index >= len(argv):
+                fail("--debug-log requires a path value.")
+            debug = True
+            debug_log_path = Path(argv[index]).expanduser()
+        elif arg == "--proxy":
+            index += 1
+            if index >= len(argv):
+                fail("--proxy requires a value.")
+            proxy_url = argv[index].strip()
         else:
             fail(f"Unknown argument: {arg}")
         index += 1
 
-    return directory
+    return CliOptions(directory=directory, debug=debug, debug_log_path=debug_log_path, proxy_url=proxy_url)
 
 
 def auth_sort_key(name: str) -> tuple[int, int]:
@@ -329,6 +547,48 @@ def truncate_text(value: str, width: int) -> str:
     if width <= 3:
         return value[:width]
     return f"{value[: width - 3]}..."
+
+
+def color_style_for_percent(percent: int | None) -> str:
+    if percent is None:
+        return ""
+    if percent <= 33:
+        return "red"
+    if percent <= 66:
+        return "yellow"
+    return "green"
+
+
+def ansi_code_for_style(style_name: str) -> str:
+    return {
+        "red": ANSI_RED,
+        "yellow": ANSI_YELLOW,
+        "green": ANSI_GREEN,
+    }.get(style_name, "")
+
+
+def format_plain_cell(value: str, width: int) -> str:
+    return f"{truncate_text(value, width):<{width}}"
+
+
+def format_ansi_percent_cell(value: str, percent: int | None, width: int) -> str:
+    text = truncate_text(value, width)
+    padded = f"{text:<{width}}"
+    color_name = color_style_for_percent(percent)
+    ansi_code = ansi_code_for_style(color_name)
+    if not ansi_code:
+        return padded
+    return f"{ansi_code}{padded}{ANSI_RESET}"
+
+
+def format_prompt_fragments(value: str, width: int, style: str = "") -> list[tuple[str, str]]:
+    return [(style, format_plain_cell(value, width))]
+
+
+def format_prompt_percent_fragments(value: str, percent: int | None, width: int) -> list[tuple[str, str]]:
+    color_name = color_style_for_percent(percent)
+    style = f"fg:{color_name}" if color_name else ""
+    return format_prompt_fragments(value, width, style=style)
 
 
 def menu_header() -> str:
@@ -507,15 +767,18 @@ def update_quota_cache_entry(
 def load_chatgpt_base_url(directory: Path) -> str:
     config_file = directory / "config.toml"
     if not config_file.exists():
+        debug_log("using default ChatGPT base URL", config_file=config_file, base_url=DEFAULT_CHATGPT_BASE_URL)
         return DEFAULT_CHATGPT_BASE_URL
 
     try:
         config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
+        debug_log("failed to read config.toml, using default base URL", config_file=config_file)
         return DEFAULT_CHATGPT_BASE_URL
 
     base_url = config.get("chatgpt_base_url")
     if not isinstance(base_url, str) or not base_url.strip():
+        debug_log("config.toml missing chatgpt_base_url, using default base URL", config_file=config_file)
         return DEFAULT_CHATGPT_BASE_URL
 
     normalized = base_url.rstrip("/")
@@ -525,7 +788,58 @@ def load_chatgpt_base_url(directory: Path) -> str:
     ) and "/backend-api" not in normalized:
         normalized = f"{normalized}/backend-api"
 
+    debug_log("loaded ChatGPT base URL", config_file=config_file, base_url=normalized)
     return normalized
+
+
+def load_usage_proxy_config(directory: Path, override: str | None) -> UsageProxyConfig:
+    if override is not None:
+        proxy_config = usage_proxy_from_value(override)
+        debug_log("using proxy override", proxy=proxy_config.display)
+        return proxy_config
+
+    config_file = directory / "config.toml"
+    if not config_file.exists():
+        debug_log(
+            "using default usage proxy",
+            config_file=config_file,
+            proxy=DEFAULT_USAGE_PROXY_DISPLAY,
+        )
+        return default_usage_proxy_config()
+
+    try:
+        config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        debug_log(
+            "failed to read config.toml, using default usage proxy",
+            config_file=config_file,
+            proxy=DEFAULT_USAGE_PROXY_DISPLAY,
+        )
+        return default_usage_proxy_config()
+
+    proxy_value = config.get("chatgpt_proxy")
+    if proxy_value is None:
+        proxy_value = config.get("chatgpt_proxy_url")
+
+    if proxy_value is None:
+        debug_log(
+            "config.toml missing chatgpt_proxy, using default usage proxy",
+            config_file=config_file,
+            proxy=DEFAULT_USAGE_PROXY_DISPLAY,
+        )
+        return default_usage_proxy_config()
+
+    if not isinstance(proxy_value, str):
+        debug_log(
+            "config.toml chatgpt_proxy was not a string, using default usage proxy",
+            config_file=config_file,
+            proxy=DEFAULT_USAGE_PROXY_DISPLAY,
+        )
+        return default_usage_proxy_config()
+
+    proxy_config = usage_proxy_from_value(proxy_value)
+    debug_log("loaded usage proxy from config", config_file=config_file, proxy=proxy_config.display)
+    return proxy_config
 
 
 def usage_endpoint_for_base_url(base_url: str) -> str:
@@ -628,6 +942,7 @@ def select_rate_limit_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             "credits": payload.get("credits"),
         }
 
+    debug_log("usage payload missing rate_limit object", payload_keys=sorted(payload.keys()))
     raise QuotaProbeError(BAD_RESPONSE, transient=True)
 
 
@@ -639,6 +954,13 @@ def format_quota_view(payload: dict[str, Any]) -> QuotaView:
     primary_reset_at = extract_window_reset_timestamp(snapshot.get("primary"))
     secondary_reset_at = extract_window_reset_timestamp(snapshot.get("secondary"))
     if primary_left or secondary_left:
+        debug_log(
+            "formatted quota windows",
+            primary_left=primary_left or EMPTY_CELL,
+            primary_reset_at=primary_reset_at,
+            secondary_left=secondary_left or EMPTY_CELL,
+            secondary_reset_at=secondary_reset_at,
+        )
         return QuotaView(
             primary_left=primary_left or EMPTY_CELL,
             primary_reset=format_reset_timestamp(primary_reset_at) if primary_left and primary_reset_at is not None else EMPTY_CELL,
@@ -655,12 +977,15 @@ def format_quota_view(payload: dict[str, Any]) -> QuotaView:
     credits = snapshot.get("credits")
     if isinstance(credits, dict):
         if credits.get("unlimited") is True:
+            debug_log("usage payload reported unlimited credits")
             return QuotaView.status("unlimited")
 
         balance = credits.get("balance")
         if isinstance(balance, str) and balance.strip() and balance.strip() not in {"0", "0.0"}:
+            debug_log("usage payload reported credits balance", balance=balance.strip())
             return QuotaView.status(f"credits {balance.strip()}")
 
+    debug_log("usage payload had no usable quota windows or credits", snapshot=snapshot)
     return QuotaView.status(QUOTA_UNKNOWN)
 
 
@@ -693,41 +1018,140 @@ def usage_request_headers(access_token: str, account_id: str | None) -> dict[str
     return headers
 
 
-def fetch_usage_payload(url: str, headers: dict[str, str]) -> dict[str, Any]:
-    request = urllib_request.Request(url, headers=headers)
-    try:
-        with urllib_request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8")
-    except urllib_error.HTTPError as error:
-        if error.code == 401:
-            raise QuotaProbeError(UNAUTHORIZED) from error
-        if error.code == 403:
-            raise QuotaProbeError(QUOTA_UNKNOWN, transient=True) from error
-        if error.code == 429:
-            raise QuotaProbeError(RATE_LIMITED, transient=True) from error
-        raise QuotaProbeError(f"http {error.code}", transient=error.code >= 500) from error
-    except urllib_error.URLError as error:
-        reason = error.reason
-        if isinstance(reason, TimeoutError | socket.timeout):
+def retry_delay_seconds(attempt_index: int) -> float:
+    return HTTP_RETRY_BASE_DELAY_SECONDS * (2**attempt_index)
+
+
+def should_retry_http_status(status_code: int) -> bool:
+    return status_code in {408, 425, 429, 502, 503, 504} or status_code >= 500
+
+
+def is_timeout_reason(reason: object) -> bool:
+    return isinstance(reason, TimeoutError | socket.timeout)
+
+
+def is_network_reason(reason: object) -> bool:
+    return isinstance(
+        reason,
+        (
+            ConnectionError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            ConnectionRefusedError,
+            socket.gaierror,
+            ssl.SSLError,
+            OSError,
+        ),
+    )
+
+
+def build_usage_opener(proxy_config: UsageProxyConfig):
+    if proxy_config.use_environment:
+        return urllib_request.build_opener(urllib_request.ProxyHandler())
+    proxies = {} if proxy_config.proxy_url is None else {"http": proxy_config.proxy_url, "https": proxy_config.proxy_url}
+    return urllib_request.build_opener(urllib_request.ProxyHandler(proxies))
+
+
+def fetch_usage_payload(url: str, headers: dict[str, str], proxy_config: UsageProxyConfig) -> dict[str, Any]:
+    last_error: Exception | None = None
+
+    for attempt_index in range(HTTP_RETRY_ATTEMPTS):
+        request = urllib_request.Request(url, headers=headers)
+        opener = build_usage_opener(proxy_config)
+        debug_log(
+            "usage request attempt",
+            attempt=attempt_index + 1,
+            max_attempts=HTTP_RETRY_ATTEMPTS,
+            proxy=proxy_config.display,
+            timeout_seconds=HTTP_TIMEOUT_SECONDS,
+            url=url,
+        )
+        try:
+            with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                body = response.read().decode("utf-8")
+                debug_log(
+                    "usage request succeeded",
+                    attempt=attempt_index + 1,
+                    payload_preview=body,
+                    status=getattr(response, "status", EMPTY_CELL),
+                )
+            payload = json.loads(body)
+            if isinstance(payload, dict):
+                debug_log("usage payload parsed", attempt=attempt_index + 1, payload_keys=sorted(payload.keys()))
+                return payload
+            debug_log("usage payload was not a JSON object", payload_type=type(payload).__name__)
+            raise QuotaProbeError(BAD_RESPONSE, transient=True)
+        except urllib_error.HTTPError as error:
+            last_error = error
+            debug_log(
+                "usage request HTTP error",
+                attempt=attempt_index + 1,
+                body_preview=error_body_preview(error),
+                retryable=should_retry_http_status(error.code),
+                status=error.code,
+                url=url,
+            )
+            if error.code == 401:
+                raise QuotaProbeError(UNAUTHORIZED) from error
+            if error.code == 403:
+                raise QuotaProbeError(QUOTA_UNKNOWN, transient=True) from error
+            if error.code == 429:
+                if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
+                    time.sleep(retry_delay_seconds(attempt_index))
+                    continue
+                raise QuotaProbeError(RATE_LIMITED, transient=True) from error
+            if should_retry_http_status(error.code) and attempt_index < HTTP_RETRY_ATTEMPTS - 1:
+                time.sleep(retry_delay_seconds(attempt_index))
+                continue
+            raise QuotaProbeError(f"http {error.code}", transient=should_retry_http_status(error.code)) from error
+        except urllib_error.URLError as error:
+            last_error = error
+            reason = error.reason
+            debug_log(
+                "usage request URL error",
+                attempt=attempt_index + 1,
+                reason=reason,
+                retryable=is_timeout_reason(reason) or is_network_reason(reason),
+                timeout=is_timeout_reason(reason),
+                url=url,
+            )
+            if is_timeout_reason(reason):
+                if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
+                    time.sleep(retry_delay_seconds(attempt_index))
+                    continue
+                raise QuotaProbeError(TIMEOUT, transient=True) from error
+            if is_network_reason(reason):
+                if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
+                    time.sleep(retry_delay_seconds(attempt_index))
+                    continue
+                raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
+            raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
+        except (TimeoutError, socket.timeout) as error:
+            last_error = error
+            debug_log("usage request timeout", attempt=attempt_index + 1, error=error, url=url)
+            if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
+                time.sleep(retry_delay_seconds(attempt_index))
+                continue
             raise QuotaProbeError(TIMEOUT, transient=True) from error
-        raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            last_error = error
+            debug_log("usage response decode failure", attempt=attempt_index + 1, error=error, url=url)
+            if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
+                time.sleep(retry_delay_seconds(attempt_index))
+                continue
+            raise QuotaProbeError(BAD_RESPONSE, transient=True) from error
 
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as error:
-        raise QuotaProbeError(BAD_RESPONSE, transient=True) from error
-
-    if isinstance(payload, dict):
-        return payload
-
-    raise QuotaProbeError(BAD_RESPONSE, transient=True)
+    if last_error is not None:
+        raise QuotaProbeError(NETWORK_ERROR, transient=True) from last_error
+    raise QuotaProbeError(NETWORK_ERROR, transient=True)
 
 
-def probe_quota_view(auth_file: AuthFile, directory: Path) -> ProbeOutcome:
+def probe_quota_view(auth_file: AuthFile, directory: Path, proxy_config: UsageProxyConfig) -> ProbeOutcome:
     access_token = ""
     try:
         auth_payload = load_auth_payload(auth_file.path)
         auth_mode = auth_mode_from_payload(auth_payload)
+        debug_log("probing auth file", auth_file=auth_file.name, auth_mode=auth_mode, directory=directory)
         if auth_mode == "api_key":
             return ProbeOutcome.status(API_KEY_AUTH)
 
@@ -746,19 +1170,37 @@ def probe_quota_view(auth_file: AuthFile, directory: Path) -> ProbeOutcome:
         endpoint = usage_endpoint_for_base_url(base_url)
         account_id = tokens.get("account_id")
         account_id = account_id if isinstance(account_id, str) and account_id else None
+        debug_log(
+            "prepared usage probe",
+            auth_file=auth_file.name,
+            endpoint=endpoint,
+            has_account_id=account_id is not None,
+            proxy=proxy_config.display,
+        )
 
-        payload = fetch_usage_payload(endpoint, usage_request_headers(access_token, account_id))
-        return ProbeOutcome(format_quota_view(payload))
+        payload = fetch_usage_payload(endpoint, usage_request_headers(access_token, account_id), proxy_config)
+        quota = format_quota_view(payload)
+        debug_log("probe completed", auth_file=auth_file.name, status=quota.primary_left)
+        return ProbeOutcome(quota)
     except QuotaProbeError as error:
         status = error.status
         if status == UNAUTHORIZED and is_access_token_expired(access_token):
             status = TOKEN_EXPIRED
+        debug_log(
+            "probe failed with quota probe error",
+            auth_file=auth_file.name,
+            status=status,
+            transient=error.transient,
+        )
         return ProbeOutcome.status(status, cacheable=not error.transient)
-    except Exception:
+    except Exception as error:
+        debug_exception("probe failed with unexpected exception", error, auth_file=auth_file.name)
         return ProbeOutcome.status(PROBE_ERROR, cacheable=False)
 
 
-def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path) -> list[AuthFile]:
+def enrich_auth_files_with_quota(
+    auth_files: Sequence[AuthFile], directory: Path, proxy_config: UsageProxyConfig
+) -> list[AuthFile]:
     cache = load_quota_cache()
     now = time.time()
     updated_cache = dict(cache)
@@ -777,11 +1219,13 @@ def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path
 
         cached_quota = cached_quota_view(cache, auth_file, now, allow_stale=False)
         if cached_quota is not None:
+            debug_log("using fresh cached quota", auth_file=auth_file.name, status=cached_quota.primary_left)
             enriched_auth_files.append(replace(auth_file, quota=cached_quota))
             continue
 
         stale_quota = cached_quota_view(cache, auth_file, now, allow_stale=True)
         if stale_quota is not None:
+            debug_log("using stale quota as fallback candidate", auth_file=auth_file.name, status=stale_quota.primary_left)
             stale_fallbacks[auth_file.path] = stale_quota
 
         files_to_probe.append(auth_file)
@@ -791,7 +1235,7 @@ def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path
         max_workers = min(MAX_CONCURRENT_PROBES, len(files_to_probe))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_auth = {
-                executor.submit(probe_quota_view, auth_file, directory): auth_file
+                executor.submit(probe_quota_view, auth_file, directory, proxy_config): auth_file
                 for auth_file in files_to_probe
             }
             for future in concurrent.futures.as_completed(future_to_auth):
@@ -818,10 +1262,18 @@ def enrich_auth_files_with_quota(auth_files: Sequence[AuthFile], directory: Path
         stale_quota = stale_fallbacks.get(auth_file.path)
         if outcome is None:
             quota = stale_quota.with_stale_marker() if stale_quota is not None else QuotaView.status(PROBE_ERROR)
+            debug_log("probe outcome missing, using fallback", auth_file=auth_file.name, status=quota.primary_left)
         elif not outcome.cacheable and stale_quota is not None:
             quota = stale_quota.with_stale_marker()
+            debug_log(
+                "probe returned transient failure, using stale fallback",
+                auth_file=auth_file.name,
+                fallback_status=quota.primary_left,
+                live_status=outcome.quota.primary_left,
+            )
         else:
             quota = outcome.quota
+            debug_log("using live probe quota", auth_file=auth_file.name, status=quota.primary_left)
         enriched_by_path[auth_file.path] = replace(auth_file, quota=quota)
 
     final_auth_files = [enriched_by_path[auth_file.path] for auth_file in auth_files]
@@ -870,7 +1322,7 @@ def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> Au
     tty_output.write(f"      {menu_header()}\n")
     tty_output.write(f"      {menu_separator()}\n")
     for index, auth_file in enumerate(auth_files, start=1):
-        tty_output.write(f"  {index:>2}. {auth_file.label}\n")
+        tty_output.write(f"  {index:>2}. {auth_file.fallback_label()}\n")
     tty_output.write("\n")
     tty_output.write("      * stale cache, reset columns show time remaining\n\n")
     tty_output.flush()
@@ -925,7 +1377,7 @@ def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output)
         with create_app_session(input=tty_ui_input, output=tty_ui_output):
             result = choice(
                 message=f"{MENU_TITLE}\n\n{menu_header()}\n{menu_separator()}",
-                options=[(auth_file, auth_file.label) for auth_file in auth_files],
+                options=[(auth_file, auth_file.prompt_toolkit_label()) for auth_file in auth_files],
                 default=next(auth_file for auth_file in auth_files if auth_file.is_active),
                 style=style,
                 symbol=">",
@@ -1055,23 +1507,36 @@ def swap_auth_files(active_path: Path, selected_path: Path) -> None:
 
 
 def main() -> None:
-    directory = parse_args(sys.argv[1:])
-    auth_files = list_auth_files(directory)
-    auth_files = enrich_auth_files_with_quota(auth_files, directory)
-
-    active_auth = next(auth_file for auth_file in auth_files if auth_file.is_active)
-    selected_auth = choose_auth_file(auth_files)
-
-    if selected_auth.is_active:
-        print(f"{selected_auth.name} is already active.")
-        return
+    options = parse_args(sys.argv[1:])
+    configure_debug_logging(options.debug, options.debug_log_path)
+    proxy_config = load_usage_proxy_config(options.directory, options.proxy_url)
+    debug_log(
+        "starting codex-auth",
+        auth_directory=options.directory,
+        debug_log_path=options.debug_log_path or "stderr",
+        proxy=proxy_config.display,
+    )
 
     try:
-        swap_auth_files(active_auth.path, selected_auth.path)
-    except SwapError as error:
-        fail(str(error))
+        directory = options.directory
+        auth_files = list_auth_files(directory)
+        auth_files = enrich_auth_files_with_quota(auth_files, directory, proxy_config)
 
-    print(f"Active auth switched: {active_auth.name} <-> {selected_auth.name}")
+        active_auth = next(auth_file for auth_file in auth_files if auth_file.is_active)
+        selected_auth = choose_auth_file(auth_files)
+
+        if selected_auth.is_active:
+            print(f"{selected_auth.name} is already active.")
+            return
+
+        try:
+            swap_auth_files(active_auth.path, selected_auth.path)
+        except SwapError as error:
+            fail(str(error))
+
+        print(f"Active auth switched: {active_auth.name} <-> {selected_auth.name}")
+    finally:
+        close_debug_logging()
 
 
 if __name__ == "__main__":

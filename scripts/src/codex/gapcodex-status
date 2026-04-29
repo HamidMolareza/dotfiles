@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+GapGPT Usage Checker — fetches and displays plan usage for one or more accounts.
+
+By default reads GAPGPT_API_KEY. You can pass multiple env variable names to
+check several accounts at once.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' library is required. Install it with: pip install requests")
+    sys.exit(1)
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.columns import Columns
+    from rich.align import Align
+    from rich.rule import Rule
+    from rich import box
+except ImportError:
+    print("Error: 'rich' library is required. Install it with: pip install rich")
+    sys.exit(1)
+
+
+API_URL = "https://gapgpt.app/api/v1/api/codex/usage"
+USER_AGENT = "codex_cli_rs/0.104.1 (Ubuntu 24.4.0; x86_64) gnome-terminal"
+DEFAULT_ENV = "GAPGPT_API_KEY"
+
+console = Console()
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def fmt_seconds(seconds: int) -> str:
+    if seconds <= 0:
+        return "now"
+    parts = []
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s or not parts:
+        parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def fmt_timestamp(unix_ts: int) -> str:
+    if unix_ts <= 0:
+        return "unknown"
+    dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def pct_color(pct: float) -> str:
+    if pct < 50:
+        return "green"
+    elif pct < 80:
+        return "yellow"
+    return "red"
+
+
+def pct_style(pct: float) -> str:
+    return f"bold {pct_color(pct)}"
+
+
+# ── network ──────────────────────────────────────────────────────────────────
+
+def fetch_usage(token: str, timeout: int = 15) -> dict:
+    """Send GET request and return parsed JSON or an error dict."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Authorization": f"Bearer {token}",
+        "Accept": "*/*",
+    }
+
+    resp = requests.get(API_URL, headers=headers, timeout=timeout)
+
+    if resp.status_code == 401:
+        try:
+            body = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+        error_msg = body.get("error", "unauthorized")
+        if error_msg == "invalid api key":
+            raise ValueError("Invalid API key. Double-check the token value.")
+        else:
+            raise ValueError("Unauthorized — token is missing or malformed.")
+
+    if resp.status_code != 200:
+        raise ValueError(f"Unexpected HTTP {resp.status_code}: {resp.text[:200]}")
+
+    try:
+        return resp.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Could not parse JSON response: {exc}")
+
+
+# ── display ──────────────────────────────────────────────────────────────────
+
+def make_window_table(
+    title: str,
+    pct: float,
+    window_seconds: int,
+    reset_seconds: int,
+    reset_at: int,
+) -> Table:
+    color = pct_color(pct)
+    style = pct_style(pct)
+
+    table = Table(
+        title=title,
+        box=box.ROUNDED,
+        title_style="bold cyan",
+        border_style="dim",
+        expand=True,
+        show_header=False,
+        padding=(0, 1),
+    )
+    table.add_column("Key", style="bold", ratio=1)
+    table.add_column("Value", ratio=3)
+
+    bar_width = 35
+    filled = int(round(pct / 100 * bar_width))
+    empty = bar_width - filled
+    bar_text = Text()
+    bar_text.append("█" * filled, style=color)
+    bar_text.append("░" * empty, style="dim")
+    bar_text.append(f"  {pct:.1f}%", style=style)
+    table.add_row("Usage", bar_text)
+
+    table.add_row("Window", fmt_seconds(window_seconds))
+    table.add_row("Resets in", f"[cyan]{fmt_seconds(reset_seconds)}[/]")
+    table.add_row("Resets at", f"[dim]{fmt_timestamp(reset_at)}[/]")
+
+    return table
+
+
+def display_one(env_name: str, data: dict) -> None:
+    """Pretty-print the usage data for a single account."""
+
+    plan = data.get("plan_type", "unknown")
+    rate = data.get("rate_limit", {})
+    credits_info = data.get("credits", {})
+
+    allowed = rate.get("allowed", False)
+    limit_reached = rate.get("limit_reached", False)
+
+    primary = rate.get("primary_window", {})
+    secondary = rate.get("secondary_window", {})
+
+    p_pct = primary.get("used_percent", 0)
+    s_pct = secondary.get("used_percent", 0)
+
+    # ── header ───────────────────────────────────────────────────────────
+
+    status_parts: list[Text] = []
+    if allowed:
+        status_parts.append(Text("✓ Requests allowed", style="bold green"))
+    else:
+        status_parts.append(Text("✗ Requests BLOCKED", style="bold red"))
+    if limit_reached:
+        status_parts.append(Text("  ⚠ Limit reached", style="bold red"))
+    else:
+        status_parts.append(Text("  ✓ Within limits", style="green"))
+
+    header_text = Text()
+    header_text.append("Plan: ", style="bold")
+    header_text.append(plan.upper(), style="bold magenta")
+    header_text.append("   ")
+    for part in status_parts:
+        header_text.append_text(part)
+
+    # Credits
+    balance = credits_info.get("balance", "$0.00")
+    has_credits = credits_info.get("has_credits", False)
+    unlimited = credits_info.get("unlimited", False)
+
+    header_text.append("\n")
+    header_text.append("Credits: ", style="bold")
+    if unlimited:
+        header_text.append("Unlimited", style="bold green")
+    elif has_credits:
+        header_text.append(f"Available ({balance})", style="green")
+    else:
+        header_text.append(f"None ({balance})", style="dim")
+
+    console.print(
+        Panel(
+            Align.left(header_text),
+            title=f"[bold]{env_name}[/]",
+            border_style="bright_cyan",
+            box=box.DOUBLE_EDGE,
+            padding=(1, 2),
+        )
+    )
+
+    # ── rate-limit windows ───────────────────────────────────────────────
+
+    primary_table = make_window_table(
+        title="Primary Window",
+        pct=p_pct,
+        window_seconds=primary.get("limit_window_seconds", 0),
+        reset_seconds=primary.get("reset_after_seconds", 0),
+        reset_at=primary.get("reset_at", 0),
+    )
+
+    secondary_table = make_window_table(
+        title="Secondary Window",
+        pct=s_pct,
+        window_seconds=secondary.get("limit_window_seconds", 0),
+        reset_seconds=secondary.get("reset_after_seconds", 0),
+        reset_at=secondary.get("reset_at", 0),
+    )
+
+    console.print(Columns([primary_table, secondary_table], equal=True, expand=True))
+
+    # ── additional rate limits ───────────────────────────────────────────
+    extra = data.get("additional_rate_limits")
+    if extra:
+        console.print(
+            Panel(
+                json.dumps(extra, indent=2, ensure_ascii=False),
+                title="Additional Rate Limits",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+
+
+def display_error(env_name: str, error: str) -> None:
+    """Show a compact error panel for a failed account."""
+    console.print(
+        Panel(
+            f"[bold red]Error:[/] {error}",
+            title=f"[bold]{env_name}[/]",
+            border_style="red",
+            box=box.HEAVY,
+            padding=(0, 2),
+        )
+    )
+
+
+# ── summary table ────────────────────────────────────────────────────────────
+
+def display_summary(results: list[tuple[str, dict | None, str | None]]) -> None:
+    """Show a compact summary table when there are multiple accounts."""
+    if len(results) < 2:
+        return
+
+    def summary_sort_key(item: tuple[str, dict | None, str | None]) -> tuple[int, int, str]:
+        env_name, data, error = item
+        if error or not data:
+            return (1, float("inf"), env_name)
+
+        reset_seconds = (
+            data.get("rate_limit", {})
+            .get("secondary_window", {})
+            .get("reset_after_seconds", 0)
+        )
+        return (0, reset_seconds, env_name)
+
+    table = Table(
+        title="Summary",
+        box=box.ROUNDED,
+        title_style="bold bright_cyan",
+        border_style="dim",
+        expand=True,
+        padding=(0, 1),
+    )
+    table.add_column("Account", style="bold")
+    table.add_column("Plan", justify="center")
+    table.add_column("Status", justify="center")
+    table.add_column("Primary", justify="center")
+    table.add_column("Secondary", justify="center")
+    table.add_column("Resets in", justify="center")
+    table.add_column("Credits", justify="center")
+
+    for env_name, data, error in sorted(results, key=summary_sort_key):
+        if error:
+            table.add_row(
+                env_name,
+                "[dim]—[/]",
+                f"[red]Error[/]",
+                "[dim]—[/]",
+                "[dim]—[/]",
+                "[dim]—[/]",
+                "[dim]—[/]",
+            )
+            continue
+
+        plan = data.get("plan_type", "?").upper()
+        rate = data.get("rate_limit", {})
+        allowed = rate.get("allowed", False)
+        limit_reached = rate.get("limit_reached", False)
+
+        p_pct = rate.get("primary_window", {}).get("used_percent", 0)
+        s_pct = rate.get("secondary_window", {}).get("used_percent", 0)
+        s_reset_seconds = rate.get("secondary_window", {}).get("reset_after_seconds", 0)
+
+        credits_info = data.get("credits", {})
+        balance = credits_info.get("balance", "$0.00")
+        unlimited = credits_info.get("unlimited", False)
+        has_credits = credits_info.get("has_credits", False)
+
+        if not allowed or limit_reached:
+            status = "[bold red]⚠ Limited[/]"
+        else:
+            status = "[green]✓ OK[/]"
+
+        p_bar = Text()
+        p_bar.append(f"{p_pct}%", style=pct_style(p_pct))
+
+        s_bar = Text()
+        s_bar.append(f"{s_pct}%", style=pct_style(s_pct))
+
+        if unlimited:
+            credit_str = "[bold green]Unlimited[/]"
+        elif has_credits:
+            credit_str = f"[green]{balance}[/]"
+        else:
+            credit_str = f"[dim]{balance}[/]"
+
+        table.add_row(
+            env_name,
+            f"[magenta]{plan}[/]",
+            status,
+            p_bar,
+            s_bar,
+            f"[cyan]{fmt_seconds(s_reset_seconds)}[/]",
+            credit_str,
+        )
+
+    console.print()
+    console.print(table)
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch and display GapGPT API usage for one or more accounts.",
+        epilog=(
+            "Examples:\n"
+            "  # Single account (default env var):\n"
+            "  export GAPGPT_API_KEY='token-abc'\n"
+            "  python %(prog)s\n"
+            "\n"
+            "  # Multiple accounts:\n"
+            "  export WORK_TOKEN='token-111'\n"
+            "  export PERSONAL_TOKEN='token-222'\n"
+            "  python %(prog)s WORK_TOKEN PERSONAL_TOKEN\n"
+            "\n"
+            "  # Mix default with extras:\n"
+            "  python %(prog)s GAPGPT_API_KEY WORK_TOKEN PERSONAL_TOKEN\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "env_vars",
+        nargs="*",
+        default=[DEFAULT_ENV],
+        metavar="ENV_VAR",
+        help=(
+            f"Environment variable name(s) holding API token(s). "
+            f"Default: {DEFAULT_ENV}"
+        ),
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print raw JSON responses instead of the formatted view.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=15,
+        metavar="SEC",
+        help="HTTP request timeout in seconds (default: 15).",
+    )
+    args = parser.parse_args()
+
+    # De-duplicate while preserving order
+    seen = set()
+    env_vars: list[str] = []
+    for name in args.env_vars:
+        if name not in seen:
+            seen.add(name)
+            env_vars.append(name)
+
+    # Collect results: (env_name, data_or_None, error_or_None)
+    results: list[tuple[str, dict | None, str | None]] = []
+
+    multi = len(env_vars) > 1
+
+    console.print()
+    console.print(
+        Rule(
+            f"[bold]GapGPT Usage Report — "
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}[/]",
+            style="bright_cyan",
+        )
+    )
+    console.print()
+
+    for i, env_name in enumerate(env_vars):
+        token = os.environ.get(env_name, "").strip()
+
+        if not token:
+            error_msg = (
+                f"Environment variable [bold]{env_name}[/] is not set or empty.\n"
+                f"  Set it first: [cyan]export {env_name}='your-token'[/]"
+            )
+            display_error(env_name, error_msg)
+            results.append((env_name, None, "not set"))
+            if i < len(env_vars) - 1:
+                console.print()
+            continue
+
+        # Fetch
+        try:
+            with console.status(
+                f"[bold cyan]Fetching usage for {env_name}…[/]", spinner="dots"
+            ):
+                data = fetch_usage(token, timeout=args.timeout)
+        except requests.ConnectionError:
+            error_msg = f"Could not connect to {API_URL}. Check your network."
+            display_error(env_name, error_msg)
+            results.append((env_name, None, "connection error"))
+            if i < len(env_vars) - 1:
+                console.print()
+            continue
+        except requests.Timeout:
+            error_msg = f"Request timed out after {args.timeout}s."
+            display_error(env_name, error_msg)
+            results.append((env_name, None, "timeout"))
+            if i < len(env_vars) - 1:
+                console.print()
+            continue
+        except requests.RequestException as exc:
+            error_msg = f"HTTP request failed: {exc}"
+            display_error(env_name, error_msg)
+            results.append((env_name, None, str(exc)))
+            if i < len(env_vars) - 1:
+                console.print()
+            continue
+        except ValueError as exc:
+            display_error(env_name, str(exc))
+            results.append((env_name, None, str(exc)))
+            if i < len(env_vars) - 1:
+                console.print()
+            continue
+
+        # Output
+        if args.raw:
+            console.print(f"[bold]── {env_name} ──[/]")
+            console.print_json(json.dumps(data, ensure_ascii=False))
+        else:
+            display_one(env_name, data)
+
+        results.append((env_name, data, None))
+
+        if i < len(env_vars) - 1:
+            console.print()
+
+    # Summary table for multiple accounts
+    if not args.raw:
+        display_summary(results)
+
+    console.print()
+
+    # Exit code: 1 if ALL failed, 0 otherwise
+    all_failed = all(error is not None for _, _, error in results)
+    if all_failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

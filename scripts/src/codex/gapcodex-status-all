@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# gapgpt_check.sh — find all GAPGPT_API_KEY* env vars and pass them to gapgpt_usage.py
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAIN_SCRIPT="gapcodex-status" # ${SCRIPT_DIR}/gapcodex-status
+
+# Collect matching env var names, sorted naturally
+mapfile -t tokens < <(env | grep -oP '^GAPGPT_API_KEY\w*(?==)' | sort -V)
+
+if [[ ${#tokens[@]} -eq 0 ]]; then
+    echo "No environment variables matching GAPGPT_API_KEY* found."
+    echo "Set at least one:  export GAPGPT_API_KEY='your-token'"
+    exit 1
+fi
+
+echo "Found ${#tokens[@]} token(s): ${tokens[*]}"
+echo ""
+
+exec "$MAIN_SCRIPT" "${tokens[@]}" "$@"

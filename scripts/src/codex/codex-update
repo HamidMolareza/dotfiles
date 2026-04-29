@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PACKAGE='@openai/codex'
+REGISTRY='https://registry.npmjs.org/'
+NETWORK_MODE='current'
+
+run_npm_direct() {
+  env \
+    -u ALL_PROXY \
+    -u all_proxy \
+    -u HTTP_PROXY \
+    -u http_proxy \
+    -u HTTPS_PROXY \
+    -u https_proxy \
+    -u FTP_PROXY \
+    -u ftp_proxy \
+    -u NO_PROXY \
+    -u no_proxy \
+    -u npm_config_proxy \
+    -u npm_config_https_proxy \
+    -u npm_config_noproxy \
+    npm \
+    --proxy=null \
+    --https-proxy=null \
+    --noproxy='' \
+    "$@"
+}
+
+run_npm_proxy() {
+  env \
+    -u FTP_PROXY \
+    -u ftp_proxy \
+    npm "$@"
+}
+
+run_npm_current() {
+  npm "$@"
+}
+
+run_npm() {
+  case "$NETWORK_MODE" in
+    current)
+      run_npm_current "$@"
+      ;;
+    direct)
+      run_npm_direct "$@"
+      ;;
+    proxy)
+      run_npm_proxy "$@"
+      ;;
+    *)
+      printf 'Unknown network mode: %s\n' "$NETWORK_MODE" >&2
+      exit 1
+      ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+Usage: codex-update [options] [version]
+
+Update Codex CLI from npmjs.org.
+
+Options:
+  --direct     Bypass proxy environment and npm proxy config.
+               This can help when proxy environment variables are set.
+  --proxy      Use the current shell/npm proxy settings.
+               FTP proxy variables are still ignored because they can
+               interfere with npm registry requests.
+  --current    Use npm with the current environment unchanged. This is the
+               default mode.
+  -h, --help   Show this help text.
+
+Arguments:
+  version    Optional explicit version to install, for example 0.122.0.
+             When omitted, the script resolves the current latest version
+             first and then installs that exact version.
+EOF
+}
+
+TARGET_VERSION=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --direct)
+      NETWORK_MODE='direct'
+      shift
+      ;;
+    --proxy)
+      NETWORK_MODE='proxy'
+      shift
+      ;;
+    --current)
+      NETWORK_MODE='current'
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$TARGET_VERSION" ]]; then
+        printf 'Only one version argument is supported.\n\n' >&2
+        usage >&2
+        exit 1
+      fi
+      TARGET_VERSION="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ $# -gt 0 ]]; then
+  printf 'Unexpected extra arguments: %s\n\n' "$*" >&2
+  usage >&2
+  exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  printf 'npm is required but was not found on PATH.\n' >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  printf 'node is required but was not found on PATH.\n' >&2
+  exit 1
+fi
+
+if [[ -z "$TARGET_VERSION" ]]; then
+  printf 'Resolving latest %s version from %s...\n' "$PACKAGE" "$REGISTRY"
+  TARGET_VERSION="$(run_npm view "$PACKAGE" version --registry="$REGISTRY" | tr -d '[:space:]')"
+fi
+
+if [[ -z "$TARGET_VERSION" ]]; then
+  printf 'Could not resolve a target version for %s.\n' "$PACKAGE" >&2
+  exit 1
+fi
+
+printf 'Removing %s...\n' "$PACKAGE"
+run_npm uninstall -g "$PACKAGE" --registry="$REGISTRY" || true
+
+printf 'Installing %s@%s from %s...\n' "$PACKAGE" "$TARGET_VERSION" "$REGISTRY"
+run_npm install -g "$PACKAGE@$TARGET_VERSION" --registry="$REGISTRY"
+
+GLOBAL_ROOT="$(run_npm root -g)"
+INSTALLED_VERSION="$(
+  node -e "const path = require('node:path'); const pkg = require(path.join(process.argv[1], '@openai', 'codex', 'package.json')); process.stdout.write(pkg.version);" \
+    "$GLOBAL_ROOT"
+)"
+
+if [[ "$INSTALLED_VERSION" != "$TARGET_VERSION" ]]; then
+  printf 'Expected %s version %s, but npm installed %s under %s.\n' \
+    "$PACKAGE" "$TARGET_VERSION" "$INSTALLED_VERSION" "$GLOBAL_ROOT" >&2
+  exit 1
+fi
+
+printf 'Verified package version: %s\n' "$INSTALLED_VERSION"
+printf 'CLI reports: '
+codex --version
