@@ -21,6 +21,7 @@ fi
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
+alias ls-1='ls -1'
 
 # Remove Folder
 alias rf='rd'
@@ -71,3 +72,10 @@ alias dc-restart='dc down && dc up -d'
 # Agent
 alias acc='agent-commit | clipboard'
 alias acc-intractive='agent-commit --interactive | clipboard'
+
+alias vpn-usage='(cd /home/home/my-files/projects/vpn-usage-tracker && watch -n 5 ./report.py)'
+
+alias sp-ssh='retry-until-success 10 "gh codespace ssh -c fictional-train-9qjxrpppqrr3p477"'
+alias sp-proxy='retry-until-success 10 "gh codespace ports forward 8899:8901 -c fictional-train-9qjxrpppqrr3p477"'
+alias sp-usage='retry-until-success 10 "gh codespace ports forward 8898:8898 -c fictional-train-9qjxrpppqrr3p477"'
+alias sp-stop='retry-until-success 10 "gh codespace stop -c fictional-train-9qjxrpppqrr3p477"'

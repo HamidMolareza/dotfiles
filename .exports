@@ -32,3 +32,15 @@ fi
 
 # GapCode
 add_to_path_if_missing "$HOME/.gapcode/bin"
+
+# Flatpak exports
+add_to_path_if_missing "/var/lib/flatpak/exports/bin"
+add_to_path_if_missing "$HOME/.local/share/flatpak/exports/bin"
+
+# APK analysis tools
+export APK_MCP_ApkAnalysis__ToolPaths__Jadx="/var/lib/flatpak/exports/bin/com.github.skylot.jadx"
+export APK_MCP_ApkAnalysis__ToolPaths__Apktool="/usr/bin/apktool"
+
+# Disable NuGet vulnerability auditing during restore to avoid
+# requests to api.nuget.org vulnerability endpoints on restricted networks.
+export NuGetAudit=false

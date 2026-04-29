@@ -1,2 +1,3 @@
 [Default Applications]
-application/x-extension-burp=install4j_1cbxaxn-BurpSuiteCommunity.desktop
+application/x-extension-burp=install4j_1cbxaxn-BurpSuiteCommunity.desktop;install4j_1ja7px3-BurpSuiteCommunity.desktop
+x-scheme-handler/burp=install4j_1ja7px3-BurpSuiteCommunity.desktop

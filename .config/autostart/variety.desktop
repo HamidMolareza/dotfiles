@@ -2,7 +2,7 @@
 Name=Variety
 Comment=Variety Wallpaper Changer
 Categories=GNOME;GTK;Utility;
-Exec=/bin/bash -c "sleep 20 && http_proxy=http://localhost:10808 https_proxy=http://localhost:10808 /usr/bin/variety --profile /home/home/.config/variety/"
+Exec=/home/home/.config/variety/
 MimeType=text/uri-list;x-scheme-handler/variety;x-scheme-handler/vrty;
 Icon=variety
 Terminal=false

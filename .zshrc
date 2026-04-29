@@ -120,6 +120,6 @@ if [ -f ~/.exports ]; then
     source ~/.exports
 fi
 
-if command_exists gcodext; then
+if command_exists codex; then
     eval "$(codex completion zsh)"
 fi
