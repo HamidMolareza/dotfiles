@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import datetime as dt
+import os
+import json
+import math
+import shutil
+import subprocess
+import sys
+import textwrap
+from dataclasses import dataclass
+from typing import Any
+
+
+API_VERSION = "2026-03-10"
+PLAN_LIMITS = {
+    "free": {"compute_units": 120.0, "storage_gb_month": 15.0, "label": "GitHub Free"},
+    "pro": {"compute_units": 180.0, "storage_gb_month": 20.0, "label": "GitHub Pro"},
+}
+RESET = "\033[0m"
+
+
+class CommandError(RuntimeError):
+    pass
+
+
+@dataclass
+class UsageTotals:
+    compute_hours: float = 0.0
+    compute_units: float = 0.0
+    compute_net_amount: float = 0.0
+    compute_discount_amount: float = 0.0
+    storage_gb_hours: float = 0.0
+    storage_gb_months: float = 0.0
+    storage_net_amount: float = 0.0
+    storage_discount_amount: float = 0.0
+    total_net_amount: float = 0.0
+    total_discount_amount: float = 0.0
+
+
+def parse_args() -> argparse.Namespace:
+    now = dt.datetime.now()
+    parser = argparse.ArgumentParser(
+        prog="gh-codespace-usage",
+        description=(
+            "Show GitHub Codespaces usage and remaining included quota using gh api. "
+            "If GH_TOKEN or GITHUB_TOKEN is set, gh will use that token instead of the stored gh auth login token."
+        ),
+    )
+    parser.add_argument("--username", help="GitHub username. Defaults to the authenticated user.")
+    parser.add_argument("--year", type=int, default=now.year, help="Billing year. Default: current year.")
+    parser.add_argument("--month", type=int, default=now.month, help="Billing month (1-12). Default: current month.")
+    parser.add_argument(
+        "--plan",
+        choices=sorted(PLAN_LIMITS.keys()),
+        help="Override plan detection. When omitted, the script tries to detect your plan from the authenticated user.",
+    )
+    parser.add_argument(
+        "--input-json",
+        help="Use a local JSON payload instead of calling gh api. Useful for testing or saved billing responses.",
+    )
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    return parser.parse_args()
+
+
+def style(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}{RESET}"
+
+
+def run_command(args: list[str]) -> str:
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        fail("The `gh` command is required but was not found in PATH.")
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout).strip()
+        raise CommandError(error or f"Command failed: {' '.join(args)}")
+    return result.stdout
+
+
+def gh_api(path: str, query: dict[str, Any] | None = None) -> Any:
+    args = [
+        "gh",
+        "api",
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        f"X-GitHub-Api-Version: {API_VERSION}",
+    ]
+    if query:
+        for key, value in query.items():
+            args.extend(["-f", f"{key}={value}"])
+    args.append(path)
+    return json.loads(run_command(args))
+
+
+def fail(message: str) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def token_prefix(token: str | None) -> str | None:
+    if not token:
+        return None
+    if token.startswith("github_pat_"):
+        return "github_pat"
+    if "_" not in token:
+        return None
+    return token.split("_", 1)[0]
+
+
+def detect_auth_token_prefix() -> str | None:
+    for env_name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        prefix = token_prefix(os.environ.get(env_name))
+        if prefix:
+            return prefix
+
+    try:
+        token = run_command(["gh", "auth", "token"]).strip()
+    except CommandError:
+        return None
+    return token_prefix(token)
+
+
+def validate_billing_auth() -> None:
+    prefix = detect_auth_token_prefix()
+    if prefix == "gho":
+        fail(
+            "The active GitHub CLI auth token starts with `gho_`, which is the standard OAuth token from `gh auth login`. "
+            "GitHub's user billing usage endpoint typically requires a fine-grained token instead. "
+            "Use a `github_pat_...` token with `Plan: read` via `GH_TOKEN` or `GITHUB_TOKEN`, "
+            "or check https://github.com/settings/billing."
+        )
+
+
+def detect_username() -> str:
+    try:
+        payload = gh_api("/user")
+    except CommandError as exc:
+        fail(str(exc))
+    username = payload.get("login")
+    if not username:
+        fail("Could not determine the authenticated GitHub username.")
+    return username
+
+
+def normalize_plan(plan_name: str | None) -> str | None:
+    if not plan_name:
+        return None
+    lowered = plan_name.strip().lower()
+    if lowered in PLAN_LIMITS:
+        return lowered
+    if lowered.startswith("github "):
+        lowered = lowered.removeprefix("github ").strip()
+    if lowered in PLAN_LIMITS:
+        return lowered
+    return None
+
+
+def detect_plan() -> str | None:
+    try:
+        payload = gh_api("/user")
+    except CommandError as exc:
+        fail(str(exc))
+    plan = payload.get("plan") or {}
+    for key in ("name", "filled_name"):
+        normalized = normalize_plan(plan.get(key))
+        if normalized:
+            return normalized
+    return None
+
+
+def load_usage(username: str, year: int, month: int, input_json: str | None) -> Any:
+    if input_json:
+        try:
+            return json.loads(input_json)
+        except json.JSONDecodeError as exc:
+            fail(f"Could not parse --input-json: {exc}")
+
+    try:
+        return gh_api(f"/users/{username}/settings/billing/usage/summary", {"year": year, "month": month})
+    except CommandError as exc:
+        message = str(exc)
+        if "HTTP 404" in message:
+            fail(
+                "GitHub returned 404 for the billing summary endpoint. "
+                "This usually means the account does not expose billing usage through the API for your current auth context. "
+                "Verify `gh auth status`, or check the data in https://github.com/settings/billing."
+            )
+        fail(message)
+    except Exception as exc:  # pragma: no cover - defensive guard for CLI use
+        fail(str(exc))
+
+
+def machine_details(sku: str) -> tuple[str, float]:
+    parts = sku.rsplit("_", 1)
+    suffix = parts[-1] if parts else ""
+    digits = "".join(ch for ch in suffix if ch.isdigit())
+    if digits:
+        cores = float(digits)
+        return f"{int(cores)}-core", cores
+    return sku, 1.0
+
+
+def summarize_usage(payload: Any, year: int, month: int) -> tuple[UsageTotals, list[dict[str, Any]]]:
+    hours_in_month = calendar.monthrange(year, month)[1] * 24
+    totals = UsageTotals()
+    rows: list[dict[str, Any]] = []
+
+    for item in payload.get("usageItems", []):
+        product = item.get("product", "")
+        sku = item.get("sku", "")
+        unit_type = item.get("unitType", "")
+        gross_quantity = float(item.get("grossQuantity", 0.0) or 0.0)
+        discount_quantity = float(item.get("discountQuantity", 0.0) or 0.0)
+        net_quantity = float(item.get("netQuantity", 0.0) or 0.0)
+        gross_amount = float(item.get("grossAmount", 0.0) or 0.0)
+        discount_amount = float(item.get("discountAmount", 0.0) or 0.0)
+        net_amount = float(item.get("netAmount", 0.0) or 0.0)
+
+        row: dict[str, Any] = {
+            "product": product,
+            "sku": sku,
+            "unit_type": unit_type,
+            "gross_quantity": gross_quantity,
+            "discount_quantity": discount_quantity,
+            "net_quantity": net_quantity,
+            "gross_amount": gross_amount,
+            "discount_amount": discount_amount,
+            "net_amount": net_amount,
+            "description": sku,
+        }
+
+        if product == "Codespaces" and sku.startswith("codespaces_compute_"):
+            machine_label, compute_units_per_hour = machine_details(sku)
+            row["description"] = f"{machine_label} compute"
+            row["compute_units"] = gross_quantity * compute_units_per_hour
+            totals.compute_hours += gross_quantity
+            totals.compute_units += row["compute_units"]
+            totals.compute_net_amount += net_amount
+            totals.compute_discount_amount += discount_amount
+        elif product == "Codespaces" and sku == "codespaces_storage":
+            row["description"] = "Storage"
+            row["storage_gb_months"] = gross_quantity / hours_in_month if hours_in_month else 0.0
+            totals.storage_gb_hours += gross_quantity
+            totals.storage_gb_months += row["storage_gb_months"]
+            totals.storage_net_amount += net_amount
+            totals.storage_discount_amount += discount_amount
+
+        totals.total_net_amount += net_amount
+        totals.total_discount_amount += discount_amount
+        rows.append(row)
+
+    return totals, rows
+
+
+def progress_bar(used: float, limit: float, width: int = 24) -> str:
+    if limit <= 0:
+        return "?" * width
+    ratio = max(0.0, min(used / limit, 1.0))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def format_number(value: float, digits: int = 2) -> str:
+    if math.isclose(value, round(value), rel_tol=0.0, abs_tol=10 ** (-digits)):
+        return f"{round(value):.0f}"
+    return f"{value:.{digits}f}"
+
+
+def next_reset_time(year: int, month: int) -> dt.datetime:
+    reset_year = year + 1 if month == 12 else year
+    reset_month = 1 if month == 12 else month + 1
+    return dt.datetime(reset_year, reset_month, 1, tzinfo=dt.timezone.utc)
+
+
+def format_duration(seconds: int) -> str:
+    seconds = abs(seconds)
+    days, seconds = divmod(seconds, 24 * 60 * 60)
+    hours, seconds = divmod(seconds, 60 * 60)
+    minutes, seconds = divmod(seconds, 60)
+
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def format_reset_line(reset_at_utc: dt.datetime, now_utc: dt.datetime) -> str:
+    reset_at_local = reset_at_utc.astimezone()
+    local_zone = reset_at_local.tzname() or reset_at_local.strftime("%z")
+    reset_text = f"{reset_at_local:%Y-%m-%d %H:%M:%S} {local_zone} ({reset_at_utc:%Y-%m-%d %H:%M:%S} UTC)"
+    seconds_until_reset = math.ceil((reset_at_utc - now_utc).total_seconds())
+
+    if seconds_until_reset >= 0:
+        return f"Next reset: {reset_text}  •  in {format_duration(seconds_until_reset)}"
+    return f"Period reset: {reset_text}  •  {format_duration(seconds_until_reset)} ago"
+
+
+def render_box(title: str, lines: list[str], width: int) -> str:
+    inner = max(width - 4, 20)
+    top = f"┌─ {title[: inner - 2]} " + "─" * max(inner - len(title) - 3, 0) + "┐"
+    body: list[str] = []
+    for line in lines:
+        wrapped = textwrap.wrap(line, width=inner) if line else [""]
+        body.extend(f"│ {segment.ljust(inner)} │" for segment in wrapped)
+    bottom = "└" + "─" * (inner + 2) + "┘"
+    return "\n".join([top, *body, bottom])
+
+
+def render_dashboard(
+    payload: Any,
+    totals: UsageTotals,
+    rows: list[dict[str, Any]],
+    selected_plan: str | None,
+    detected_plan: str | None,
+    color: bool,
+) -> str:
+    year = int(payload.get("timePeriod", {}).get("year", 0) or 0)
+    month = int(payload.get("timePeriod", {}).get("month", 0) or 0)
+    username = payload.get("user", "unknown")
+    month_label = dt.date(year or 1970, month or 1, 1).strftime("%B %Y")
+    width = min(shutil.get_terminal_size((100, 24)).columns, 110)
+    reset_at_utc = next_reset_time(year, month)
+    reset_line = format_reset_line(reset_at_utc, dt.datetime.now(dt.timezone.utc))
+
+    status = "Included quota remaining" if totals.total_net_amount == 0 else "Paid overage started"
+    status_color = "32;1" if totals.total_net_amount == 0 else "31;1"
+    title = style("GitHub Codespaces Usage", "1;36", color)
+    subtitle = f"{username}  •  {month_label}"
+
+    lines = [
+        f"{title}",
+        subtitle,
+        style(status, status_color, color),
+        "",
+        f"Compute used: {format_number(totals.compute_hours)} h raw  •  {format_number(totals.compute_units)} included units",
+        f"Storage used: {format_number(totals.storage_gb_hours, 4)} GB-h  •  {format_number(totals.storage_gb_months, 5)} GB-month",
+        f"Covered by quota: ${totals.total_discount_amount:.4f}  •  Billed now: ${totals.total_net_amount:.4f}",
+        reset_line,
+    ]
+
+    sections = [render_box("Overview", lines, width)]
+
+    plan_lines: list[str] = []
+    if selected_plan:
+        plan_keys = [selected_plan]
+    else:
+        plan_keys = ["free", "pro"]
+
+    for plan_key in plan_keys:
+        limits = PLAN_LIMITS[plan_key]
+        remaining_compute_units = max(limits["compute_units"] - totals.compute_units, 0.0)
+        remaining_storage = max(limits["storage_gb_month"] - totals.storage_gb_months, 0.0)
+        used_compute_bar = progress_bar(totals.compute_units, limits["compute_units"])
+        used_storage_bar = progress_bar(totals.storage_gb_months, limits["storage_gb_month"])
+        marker = " (detected)" if plan_key == detected_plan and not selected_plan else ""
+        plan_lines.extend(
+            [
+                f"{limits['label']}{marker}",
+                f"  Compute  {used_compute_bar}  {format_number(totals.compute_units)}/{format_number(limits['compute_units'])}",
+                f"  Remaining compute units: {format_number(remaining_compute_units)}",
+                f"  Estimated 2-core time left: {format_number(remaining_compute_units / 2.0)} h",
+                f"  Estimated 4-core time left: {format_number(remaining_compute_units / 4.0)} h",
+                f"  Storage  {used_storage_bar}  {format_number(totals.storage_gb_months, 5)}/{format_number(limits['storage_gb_month'], 2)} GB-month",
+                f"  Remaining storage: {format_number(remaining_storage, 5)} GB-month",
+                "",
+            ]
+        )
+    if plan_lines and not plan_lines[-1]:
+        plan_lines.pop()
+    sections.append(render_box("Quota", plan_lines, width))
+
+    table_lines = []
+    header = f"{'Type':<18} {'SKU':<24} {'Used':>12} {'Covered':>12} {'Billed':>12}"
+    table_lines.append(style(header, "1", color))
+    table_lines.append("─" * min(len(header), width - 4))
+    for row in rows:
+        unit_label = {
+            "hours": "h",
+            "gigabyte-hours": "GB-h",
+        }.get(row["unit_type"], row["unit_type"])
+        used = f"{format_number(row['gross_quantity'], 4)} {unit_label}"
+        covered = f"{format_number(row['discount_quantity'], 4)}"
+        billed = f"{format_number(row['net_quantity'], 4)}"
+        table_lines.append(
+            f"{row['description'][:18]:<18} {row['sku'][:24]:<24} {used:>12} {covered:>12} {billed:>12}"
+        )
+    if not rows:
+        table_lines.append("No usage items returned for this period.")
+    sections.append(render_box("Line Items", table_lines, width))
+
+    notes = [
+        "Compute remaining is estimated from Codespaces machine multipliers.",
+        "Storage remaining converts GB-hours into GB-month using the selected calendar month.",
+        "If the billing API is unavailable for your account, open https://github.com/settings/billing instead.",
+    ]
+    sections.append(render_box("Notes", notes, width))
+
+    return "\n\n".join(sections)
+
+
+def main() -> None:
+    args = parse_args()
+    color = not args.no_color and sys.stdout.isatty()
+
+    if not 1 <= args.month <= 12:
+        fail("--month must be between 1 and 12.")
+
+    username = args.username
+    detected_plan = None
+    if not args.input_json:
+        validate_billing_auth()
+        username = username or detect_username()
+        detected_plan = detect_plan()
+    selected_plan = args.plan or detected_plan
+
+    payload = load_usage(username or "", args.year, args.month, args.input_json)
+    period = payload.get("timePeriod", {})
+    period_year = int(period.get("year", args.year))
+    period_month = int(period.get("month", args.month))
+    totals, rows = summarize_usage(payload, period_year, period_month)
+    print(render_dashboard(payload, totals, rows, selected_plan, detected_plan, color))
+
+
+if __name__ == "__main__":
+    main()
