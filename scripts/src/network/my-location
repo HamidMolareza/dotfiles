@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_TIMEOUT_SECONDS = 15
+USER_AGENT = "my-location/1.0"
+
+HELP_MSG = f"""my-location: find your approximate location from your public IP address.
+
+Usage:
+  {Path(sys.argv[0]).name} [--json] [--proxy] [--no-proxy] [--timeout SECONDS]
+
+Options:
+  --json       Print normalized JSON instead of text.
+  --proxy      Honor standard proxy variables for this run. This is the default.
+  --no-proxy   Ignore standard proxy variables for this run.
+  --timeout    Per-request timeout in seconds. Default: {DEFAULT_TIMEOUT_SECONDS}
+  -h, --help   Show this help message and exit.
+
+Notes:
+  - The script uses external IP geolocation services.
+  - If you use a proxy or VPN, the reported location will be the proxy/VPN exit location.
+  - Standard proxy variables such as http_proxy and https_proxy are honored by default.
+"""
+
+
+def fetch_json(url: str, timeout_seconds: int, use_proxy: bool):
+    command = [
+        "curl",
+        "-4fsSL",
+        "--connect-timeout",
+        str(min(timeout_seconds, 10)),
+        "--max-time",
+        str(timeout_seconds),
+        "-H",
+        "Accept: application/json",
+        "-H",
+        f"User-Agent: {USER_AGENT}",
+    ]
+
+    if not use_proxy:
+        command.extend(["--noproxy", "*"])
+
+    command.append(url)
+
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def normalize_ident_me(data):
+    return {
+        "provider": "ident.me",
+        "ip": data.get("ip"),
+        "city": data.get("city"),
+        "region": None,
+        "country": data.get("country"),
+        "country_code": data.get("cc"),
+        "postal": data.get("postal"),
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "timezone": data.get("tz"),
+        "isp": data.get("aso"),
+    }
+
+
+def normalize_ipwhois(data):
+    if not data.get("success", True):
+        raise ValueError(data.get("message") or data.get("error") or "ipwho.is lookup failed.")
+
+    timezone = data.get("timezone") or {}
+    connection = data.get("connection") or {}
+
+    return {
+        "provider": "ipwho.is",
+        "ip": data.get("ip"),
+        "city": data.get("city"),
+        "region": data.get("region"),
+        "country": data.get("country"),
+        "country_code": data.get("country_code"),
+        "postal": data.get("postal"),
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "timezone": timezone.get("id"),
+        "isp": connection.get("isp"),
+    }
+
+
+def normalize_ipinfo(data):
+    latitude = None
+    longitude = None
+    loc = data.get("loc")
+    if isinstance(loc, str) and "," in loc:
+        latitude, longitude = loc.split(",", 1)
+
+    return {
+        "provider": "ipinfo.io",
+        "ip": data.get("ip"),
+        "city": data.get("city"),
+        "region": data.get("region"),
+        "country": data.get("country"),
+        "country_code": data.get("country"),
+        "postal": data.get("postal"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone": data.get("timezone"),
+        "isp": data.get("org"),
+    }
+
+
+def normalize_ip_api(data):
+    if data.get("status") != "success":
+        raise ValueError(data.get("message") or "ip-api.com lookup failed.")
+
+    return {
+        "provider": "ip-api.com",
+        "ip": data.get("query"),
+        "city": data.get("city"),
+        "region": data.get("regionName"),
+        "country": data.get("country"),
+        "country_code": data.get("countryCode"),
+        "postal": data.get("zip"),
+        "latitude": data.get("lat"),
+        "longitude": data.get("lon"),
+        "timezone": data.get("timezone"),
+        "isp": data.get("isp"),
+    }
+
+
+PROVIDERS = [
+    ("https://ident.me/json", normalize_ident_me),
+    ("https://ipwho.is/", normalize_ipwhois),
+    ("https://ipinfo.io/json", normalize_ipinfo),
+    ("http://ip-api.com/json/", normalize_ip_api),
+]
+
+
+def lookup_location(timeout_seconds: int, use_proxy: bool):
+    errors = []
+
+    for url, normalizer in PROVIDERS:
+        try:
+            return normalizer(fetch_json(url, timeout_seconds, use_proxy))
+        except (subprocess.CalledProcessError, FileNotFoundError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"{url}: {exc}")
+
+    raise RuntimeError("All location providers failed:\n- " + "\n- ".join(errors))
+
+
+def print_text(data):
+    lines = [
+        f"IP: {data.get('ip') or 'Unknown'}",
+        f"City: {data.get('city') or 'Unknown'}",
+        f"Region: {data.get('region') or 'Unknown'}",
+        f"Country: {data.get('country') or 'Unknown'}",
+        f"Country Code: {data.get('country_code') or 'Unknown'}",
+        f"Postal: {data.get('postal') or 'Unknown'}",
+        f"Coordinates: {data.get('latitude') or 'Unknown'}, {data.get('longitude') or 'Unknown'}",
+        f"Timezone: {data.get('timezone') or 'Unknown'}",
+        f"ISP: {data.get('isp') or 'Unknown'}",
+        f"Provider: {data.get('provider') or 'Unknown'}",
+    ]
+    print("\n".join(lines))
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(HELP_MSG)
+        sys.exit(0)
+
+    json_output = False
+    if "--json" in args:
+        json_output = True
+        args.remove("--json")
+
+    use_proxy = True
+    if "--proxy" in args:
+        use_proxy = True
+        args.remove("--proxy")
+
+    if "--no-proxy" in args:
+        use_proxy = False
+        args.remove("--no-proxy")
+
+    timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    if "--timeout" in args:
+        timeout_index = args.index("--timeout")
+        try:
+            timeout_seconds = int(args[timeout_index + 1])
+        except (IndexError, ValueError):
+            print("Error: --timeout requires an integer number of seconds.\n")
+            print(HELP_MSG)
+            sys.exit(1)
+        del args[timeout_index:timeout_index + 2]
+
+    if args:
+        print(f"Error: Unsupported arguments: {' '.join(args)}\n")
+        print(HELP_MSG)
+        sys.exit(1)
+
+    try:
+        data = lookup_location(timeout_seconds, use_proxy)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if json_output:
+        print(json.dumps(data, indent=2))
+    else:
+        print_text(data)
+
+
+if __name__ == "__main__":
+    main()

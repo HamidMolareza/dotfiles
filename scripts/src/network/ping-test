@@ -1,6 +1,6 @@
 #!/bin/bash
-# This script measures the latency of a socks proxy on port 9050 using curl
-# It accepts two optional arguments: the proxy address and the test URL
+# This script measures latency to a URL, optionally through a proxy.
+# It accepts two optional arguments: the proxy address and the test URL.
 # It prints the average time in milliseconds
 
 if ! command-exists curl; then
@@ -13,7 +13,7 @@ print_help() {
     echo "Usage: $(basename "$0") [proxy] [url]"
     echo "Example: $(basename "$0") socks5h://192.168.1.100:1080 https://www.google.com"
     echo "If no arguments are given, it will use the default values:"
-    echo "Proxy: ''"
+    echo "Proxy: current environment"
     echo "URL: https://www.bing.com"
 }
 
@@ -48,10 +48,15 @@ fi
 # Initialize the total time to zero
 total=0
 
+curl_args=()
+if [ -n "$proxy" ]; then
+    curl_args+=(--proxy "$proxy")
+fi
+
 # Loop through the trials
 for _ in $(seq 1 $trials); do
     # Use curl to measure the time and extract the value in milliseconds
-    time=$(curl -s -w "%{time_total}\n" -o /dev/null --proxy "$proxy" "$url" | awk '{printf "%.0f\n", $1 * 1000}')
+    time=$(curl -s -w "%{time_total}\n" -o /dev/null "${curl_args[@]}" "$url" | awk '{printf "%.0f\n", $1 * 1000}')
 
     # Add the time to the total
     total=$((total + time))

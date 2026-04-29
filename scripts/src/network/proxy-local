@@ -17,10 +17,10 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 HTTP_DEFAULT_PORT = 8899
 HTTPS_DEFAULT_PORT = 8900
@@ -66,6 +66,34 @@ BYTES_IN_MB = 1_000_000
 DASHBOARD_DEFAULT_BIND = "127.0.0.1"
 DASHBOARD_DEFAULT_PORT = 8898
 RECENT_REQUEST_LIMIT = 25
+HISTORY_DEFAULT_RANGE = "24h"
+HISTORY_RANGE_OPTIONS = {
+    "1h": {
+        "window": timedelta(hours=1),
+        "bucket_seconds": 300,
+        "label_format": "%H:%M",
+        "title": "Last hour",
+    },
+    "24h": {
+        "window": timedelta(hours=24),
+        "bucket_seconds": 3600,
+        "label_format": "%H:%M",
+        "title": "Last 24 hours",
+    },
+    "7d": {
+        "window": timedelta(days=7),
+        "bucket_seconds": 86400,
+        "label_format": "%m-%d",
+        "title": "Last 7 days",
+    },
+    "all": {
+        "window": None,
+        "bucket_seconds": 86400,
+        "label_format": "%Y-%m-%d",
+        "title": "All time",
+    },
+}
+HISTORY_TOP_DESTINATIONS_LIMIT = 8
 
 
 def supports_color(stream) -> bool:
@@ -1172,9 +1200,81 @@ class ThreadedDashboardServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler_class):
+    def __init__(self, server_address, handler_class, *, usage_log_path: Path | None):
         super().__init__(server_address, handler_class)
         self.dashboard_state = DASHBOARD_STATE
+        self.history_cache = UsageHistoryCache(usage_log_path)
+
+
+class UsageHistoryCache:
+    def __init__(self, log_file: Path | None):
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._file_id = None
+        self._offset = 0
+        self._records = []
+        self._invalid_lines = 0
+
+    def _reset(self):
+        self._file_id = None
+        self._offset = 0
+        self._records = []
+        self._invalid_lines = 0
+
+    def _load_if_needed(self):
+        if self.log_file is None:
+            self._reset()
+            return
+
+        try:
+            stat = self.log_file.stat()
+        except FileNotFoundError:
+            self._reset()
+            return
+
+        file_id = (getattr(stat, "st_dev", None), getattr(stat, "st_ino", None))
+        reload_full = self._file_id != file_id or stat.st_size < self._offset
+
+        if reload_full:
+            self._records = []
+            self._invalid_lines = 0
+            self._offset = 0
+
+        with self.log_file.open("r", encoding="utf-8") as stream:
+            if self._offset > 0:
+                stream.seek(self._offset)
+
+            for line in stream:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    self._records.append(json.loads(stripped))
+                except json.JSONDecodeError:
+                    self._invalid_lines += 1
+
+            self._offset = stream.tell()
+            self._file_id = file_id
+
+    def build_history_payload(
+        self,
+        *,
+        range_key: str,
+        proxy_type: str | None = None,
+        client: str | None = None,
+    ):
+        with self._lock:
+            self._load_if_needed()
+            records = list(self._records)
+            invalid_lines = self._invalid_lines
+
+        return summarize_history_records(
+            records,
+            invalid_lines=invalid_lines,
+            range_key=range_key,
+            proxy_type=proxy_type,
+            client=client,
+        )
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -1185,7 +1285,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             debug_log("dashboard", fmt % args, level="INFO")
 
     def do_GET(self):
-        if self.path in {"/api/dashboard", "/api/dashboard.json"}:
+        parsed = urlsplit(self.path)
+        route_path = parsed.path
+
+        if route_path in {"/api/dashboard", "/api/dashboard.json"}:
             snapshot = self.server.dashboard_state.snapshot()
             payload = json.dumps(snapshot, sort_keys=True).encode("utf-8")
             self.send_response(200)
@@ -1196,12 +1299,32 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        if self.path not in {"/", "/index.html"}:
+        if route_path in {"/api/history", "/api/history.json"}:
+            query = parse_qs(parsed.query)
+            range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
+            proxy_type = normalize_history_filter(first_query_value(query, "proxy_type"))
+            client = normalize_history_filter(first_query_value(query, "client"))
+            payload = self.server.history_cache.build_history_payload(
+                range_key=range_key,
+                proxy_type=proxy_type,
+                client=client,
+            )
+            body = json.dumps(payload, sort_keys=True).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if route_path not in {"/", "/index.html"}:
             self.send_error(404, "Not Found")
             return
 
         snapshot = self.server.dashboard_state.snapshot()
-        document = render_dashboard_html(snapshot)
+        history_snapshot = self.server.history_cache.build_history_payload(range_key=HISTORY_DEFAULT_RANGE)
+        document = render_dashboard_html(snapshot, history_snapshot)
         body = document.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1369,7 +1492,7 @@ def print_usage_summary(label: str, summary):
     print(f"  Total:    {format_mb(summary['total_bytes'])} ({summary['total_bytes']} bytes)")
 
 
-def load_usage_records(log_file: Path):
+def load_usage_records(log_file: Path, *, log_invalid: bool = True):
     records = []
     invalid_lines = 0
 
@@ -1383,15 +1506,170 @@ def load_usage_records(log_file: Path):
                     records.append(json.loads(stripped))
                 except json.JSONDecodeError:
                     invalid_lines += 1
-                    debug_log(
-                        "usage-analyze",
-                        f"skipping invalid JSON line {line_number} from {log_file}",
-                        level="WARNING",
-                    )
+                    if log_invalid:
+                        debug_log(
+                            "usage-analyze",
+                            f"skipping invalid JSON line {line_number} from {log_file}",
+                            level="WARNING",
+                        )
     except FileNotFoundError as exc:
         raise SystemExit(f"Error: usage log file not found: {log_file}") from exc
 
     return records, invalid_lines
+
+
+def first_query_value(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    if not values:
+        return None
+    return values[0]
+
+
+def normalize_history_filter(value: str | None) -> str | None:
+    if value in {None, "", "all"}:
+        return None
+    return value
+
+
+def parse_usage_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def bucket_datetime(value: datetime, bucket_seconds: int) -> datetime:
+    bucket_epoch = int(value.timestamp()) // bucket_seconds * bucket_seconds
+    return datetime.fromtimestamp(bucket_epoch, tz=value.tzinfo)
+
+
+def summarize_history_records(
+    records,
+    *,
+    invalid_lines: int,
+    range_key: str,
+    proxy_type: str | None = None,
+    client: str | None = None,
+):
+    config = HISTORY_RANGE_OPTIONS.get(range_key, HISTORY_RANGE_OPTIONS[HISTORY_DEFAULT_RANGE])
+    now = datetime.now().astimezone()
+    window = config["window"]
+    cutoff = now - window if window is not None else None
+
+    summary = empty_usage_summary()
+    buckets = {}
+    destinations = {}
+    available_proxy_types = set()
+    selected_timestamps = []
+
+    for record in records:
+        record_proxy_type = record.get("proxy_type", "unknown")
+        available_proxy_types.add(record_proxy_type)
+
+        if proxy_type is not None and record_proxy_type != proxy_type:
+            continue
+        if client is not None and record.get("client") != client:
+            continue
+
+        timestamp = parse_usage_timestamp(record.get("timestamp"))
+        if timestamp is None:
+            continue
+        if cutoff is not None and timestamp < cutoff:
+            continue
+
+        uploaded_bytes = int(record.get("uploaded_bytes", 0))
+        downloaded_bytes = int(record.get("downloaded_bytes", 0))
+        total_bytes = int(record.get("total_bytes", uploaded_bytes + downloaded_bytes))
+
+        summary["count"] += 1
+        summary["uploaded_bytes"] += uploaded_bytes
+        summary["downloaded_bytes"] += downloaded_bytes
+        summary["total_bytes"] += total_bytes
+        selected_timestamps.append(timestamp)
+
+        bucket_start = bucket_datetime(timestamp, config["bucket_seconds"])
+        bucket_key = bucket_start.isoformat()
+        bucket_summary = buckets.setdefault(
+            bucket_key,
+            {
+                "start_at": bucket_key,
+                "label": bucket_start.strftime(config["label_format"]),
+                "count": 0,
+                "uploaded_bytes": 0,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+            },
+        )
+        bucket_summary["count"] += 1
+        bucket_summary["uploaded_bytes"] += uploaded_bytes
+        bucket_summary["downloaded_bytes"] += downloaded_bytes
+        bucket_summary["total_bytes"] += total_bytes
+
+        destination = record.get("destination", "unknown")
+        destination_summary = destinations.setdefault(
+            destination,
+            {
+                "destination": destination,
+                "count": 0,
+                "uploaded_bytes": 0,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+            },
+        )
+        destination_summary["count"] += 1
+        destination_summary["uploaded_bytes"] += uploaded_bytes
+        destination_summary["downloaded_bytes"] += downloaded_bytes
+        destination_summary["total_bytes"] += total_bytes
+
+    series = []
+    if selected_timestamps:
+        if cutoff is not None:
+            start_bucket = bucket_datetime(cutoff, config["bucket_seconds"])
+        else:
+            start_bucket = bucket_datetime(min(selected_timestamps), config["bucket_seconds"])
+        end_bucket = bucket_datetime(max(selected_timestamps), config["bucket_seconds"])
+        cursor = start_bucket
+        while cursor <= end_bucket:
+            bucket_key = cursor.isoformat()
+            series.append(
+                buckets.get(
+                    bucket_key,
+                    {
+                        "start_at": bucket_key,
+                        "label": cursor.strftime(config["label_format"]),
+                        "count": 0,
+                        "uploaded_bytes": 0,
+                        "downloaded_bytes": 0,
+                        "total_bytes": 0,
+                    },
+                )
+            )
+            cursor += timedelta(seconds=config["bucket_seconds"])
+
+    top_destinations = sorted(
+        destinations.values(),
+        key=lambda item: (-item["total_bytes"], -item["count"], item["destination"]),
+    )[:HISTORY_TOP_DESTINATIONS_LIMIT]
+
+    return {
+        "range": range_key if range_key in HISTORY_RANGE_OPTIONS else HISTORY_DEFAULT_RANGE,
+        "range_title": config["title"],
+        "proxy_type": proxy_type or "all",
+        "client": client or "all",
+        "summary": summary,
+        "series": series,
+        "top_destinations": top_destinations,
+        "invalid_lines": invalid_lines,
+        "available_proxy_types": sorted(available_proxy_types),
+        "has_log_data": bool(records),
+        "matched_records": summary["count"],
+        "time_range": {
+            "from": min(selected_timestamps).isoformat() if selected_timestamps else None,
+            "to": max(selected_timestamps).isoformat() if selected_timestamps else None,
+        },
+    }
 
 
 def run_usage_analyze(argv):
@@ -1544,7 +1822,97 @@ def render_recent_requests(snapshot) -> str:
     )
 
 
-def render_dashboard_html(snapshot) -> str:
+def format_chart_timestamp_label(timestamp: str) -> str:
+    try:
+        return datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+    except ValueError:
+        return timestamp
+
+
+def build_usage_chart_points(snapshot, limit: int = 12):
+    recent_requests = snapshot.get("recent_requests", [])
+    if not recent_requests:
+        return []
+
+    points = []
+    for request in reversed(recent_requests[:limit]):
+        points.append(
+            {
+                "label": format_chart_timestamp_label(request["timestamp"]),
+                "uploaded_bytes": int(request["uploaded_bytes"]),
+                "downloaded_bytes": int(request["downloaded_bytes"]),
+                "total_bytes": int(request["total_bytes"]),
+            }
+        )
+    return points
+
+
+def render_usage_chart(snapshot) -> str:
+    points = build_usage_chart_points(snapshot)
+    if not points:
+        return "<div class='empty'>No recent traffic yet.</div>"
+
+    svg_width = 720
+    svg_height = 220
+    padding_top = 14
+    padding_right = 12
+    padding_bottom = 40
+    padding_left = 12
+    inner_width = svg_width - padding_left - padding_right
+    inner_height = svg_height - padding_top - padding_bottom
+    slot_width = inner_width / len(points)
+    bar_width = min(max(slot_width * 0.58, 10), 34)
+    max_total = max(point["total_bytes"] for point in points) or 1
+    tick_every = max(1, (len(points) + 2) // 4)
+
+    bars = []
+    labels = []
+    for index, point in enumerate(points):
+        x = padding_left + (slot_width * index) + ((slot_width - bar_width) / 2)
+        download_height = (point["downloaded_bytes"] / max_total) * inner_height
+        upload_height = (point["uploaded_bytes"] / max_total) * inner_height
+        y_base = padding_top + inner_height
+        download_y = y_base - download_height
+        upload_y = download_y - upload_height
+
+        bars.append(
+            f"<rect class='chart-download' x='{x:.2f}' y='{download_y:.2f}' "
+            f"width='{bar_width:.2f}' height='{download_height:.2f}' rx='5' ry='5'>"
+            f"<title>{html.escape(point['label'])} download {format_mb(point['downloaded_bytes'])}</title>"
+            "</rect>"
+        )
+        if upload_height > 0:
+            bars.append(
+                f"<rect class='chart-upload' x='{x:.2f}' y='{upload_y:.2f}' "
+                f"width='{bar_width:.2f}' height='{upload_height:.2f}' rx='5' ry='5'>"
+                f"<title>{html.escape(point['label'])} upload {format_mb(point['uploaded_bytes'])}</title>"
+                "</rect>"
+            )
+
+        if index % tick_every == 0 or index == len(points) - 1:
+            labels.append(
+                f"<text class='chart-label' x='{x + (bar_width / 2):.2f}' y='{svg_height - 14}' "
+                f"text-anchor='middle'>{html.escape(point['label'])}</text>"
+            )
+
+    return (
+        "<div class='chart-shell'>"
+        "<div class='chart-legend'>"
+        "<span><i class='legend-swatch legend-upload'></i>Upload</span>"
+        "<span><i class='legend-swatch legend-download'></i>Download</span>"
+        "</div>"
+        f"<svg class='usage-chart-svg' viewBox='0 0 {svg_width} {svg_height}' "
+        "role='img' aria-label='Recent traffic by request'>"
+        f"<line class='chart-axis' x1='{padding_left}' y1='{padding_top + inner_height}' "
+        f"x2='{svg_width - padding_right}' y2='{padding_top + inner_height}'></line>"
+        f"{''.join(bars)}"
+        f"{''.join(labels)}"
+        "</svg>"
+        "</div>"
+    )
+
+
+def render_dashboard_html(snapshot, history_snapshot) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1643,9 +2011,59 @@ def render_dashboard_html(snapshot) -> str:
       width: 100%;
       overflow-x: auto;
     }}
+    .controls {{
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 0.85rem;
+      margin-bottom: 0.4rem;
+    }}
+    .control {{
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      min-width: 9rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }}
+    .control select {{
+      border: 1px solid #d8d1c2;
+      border-radius: 10px;
+      background: #fffdf8;
+      color: var(--text);
+      padding: 0.6rem 0.75rem;
+      font: inherit;
+    }}
+    .usage-chart {{ grid-column: span 7; }}
     .latest {{ grid-column: span 5; }}
-    .clients {{ grid-column: span 3; }}
-    .totals {{ grid-column: span 4; }}
+    .clients {{ grid-column: span 4; }}
+    .totals {{ grid-column: span 8; }}
+    .history {{ grid-column: 1 / -1; }}
+    .history-summary {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 0.75rem;
+      margin-top: 0.35rem;
+    }}
+    .history-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 2.1fr) minmax(280px, 1fr);
+      gap: 1rem;
+      margin-top: 0.9rem;
+      align-items: start;
+    }}
+    .subpanel {{
+      padding: 0.9rem;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fff 0%, #f6f4ed 100%);
+      border: 1px solid #e8e0d1;
+      min-width: 0;
+    }}
+    .subpanel h3 {{
+      margin: 0 0 0.8rem;
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+    }}
     .recent {{ grid-column: 1 / -1; }}
     table {{
       width: 100%;
@@ -1702,8 +2120,63 @@ def render_dashboard_html(snapshot) -> str:
       padding: 0.6rem 0.35rem;
       white-space: nowrap;
     }}
+    .chart-shell {{
+      margin-top: 0.85rem;
+    }}
+    .chart-legend {{
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.6rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    .chart-legend span {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }}
+    .legend-swatch {{
+      width: 0.85rem;
+      height: 0.85rem;
+      border-radius: 999px;
+      display: inline-block;
+    }}
+    .legend-upload {{
+      background: #116466;
+    }}
+    .legend-download {{
+      background: #7cc6bb;
+    }}
+    .usage-chart-svg {{
+      width: 100%;
+      height: auto;
+      display: block;
+      overflow: visible;
+    }}
+    .chart-axis {{
+      stroke: #d9d2c3;
+      stroke-width: 1;
+    }}
+    .chart-upload {{
+      fill: #116466;
+    }}
+    .chart-download {{
+      fill: #7cc6bb;
+    }}
+    .chart-label {{
+      fill: #6a6f73;
+      font-size: 12px;
+      font-family: "IBM Plex Sans", "Noto Sans", sans-serif;
+    }}
+    .history-note {{
+      margin-top: 0.45rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
     @media (max-width: 900px) {{
-      .latest, .clients, .totals {{ grid-column: 1 / -1; }}
+      .usage-chart, .latest, .clients, .totals {{ grid-column: 1 / -1; }}
+      .history-grid {{ grid-template-columns: 1fr; }}
       .hero {{ flex-direction: column; align-items: start; }}
     }}
   </style>
@@ -1719,6 +2192,42 @@ def render_dashboard_html(snapshot) -> str:
     </section>
     <section class="grid">
       <div class="cards" id="summary-cards">{render_summary_cards(snapshot)}</div>
+      <section class="panel history">
+        <h2>History</h2>
+        <div class="controls">
+          <label class="control">
+            <span>Range</span>
+            <select id="history-range">
+              <option value="1h">Last hour</option>
+              <option value="24h" selected>Last 24 hours</option>
+              <option value="7d">Last 7 days</option>
+              <option value="all">All time</option>
+            </select>
+          </label>
+          <label class="control">
+            <span>Proxy</span>
+            <select id="history-proxy-type">
+              <option value="all">All proxies</option>
+            </select>
+          </label>
+        </div>
+        <div class="history-summary" id="history-summary"></div>
+        <div class="history-note" id="history-note"></div>
+        <div class="history-grid">
+          <section class="subpanel">
+            <h3>Traffic over time</h3>
+            <div id="history-chart"></div>
+          </section>
+          <section class="subpanel">
+            <h3>Top destinations</h3>
+            <div id="history-destinations"></div>
+          </section>
+        </div>
+      </section>
+      <section class="panel usage-chart">
+        <h2>Recent traffic</h2>
+        <div id="usage-chart">{render_usage_chart(snapshot)}</div>
+      </section>
       <section class="panel latest">
         <h2>Latest request</h2>
         <div id="latest-request">{render_latest_request(snapshot)}</div>
@@ -1748,11 +2257,19 @@ def render_dashboard_html(snapshot) -> str:
     const PROXY_TYPES = ["http", "https", "socks5"];
     const bytesInMb = 1000000;
     const summaryCardsElement = document.getElementById("summary-cards");
+    const historyRangeElement = document.getElementById("history-range");
+    const historyProxyTypeElement = document.getElementById("history-proxy-type");
+    const historySummaryElement = document.getElementById("history-summary");
+    const historyNoteElement = document.getElementById("history-note");
+    const historyChartElement = document.getElementById("history-chart");
+    const historyDestinationsElement = document.getElementById("history-destinations");
+    const usageChartElement = document.getElementById("usage-chart");
     const latestRequestElement = document.getElementById("latest-request");
     const activeClientsElement = document.getElementById("active-clients");
     const totalsTableElement = document.getElementById("totals-table");
     const recentRequestsElement = document.getElementById("recent-requests");
     const statusElement = document.getElementById("dashboard-status");
+    const INITIAL_HISTORY_SNAPSHOT = {json.dumps(history_snapshot, sort_keys=True)};
 
     function escapeHtml(value) {{
       return String(value)
@@ -1776,6 +2293,31 @@ def render_dashboard_html(snapshot) -> str:
       }};
     }}
 
+    function formatChartTimestampLabel(timestamp) {{
+      const date = new Date(timestamp);
+      if (Number.isNaN(date.getTime())) {{
+        return String(timestamp);
+      }}
+      return date.toLocaleTimeString([], {{
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }});
+    }}
+
+    function buildUsageChartPoints(snapshot, limit = 12) {{
+      const recentRequests = snapshot.recent_requests || [];
+      return recentRequests
+        .slice(0, limit)
+        .reverse()
+        .map((request) => ({{
+          label: formatChartTimestampLabel(request.timestamp),
+          uploaded_bytes: Number(request.uploaded_bytes) || 0,
+          downloaded_bytes: Number(request.downloaded_bytes) || 0,
+          total_bytes: Number(request.total_bytes) || 0,
+        }}));
+    }}
+
     function renderSummaryCards(snapshot) {{
       const overall = snapshot.overall;
       const activeTotal = Object.values(snapshot.active_by_proxy).reduce((sum, count) => sum + count, 0);
@@ -1793,6 +2335,154 @@ def render_dashboard_html(snapshot) -> str:
           <div class="card-value">${{escapeHtml(value)}}</div>
         </div>
       `).join("");
+    }}
+
+    function renderHistorySummary(history) {{
+      const summary = history.summary || emptyUsageSummary();
+      const cards = [
+        ["Range", history.range_title || "History"],
+        ["Matched requests", String(summary.count || 0)],
+        ["Total traffic", formatMb(summary.total_bytes || 0)],
+        ["Upload", formatMb(summary.uploaded_bytes || 0)],
+        ["Download", formatMb(summary.downloaded_bytes || 0)],
+      ];
+      historySummaryElement.innerHTML = cards.map(([label, value]) => `
+        <div class="card">
+          <div class="card-label">${{escapeHtml(label)}}</div>
+          <div class="card-value">${{escapeHtml(value)}}</div>
+        </div>
+      `).join("");
+    }}
+
+    function syncHistoryProxyOptions(history) {{
+      const proxies = history.available_proxy_types || [];
+      const previousValue = historyProxyTypeElement.value || "all";
+      historyProxyTypeElement.innerHTML = `
+        <option value="all">All proxies</option>
+        ${{proxies.map((proxyType) => `
+          <option value="${{escapeHtml(proxyType)}}">${{escapeHtml(proxyType)}}</option>
+        `).join("")}}
+      `;
+      historyProxyTypeElement.value = proxies.includes(previousValue) || previousValue === "all"
+        ? previousValue
+        : "all";
+    }}
+
+    function renderHistoryNote(history) {{
+      const notes = [];
+      if (history.time_range && history.time_range.from && history.time_range.to) {{
+        notes.push(`${{history.time_range.from}} -> ${{history.time_range.to}}`);
+      }}
+      if (history.invalid_lines) {{
+        notes.push(`Skipped invalid log lines: ${{history.invalid_lines}}`);
+      }}
+      historyNoteElement.textContent = notes.join(" · ") || "Built from the append-only usage log.";
+    }}
+
+    function renderBucketChart(targetElement, series, emptyMessage) {{
+      if (!series.length) {{
+        targetElement.innerHTML = `<div class="empty">${{escapeHtml(emptyMessage)}}</div>`;
+        return;
+      }}
+
+      const svgWidth = 720;
+      const svgHeight = 220;
+      const paddingTop = 14;
+      const paddingRight = 12;
+      const paddingBottom = 40;
+      const paddingLeft = 12;
+      const innerWidth = svgWidth - paddingLeft - paddingRight;
+      const innerHeight = svgHeight - paddingTop - paddingBottom;
+      const slotWidth = innerWidth / series.length;
+      const barWidth = Math.min(Math.max(slotWidth * 0.58, 10), 34);
+      const maxTotal = Math.max(...series.map((point) => Number(point.total_bytes) || 0), 1);
+      const tickEvery = Math.max(1, Math.floor((series.length + 2) / 4));
+
+      const bars = [];
+      const labels = [];
+
+      series.forEach((point, index) => {{
+        const uploadedBytes = Number(point.uploaded_bytes) || 0;
+        const downloadedBytes = Number(point.downloaded_bytes) || 0;
+        const x = paddingLeft + (slotWidth * index) + ((slotWidth - barWidth) / 2);
+        const downloadHeight = (downloadedBytes / maxTotal) * innerHeight;
+        const uploadHeight = (uploadedBytes / maxTotal) * innerHeight;
+        const yBase = paddingTop + innerHeight;
+        const downloadY = yBase - downloadHeight;
+        const uploadY = downloadY - uploadHeight;
+
+        bars.push(`
+          <rect class="chart-download" x="${{x.toFixed(2)}}" y="${{downloadY.toFixed(2)}}"
+                width="${{barWidth.toFixed(2)}}" height="${{downloadHeight.toFixed(2)}}" rx="5" ry="5">
+            <title>${{escapeHtml(point.label)}} download ${{escapeHtml(formatMb(downloadedBytes))}}</title>
+          </rect>
+        `);
+
+        if (uploadHeight > 0) {{
+          bars.push(`
+            <rect class="chart-upload" x="${{x.toFixed(2)}}" y="${{uploadY.toFixed(2)}}"
+                  width="${{barWidth.toFixed(2)}}" height="${{uploadHeight.toFixed(2)}}" rx="5" ry="5">
+              <title>${{escapeHtml(point.label)}} upload ${{escapeHtml(formatMb(uploadedBytes))}}</title>
+            </rect>
+          `);
+        }}
+
+        if (index % tickEvery === 0 || index === series.length - 1) {{
+          labels.push(`
+            <text class="chart-label" x="${{(x + (barWidth / 2)).toFixed(2)}}" y="${{svgHeight - 14}}" text-anchor="middle">
+              ${{escapeHtml(point.label)}}
+            </text>
+          `);
+        }}
+      }});
+
+      targetElement.innerHTML = `
+        <div class="chart-shell">
+          <div class="chart-legend">
+            <span><i class="legend-swatch legend-upload"></i>Upload</span>
+            <span><i class="legend-swatch legend-download"></i>Download</span>
+          </div>
+          <svg class="usage-chart-svg" viewBox="0 0 ${{svgWidth}} ${{svgHeight}}" role="img" aria-label="Traffic over time">
+            <line class="chart-axis" x1="${{paddingLeft}}" y1="${{paddingTop + innerHeight}}" x2="${{svgWidth - paddingRight}}" y2="${{paddingTop + innerHeight}}"></line>
+            ${{bars.join("")}}
+            ${{labels.join("")}}
+          </svg>
+        </div>
+      `;
+    }}
+
+    function renderHistoryChart(history) {{
+      renderBucketChart(historyChartElement, history.series || [], "No historical traffic matched this filter.");
+    }}
+
+    function renderHistoryDestinations(history) {{
+      const destinations = history.top_destinations || [];
+      if (!destinations.length) {{
+        historyDestinationsElement.innerHTML = "<div class='empty'>No destinations matched this filter.</div>";
+        return;
+      }}
+
+      historyDestinationsElement.innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Destination</th><th>Requests</th><th>Total</th></tr>
+          </thead>
+          <tbody>
+            ${{destinations.map((item) => `
+              <tr>
+                <td class="destination">${{escapeHtml(item.destination)}}</td>
+                <td>${{item.count}}</td>
+                <td>${{escapeHtml(formatMb(item.total_bytes))}}</td>
+              </tr>
+            `).join("")}}
+          </tbody>
+        </table>
+      `;
+    }}
+
+    function renderUsageChart(snapshot) {{
+      const points = buildUsageChartPoints(snapshot);
+      renderBucketChart(usageChartElement, points, "No recent traffic yet.");
     }}
 
     function renderLatestRequest(snapshot) {{
@@ -1886,15 +2576,50 @@ def render_dashboard_html(snapshot) -> str:
 
     function renderDashboard(snapshot) {{
       renderSummaryCards(snapshot);
+      renderUsageChart(snapshot);
       renderLatestRequest(snapshot);
       renderActiveClients(snapshot);
       renderTotalsTable(snapshot);
       renderRecentRequests(snapshot);
     }}
 
+    function renderHistory(history) {{
+      syncHistoryProxyOptions(history);
+      renderHistorySummary(history);
+      renderHistoryNote(history);
+      renderHistoryChart(history);
+      renderHistoryDestinations(history);
+    }}
+
     function setStatus(text, isWarning = false) {{
       statusElement.textContent = text;
       statusElement.classList.toggle("pill-warning", isWarning);
+    }}
+
+    function setHistoryError(message) {{
+      historyNoteElement.textContent = message;
+      historyChartElement.innerHTML = `<div class="empty">${{escapeHtml(message)}}</div>`;
+      historyDestinationsElement.innerHTML = "<div class='empty'>History data is unavailable right now.</div>";
+    }}
+
+    async function refreshHistory() {{
+      const params = new URLSearchParams();
+      params.set("range", historyRangeElement.value);
+      if (historyProxyTypeElement.value !== "all") {{
+        params.set("proxy_type", historyProxyTypeElement.value);
+      }}
+
+      const response = await fetch(`/api/history?${{params.toString()}}`, {{
+        cache: "no-store",
+        headers: {{
+          "Accept": "application/json"
+        }}
+      }});
+      if (!response.ok) {{
+        throw new Error(`history HTTP ${{response.status}}`);
+      }}
+      const history = await response.json();
+      renderHistory(history);
     }}
 
     async function refreshDashboard() {{
@@ -1916,8 +2641,21 @@ def render_dashboard_html(snapshot) -> str:
       }} catch (error) {{
         setStatus(`Live updates paused: ${{error.message}}`, true);
       }}
+
+      try {{
+        await refreshHistory();
+      }} catch (error) {{
+        setHistoryError(`History refresh paused: ${{error.message}}`);
+      }}
     }}
 
+    renderHistory(INITIAL_HISTORY_SNAPSHOT);
+    historyRangeElement.addEventListener("change", () => {{
+      refreshHistory().catch((error) => setHistoryError(`History refresh paused: ${{error.message}}`));
+    }});
+    historyProxyTypeElement.addEventListener("change", () => {{
+      refreshHistory().catch((error) => setHistoryError(`History refresh paused: ${{error.message}}`));
+    }});
     setStatus("Connecting to live dashboard…");
     window.setTimeout(refreshDashboard, 0);
     window.setInterval(refreshDashboard, 2000);
@@ -1927,13 +2665,14 @@ def render_dashboard_html(snapshot) -> str:
 """
 
 
-def start_dashboard_server(args):
+def start_dashboard_server(args, usage_log_path: Path | None):
     if args.no_dashboard:
         return None
 
     server = ThreadedDashboardServer(
         (args.dashboard_bind, args.dashboard_port),
         DashboardRequestHandler,
+        usage_log_path=usage_log_path,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2198,7 +2937,7 @@ def main():
     dashboard = None
     if not args.no_dashboard:
         try:
-            dashboard = start_dashboard_server(args)
+            dashboard = start_dashboard_server(args, usage_log_path)
         except OSError as exc:
             print_warning(
                 f"Dashboard could not start on {args.dashboard_bind}:{args.dashboard_port}: {exc}"

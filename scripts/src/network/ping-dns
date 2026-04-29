@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+print_help() {
+    cat <<'HELP'
+Usage: ping-dns [options] <host> <dns_server> [-- <ping args...>]
+
+Resolve a host using the given DNS server, then ping the resolved IP.
+
+Options:
+  -4            Resolve an A record and force IPv4 ping (default)
+  -6            Resolve an AAAA record and force IPv6 ping
+  -c <count>    Set ping packet count
+  -h, --help    Show this help message
+
+Examples:
+  ping-dns example.com 1.1.1.1
+  ping-dns -c 4 example.com 8.8.8.8
+  ping-dns -6 example.com 2606:4700:4700::1111
+  ping-dns example.com 1.1.1.1 -- -i 0.2 -W 2
+HELP
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Error: required command not found: $1" >&2
+        exit 1
+    fi
+}
+
+family="4"
+ping_count=""
+
+while (($# > 0)); do
+    case "$1" in
+        -4)
+            family="4"
+            shift
+            ;;
+        -6)
+            family="6"
+            shift
+            ;;
+        -c)
+            if (($# < 2)); then
+                echo "Error: -c requires a value." >&2
+                exit 1
+            fi
+            ping_count="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            echo >&2
+            print_help >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if (($# < 2)); then
+    echo "Error: host and dns_server are required." >&2
+    echo >&2
+    print_help >&2
+    exit 1
+fi
+
+host="$1"
+dns_server="$2"
+shift 2
+
+require_command dig
+require_command ping
+
+record_type="A"
+ping_family_arg="-4"
+if [[ "$family" == "6" ]]; then
+    record_type="AAAA"
+    ping_family_arg="-6"
+fi
+
+resolved_ip="$(dig +short "$host" @"$dns_server" "$record_type" | awk 'NF { print; exit }')"
+
+if [[ -z "$resolved_ip" ]]; then
+    echo "Error: could not resolve $host using DNS server $dns_server for $record_type records." >&2
+    exit 1
+fi
+
+ping_args=(-n "$ping_family_arg")
+
+if [[ -n "$ping_count" ]]; then
+    ping_args+=(-c "$ping_count")
+fi
+
+if (($# > 0)); then
+    ping_args+=("$@")
+fi
+
+ping_args+=("$resolved_ip")
+
+echo "Resolved $host to $resolved_ip using DNS server $dns_server ($record_type)." >&2
+exec ping "${ping_args[@]}"

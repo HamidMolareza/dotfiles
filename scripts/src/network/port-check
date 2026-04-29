@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    bold='\033[1m'
+    dim='\033[2m'
+    red='\033[31m'
+    green='\033[32m'
+    yellow='\033[33m'
+    blue='\033[34m'
+    magenta='\033[35m'
+    cyan='\033[36m'
+    reset='\033[0m'
+else
+    bold=''
+    dim=''
+    red=''
+    green=''
+    yellow=''
+    blue=''
+    magenta=''
+    cyan=''
+    reset=''
+fi
+
+script_name="$(basename "$0")"
+
+print_help() {
+    printf "%b\n" "${bold}${cyan}port-check${reset} ${dim}— quick TCP port probe${reset}"
+    echo
+    printf "%b\n" "${bold}Usage:${reset} $script_name <host> <port> [timeout_seconds]"
+    echo
+    printf "%b\n" "${bold}Examples:${reset}"
+    printf "  %s\n" "$script_name 213.176.122.107 80"
+    printf "  %s\n" "$script_name example.com 443 3"
+    echo
+    printf "%b\n" "${bold}Notes:${reset}"
+    printf "  %s\n" "Exit code 0 means open; exit code 1 means closed or unreachable."
+    printf "  %s\n" "Set NO_COLOR=1 to disable colors."
+}
+
+error() {
+    printf "%b\n" "${red}✘${reset} $1" >&2
+}
+
+info() {
+    printf "%b\n" "${blue}•${reset} $1"
+}
+
+success() {
+    printf "%b\n" "${green}✔${reset} $1"
+}
+
+warn() {
+    printf "%b\n" "${yellow}▲${reset} $1"
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    print_help
+    exit 0
+fi
+
+if ! command -v nc >/dev/null 2>&1; then
+    error "nc is not installed. Please install netcat before running this script."
+    exit 1
+fi
+
+host="${1:-}"
+port="${2:-}"
+timeout_seconds="${3:-5}"
+
+if [[ -z "$host" || -z "$port" ]]; then
+    print_help >&2
+    exit 1
+fi
+
+if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    error "port must be an integer between 1 and 65535."
+    exit 1
+fi
+
+if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 1 )); then
+    error "timeout_seconds must be a positive integer."
+    exit 1
+fi
+
+printf "%b\n" "${bold}${magenta}┌─ Port Check ─────────────────────────┐${reset}"
+printf "  %b %s\n" "${cyan}Host:${reset}" "$host"
+printf "  %b %s\n" "${cyan}Port:${reset}" "$port"
+printf "  %b %ss\n" "${cyan}Timeout:${reset}" "$timeout_seconds"
+printf "%b\n" "${bold}${magenta}└──────────────────────────────────────┘${reset}"
+
+info "Probing TCP connection..."
+
+if nc -z -w "$timeout_seconds" "$host" "$port" >/dev/null 2>&1; then
+    success "OPEN ${bold}$host:$port${reset} ${dim}(TCP connection succeeded)${reset}"
+    exit 0
+fi
+
+warn "CLOSED OR UNREACHABLE ${bold}$host:$port${reset} ${dim}(TCP connection failed or timed out)${reset}"
+exit 1

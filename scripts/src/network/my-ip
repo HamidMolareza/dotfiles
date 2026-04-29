@@ -5,6 +5,6 @@ if ! command-exists curl; then
     exit 1
 fi
 
-curl https://ident.me/
+curl https://ident.me/ || exit $?
 
 echo ""

@@ -1,0 +1,108 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is not installed. Please install it before running this script."
+    exit 1
+fi
+
+if ! command -v awk >/dev/null 2>&1; then
+    echo "Error: awk is not installed. Please install it before running this script."
+    exit 1
+fi
+
+print_help() {
+    echo "Usage: $(basename "$0") [proxy_or_port] [download_url] [probe_url]"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0")"
+    echo "  $(basename "$0") 10811"
+    echo "  $(basename "$0") socks5h://127.0.0.1:10811"
+    echo "  $(basename "$0") http://127.0.0.1:10811 https://speed.cloudflare.com/__down?bytes=50000000"
+    echo ""
+    echo "Defaults:"
+    echo "  proxy: current environment"
+    echo "  download_url: https://speed.cloudflare.com/__down?bytes=25000000"
+    echo "  probe_url: https://www.google.com/generate_204"
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
+    print_help
+    exit 0
+fi
+
+proxy_input="${1:-}"
+download_url="${2:-https://speed.cloudflare.com/__down?bytes=25000000}"
+probe_url="${3:-https://www.google.com/generate_204}"
+
+if [ -z "$proxy_input" ]; then
+    proxy=""
+elif [[ "$proxy_input" =~ ^[0-9]+$ ]]; then
+    proxy="socks5h://127.0.0.1:${proxy_input}"
+else
+    proxy="$proxy_input"
+fi
+
+describe_dns_mode() {
+    case "$1" in
+        socks5h://*|socks4a://*)
+            echo "proxy-side DNS expected"
+            ;;
+        socks5://*|socks4://*)
+            echo "local DNS likely before proxy"
+            ;;
+        http://*|https://*)
+            echo "proxy-side DNS is usually used for HTTP(S) requests"
+            ;;
+        *)
+            echo "DNS behavior depends on the client and proxy type"
+            ;;
+    esac
+}
+
+run_curl() {
+    local curl_args=(
+        --silent
+        --show-error
+        --location
+        --connect-timeout
+        10
+        --max-time
+        120
+    )
+
+    if [ -n "$proxy" ]; then
+        curl_args+=(--proxy "$proxy")
+    fi
+
+    curl "${curl_args[@]}" "$@"
+}
+
+proxy_ip="$(run_curl https://ident.me || true)"
+
+if [ -z "$proxy_ip" ]; then
+    echo "Error: failed to reach the IP probe."
+    exit 1
+fi
+
+latency_ms="$(
+    run_curl --output /dev/null --write-out '%{time_starttransfer}' "$probe_url" \
+        | awk '{printf "%.0f", $1 * 1000}'
+)"
+
+download_bps="$(
+    run_curl --output /dev/null --write-out '%{speed_download}' "$download_url"
+)"
+
+download_mibps="$(awk -v bps="$download_bps" 'BEGIN {printf "%.2f", bps / 1024 / 1024}')"
+download_mbps="$(awk -v bps="$download_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')"
+
+echo "Proxy: ${proxy:-current environment}"
+echo "Proxy IP: $proxy_ip"
+if [ -n "$proxy" ]; then
+    echo "DNS mode: $(describe_dns_mode "$proxy")"
+fi
+echo "Latency: ${latency_ms} ms"
+echo "Download: ${download_mibps} MiB/s (${download_mbps} Mbps)"
+echo "Download URL: $download_url"
