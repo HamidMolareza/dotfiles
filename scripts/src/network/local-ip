@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  echo "Usage: local-ip" >&2
+  echo "Print the active private/local IPv4 address." >&2
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if (($# > 0)); then
+  usage
+  exit 2
+fi
+
+if ! command -v ip >/dev/null 2>&1; then
+  echo "Error: 'ip' command was not found." >&2
+  exit 1
+fi
+
+is_ignored_iface() {
+  local dev="$1"
+  [[ "$dev" == lo || "$dev" == docker* || "$dev" == br-* || "$dev" == veth* ||
+    "$dev" == virbr* || "$dev" == cni* || "$dev" == flannel* || "$dev" == kube* ||
+    "$dev" == tun* || "$dev" == tap* || "$dev" == ppp* || "$dev" == wg* ||
+    "$dev" == tailscale* || "$dev" == zt* ]]
+}
+
+is_wifi_iface() {
+  local dev="$1"
+  [[ -d "/sys/class/net/$dev/wireless" || "$dev" == wl* || "$dev" == wlan* ]]
+}
+
+is_private_ipv4() {
+  local ip_addr="$1"
+  local first second third fourth
+
+  IFS=. read -r first second third fourth <<<"$ip_addr"
+  [[ "$first" =~ ^[0-9]+$ && "$second" =~ ^[0-9]+$ &&
+    "$third" =~ ^[0-9]+$ && "$fourth" =~ ^[0-9]+$ ]] || return 1
+
+  ((first == 10)) ||
+    ((first == 172 && second >= 16 && second <= 31)) ||
+    ((first == 192 && second == 168)) ||
+    ((first == 169 && second == 254))
+}
+
+wifi_candidates=()
+other_candidates=()
+
+if ! addr_output="$(ip -o -4 addr show scope global up 2>&1)"; then
+  echo "Error: failed to read network interfaces." >&2
+  echo "$addr_output" >&2
+  exit 1
+fi
+
+while read -r _ dev _ cidr _; do
+  [[ -z "${dev:-}" ]] && continue
+  dev="${dev%:}"
+  ip_addr="${cidr%/*}"
+
+  if is_ignored_iface "$dev" || ! is_private_ipv4 "$ip_addr"; then
+    continue
+  fi
+
+  if is_wifi_iface "$dev"; then
+    wifi_candidates+=("$ip_addr")
+  else
+    other_candidates+=("$ip_addr")
+  fi
+done <<<"$addr_output"
+
+if ((${#wifi_candidates[@]} > 0)); then
+  echo "${wifi_candidates[0]}"
+elif ((${#other_candidates[@]} > 0)); then
+  echo "${other_candidates[0]}"
+else
+  echo "No active private/local IPv4 address found." >&2
+  exit 1
+fi
