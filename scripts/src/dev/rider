@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+IDE="/home/home/Programs/JetBrains Rider-2025.2.3/bin/rider"
+
+if [[ ! -x "$IDE" ]]; then
+    echo "Error: Rider launcher is not executable: $IDE" >&2
+    exit 127
+fi
+
+if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$IDE" "$@" >/dev/null 2>&1
+else
+    nohup "$IDE" "$@" >/dev/null 2>&1 &
+fi
