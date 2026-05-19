@@ -56,6 +56,80 @@ run_npm() {
   esac
 }
 
+platform_package() {
+  case "$(platform_id)" in
+    linux:x64)
+      printf '%s\n' '@openai/codex-linux-x64'
+      ;;
+    linux:arm64)
+      printf '%s\n' '@openai/codex-linux-arm64'
+      ;;
+    darwin:x64)
+      printf '%s\n' '@openai/codex-darwin-x64'
+      ;;
+    darwin:arm64)
+      printf '%s\n' '@openai/codex-darwin-arm64'
+      ;;
+    win32:x64)
+      printf '%s\n' '@openai/codex-win32-x64'
+      ;;
+    win32:arm64)
+      printf '%s\n' '@openai/codex-win32-arm64'
+      ;;
+    *)
+      printf 'Unsupported platform for Codex: %s\n' "$(platform_id)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+platform_suffix() {
+  case "$(platform_id)" in
+    linux:x64) printf '%s\n' 'linux-x64' ;;
+    linux:arm64) printf '%s\n' 'linux-arm64' ;;
+    darwin:x64) printf '%s\n' 'darwin-x64' ;;
+    darwin:arm64) printf '%s\n' 'darwin-arm64' ;;
+    win32:x64) printf '%s\n' 'win32-x64' ;;
+    win32:arm64) printf '%s\n' 'win32-arm64' ;;
+    *)
+      printf 'Unsupported platform for Codex: %s\n' "$(platform_id)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+platform_id() {
+  node -p '`${process.platform}:${process.arch}`'
+}
+
+codex_bin_path() {
+  local global_root
+  global_root="$1"
+  printf '%s\n' "$global_root/@openai/codex/bin/codex.js"
+}
+
+verify_platform_package_resolves() {
+  local global_root package_name bin_path
+  global_root="$1"
+  package_name="$(platform_package)"
+  bin_path="$(codex_bin_path "$global_root")"
+
+  [[ -f "$bin_path" ]] || return 1
+
+  node --input-type=module - "$bin_path" "$package_name" <<'NODE'
+import { createRequire } from 'node:module';
+
+const [binPath, packageName] = process.argv.slice(2);
+
+try {
+  const require = createRequire(binPath);
+  require.resolve(`${packageName}/package.json`);
+} catch {
+  process.exit(1);
+}
+NODE
+}
+
 usage() {
   cat <<'EOF'
 Usage: codex-update [options] [version]
@@ -145,13 +219,28 @@ if [[ -z "$TARGET_VERSION" ]]; then
   exit 1
 fi
 
+PLATFORM_PACKAGE="$(platform_package)"
+PLATFORM_SUFFIX="$(platform_suffix)"
+
 printf 'Removing %s...\n' "$PACKAGE"
 run_npm uninstall -g "$PACKAGE" --registry="$REGISTRY" || true
 
 printf 'Installing %s@%s from %s...\n' "$PACKAGE" "$TARGET_VERSION" "$REGISTRY"
-run_npm install -g "$PACKAGE@$TARGET_VERSION" --registry="$REGISTRY"
+run_npm install -g "$PACKAGE@$TARGET_VERSION" --include=optional --registry="$REGISTRY"
 
 GLOBAL_ROOT="$(run_npm root -g)"
+
+if ! verify_platform_package_resolves "$GLOBAL_ROOT"; then
+  printf 'Installing missing platform package %s...\n' "$PLATFORM_PACKAGE"
+  run_npm install -g "${PLATFORM_PACKAGE}@npm:${PACKAGE}@${TARGET_VERSION}-${PLATFORM_SUFFIX}" --include=optional --registry="$REGISTRY"
+fi
+
+if ! verify_platform_package_resolves "$GLOBAL_ROOT"; then
+  printf 'Expected %s to resolve from %s, but it is still missing.\n' \
+    "$PLATFORM_PACKAGE" "$(codex_bin_path "$GLOBAL_ROOT")" >&2
+  exit 1
+fi
+
 INSTALLED_VERSION="$(
   node -e "const path = require('node:path'); const pkg = require(path.join(process.argv[1], '@openai', 'codex', 'package.json')); process.stdout.write(pkg.version);" \
     "$GLOBAL_ROOT"
