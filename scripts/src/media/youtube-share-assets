@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Download raw assets needed to share a YouTube video."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_SUB_LANGS = "en.*"
+ASSET_BASENAME = "asset"
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+SUBTITLE_EXTENSIONS = (".srt", ".vtt")
+REGEX_META_CHARS = set(".^$*+?{}[]\\|()")
+SRT_INDEX_RE = re.compile(r"^\d+$")
+SUBTITLE_TAG_RE = re.compile(r"<[^>]+>")
+CURATED_METADATA_FIELDS = (
+    "id",
+    "title",
+    "description",
+    "webpage_url",
+    "original_url",
+    "channel",
+    "channel_id",
+    "channel_url",
+    "uploader",
+    "uploader_id",
+    "uploader_url",
+    "duration",
+    "duration_string",
+    "upload_date",
+    "timestamp",
+    "release_date",
+    "view_count",
+    "like_count",
+    "comment_count",
+    "categories",
+    "tags",
+    "thumbnail",
+    "extractor",
+    "extractor_key",
+)
+
+
+class AssetError(Exception):
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def die(message: str, exit_code: int = 1) -> None:
+    raise AssetError(message, exit_code)
+
+
+def need_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        if name == "yt-dlp":
+            die(
+                "yt-dlp is required but was not found. Install it first, then rerun this command."
+            )
+        die(f"{name} is required but was not found.")
+
+
+def run_command(
+    args: list[str],
+    *,
+    capture_stdout: bool = False,
+    label: str = "command",
+) -> str:
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE if capture_stdout else None,
+            stderr=subprocess.PIPE if capture_stdout else None,
+        )
+    except OSError as exc:
+        die(str(exc))
+
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        if detail:
+            die(f"{label} failed:\n{detail}", result.returncode)
+        die(f"{label} failed with exit code {result.returncode}.", result.returncode)
+
+    return result.stdout or ""
+
+
+def ytdlp_auth_args(args: argparse.Namespace) -> list[str]:
+    result: list[str] = []
+
+    if args.cookies:
+        cookies_path = Path(args.cookies).expanduser()
+        if not cookies_path.is_file():
+            die(f"cookies file not found: {cookies_path}")
+        result.extend(["--cookies", str(cookies_path)])
+
+    if args.cookies_from_browser:
+        result.extend(["--cookies-from-browser", args.cookies_from_browser])
+
+    return result
+
+
+def ytdlp_js_args(args: argparse.Namespace) -> list[str]:
+    result: list[str] = []
+
+    if args.js_runtimes:
+        result.extend(["--js-runtimes", args.js_runtimes])
+    else:
+        node_path = shutil.which("node")
+        if node_path:
+            result.extend(["--js-runtimes", f"node:{node_path}"])
+
+    if args.remote_components:
+        result.extend(["--remote-components", args.remote_components])
+    else:
+        result.append("--no-remote-components")
+
+    return result
+
+
+def ytdlp_common_args(args: argparse.Namespace) -> list[str]:
+    return [
+        "--ignore-no-formats-error",
+        *ytdlp_auth_args(args),
+        *ytdlp_js_args(args),
+    ]
+
+
+def safe_name(value: str, fallback: str) -> str:
+    name = value.strip() or fallback
+    name = re.sub(r"[\x00-\x1f]+", " ", name)
+    name = re.sub(r'[\\/:\*\?"<>\|]+', "-", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-_")
+    if not name:
+        name = fallback
+
+    if len(name) > 90:
+        name = name[:90].rstrip(" .-_")
+
+    return name or "youtube-video"
+
+
+def video_folder_name(title: str, video_id: str) -> str:
+    safe_video_id = safe_name(video_id, "youtube-video")
+    suffix = f" [{safe_video_id}]"
+    max_title_length = max(20, 90 - len(suffix))
+    safe_title = safe_name(title, safe_video_id)
+
+    if len(safe_title) > max_title_length:
+        safe_title = safe_title[:max_title_length].rstrip(" .-_")
+
+    return safe_name(f"{safe_title}{suffix}", safe_video_id)
+
+
+def unique_directory(root: Path, folder_name: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    candidate = root / folder_name
+    if not candidate.exists():
+        candidate.mkdir()
+        return candidate
+
+    for index in range(2, 1000):
+        candidate = root / f"{folder_name}-{index}"
+        if not candidate.exists():
+            candidate.mkdir()
+            return candidate
+
+    die(f"could not create a unique output directory under {root}")
+    raise AssertionError("unreachable")
+
+
+def write_text(path: Path, value: str | None) -> None:
+    path.write_text((value or "").rstrip() + "\n", encoding="utf-8")
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def subtitle_text_from_srt(value: str) -> str:
+    lines: list[str] = []
+
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line or SRT_INDEX_RE.fullmatch(line) or "-->" in line:
+            continue
+
+        line = html.unescape(SUBTITLE_TAG_RE.sub("", line))
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines).rstrip() + ("\n" if lines else "")
+
+
+def write_plain_transcript(srt_path: Path) -> Path:
+    text_path = srt_path.with_suffix(".txt")
+    text_path.write_text(
+        subtitle_text_from_srt(srt_path.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    return text_path
+
+
+def build_metadata(info: dict[str, Any], requested_url: str) -> dict[str, Any]:
+    metadata = {
+        key: info.get(key)
+        for key in CURATED_METADATA_FIELDS
+        if key in info and info.get(key) is not None
+    }
+    metadata["requested_url"] = requested_url
+    metadata["resolved_url"] = info.get("webpage_url") or info.get("original_url") or requested_url
+    metadata["available_subtitles"] = sorted((info.get("subtitles") or {}).keys())
+    metadata["available_auto_captions"] = sorted(
+        (info.get("automatic_captions") or {}).keys()
+    )
+    return metadata
+
+
+def fetch_metadata(url: str, auth_args: list[str]) -> dict[str, Any]:
+    output = run_command(
+        ["yt-dlp", "--no-playlist", *auth_args, "-J", url],
+        capture_stdout=True,
+        label="metadata fetch",
+    )
+    try:
+        info = json.loads(output)
+    except json.JSONDecodeError as exc:
+        die(f"failed to parse yt-dlp metadata JSON: {exc}")
+
+    if not isinstance(info, dict):
+        die("yt-dlp returned unexpected metadata.")
+
+    return info
+
+
+def split_language_patterns(value: str) -> list[str]:
+    patterns = [part.strip() for part in value.split(",") if part.strip()]
+    if not patterns:
+        die("--lang must contain at least one language pattern.")
+    return patterns
+
+
+def language_matches(language: str, pattern: str) -> bool:
+    language_lower = language.lower()
+    pattern_lower = pattern.lower()
+
+    if not any(char in pattern for char in REGEX_META_CHARS):
+        return language_lower == pattern_lower or language_lower.startswith(
+            f"{pattern_lower}-"
+        )
+
+    try:
+        return re.fullmatch(pattern, language, flags=re.IGNORECASE) is not None
+    except re.error:
+        return language_lower == pattern_lower
+
+
+def language_sort_key(language: str, pattern: str) -> tuple[int, str]:
+    pattern_lower = pattern.lower()
+    language_lower = language.lower()
+
+    if pattern_lower.endswith(".*"):
+        base = pattern_lower[:-2]
+        if language_lower == base:
+            return (0, language_lower)
+        if language_lower.startswith(f"{base}-"):
+            return (1, language_lower)
+
+    return (2, language_lower)
+
+
+def select_language(source: dict[str, Any], patterns: list[str]) -> str | None:
+    languages = list(source.keys())
+    for pattern in patterns:
+        matches = [language for language in languages if language_matches(language, pattern)]
+        if matches:
+            return sorted(matches, key=lambda language: language_sort_key(language, pattern))[0]
+    return None
+
+
+def select_subtitle_source(
+    info: dict[str, Any], language_patterns: list[str]
+) -> tuple[str, str] | None:
+    human_subtitles = info.get("subtitles") or {}
+    auto_captions = info.get("automatic_captions") or {}
+
+    human_language = select_language(human_subtitles, language_patterns)
+    if human_language:
+        return ("human", human_language)
+
+    auto_language = select_language(auto_captions, language_patterns)
+    if auto_language:
+        return ("automatic", auto_language)
+
+    return None
+
+
+def asset_template(output_dir: Path) -> str:
+    return str(output_dir / f"{ASSET_BASENAME}.%(ext)s")
+
+
+def download_thumbnail(url: str, output_dir: Path, auth_args: list[str]) -> Path | None:
+    run_command(
+        [
+            "yt-dlp",
+            "--no-playlist",
+            *auth_args,
+            "--skip-download",
+            "--write-thumbnail",
+            "--convert-thumbnails",
+            "jpg",
+            "--output",
+            asset_template(output_dir),
+            url,
+        ],
+        label="thumbnail download",
+    )
+    return normalize_thumbnail(output_dir)
+
+
+def download_transcript(
+    url: str,
+    output_dir: Path,
+    auth_args: list[str],
+    source: tuple[str, str] | None,
+) -> tuple[Path, Path] | None:
+    if source is None:
+        print("Warning: no matching transcript/subtitle was found.", file=sys.stderr)
+        return None
+
+    source_type, language = source
+    subtitle_flag = "--write-subs" if source_type == "human" else "--write-auto-subs"
+    print(f"Transcript: using {source_type} subtitles for language '{language}'.")
+
+    run_command(
+        [
+            "yt-dlp",
+            "--no-playlist",
+            *auth_args,
+            "--skip-download",
+            subtitle_flag,
+            "--sub-langs",
+            language,
+            "--sub-format",
+            "srt/vtt/best",
+            "--convert-subs",
+            "srt",
+            "--output",
+            asset_template(output_dir),
+            url,
+        ],
+        label="transcript download",
+    )
+    srt_path = normalize_transcript(output_dir)
+    return (srt_path, write_plain_transcript(srt_path))
+
+
+def find_asset_files(output_dir: Path, extensions: tuple[str, ...]) -> list[Path]:
+    files = [
+        path
+        for path in output_dir.glob(f"{ASSET_BASENAME}*")
+        if path.is_file() and path.suffix.lower() in extensions
+    ]
+    return sorted(files)
+
+
+def remove_if_asset(path: Path) -> None:
+    if path.name.startswith(ASSET_BASENAME):
+        path.unlink(missing_ok=True)
+
+
+def normalize_thumbnail(output_dir: Path) -> Path | None:
+    candidates = find_asset_files(output_dir, IMAGE_EXTENSIONS)
+    if not candidates:
+        print("Warning: no thumbnail file was written.", file=sys.stderr)
+        return None
+
+    target = output_dir / "thumbnail.jpg"
+    jpg_candidates = [path for path in candidates if path.suffix.lower() in (".jpg", ".jpeg")]
+    source = jpg_candidates[0] if jpg_candidates else candidates[0]
+
+    if source.suffix.lower() in (".jpg", ".jpeg"):
+        source.replace(target)
+    else:
+        run_command(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), str(target)],
+            label="thumbnail conversion",
+        )
+        remove_if_asset(source)
+
+    for candidate in candidates:
+        if candidate != target and candidate.exists():
+            remove_if_asset(candidate)
+
+    return target
+
+
+def normalize_transcript(output_dir: Path) -> Path:
+    candidates = find_asset_files(output_dir, SUBTITLE_EXTENSIONS)
+    if not candidates:
+        die("subtitle download completed, but no subtitle file was found.")
+
+    target = output_dir / "transcript.srt"
+    srt_candidates = [path for path in candidates if path.suffix.lower() == ".srt"]
+    source = srt_candidates[0] if srt_candidates else candidates[0]
+
+    if source.suffix.lower() == ".srt":
+        source.replace(target)
+    else:
+        run_command(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), str(target)],
+            label="transcript conversion",
+        )
+        remove_if_asset(source)
+
+    for candidate in candidates:
+        if candidate != target and candidate.exists():
+            remove_if_asset(candidate)
+
+    return target
+
+
+def list_subtitles(url: str, auth_args: list[str]) -> None:
+    run_command(
+        ["yt-dlp", "--no-playlist", *auth_args, "--list-subs", url],
+        label="subtitle listing",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download transcript, thumbnail, title, description, and metadata for sharing a YouTube video."
+    )
+    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default=".",
+        help="Root directory for the per-video asset folder. Default: current directory.",
+    )
+    parser.add_argument(
+        "--lang",
+        default=DEFAULT_SUB_LANGS,
+        help=f"Comma-separated subtitle language patterns. Default: {DEFAULT_SUB_LANGS}",
+    )
+    parser.add_argument(
+        "--js-runtimes",
+        help="yt-dlp JavaScript runtime setting. Default: auto-use node when it is on PATH.",
+    )
+    parser.add_argument(
+        "--remote-components",
+        default="ejs:github",
+        help="Remote yt-dlp components to allow. Default: ejs:github. Use an empty value to disable.",
+    )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--cookies", help="Netscape cookies.txt file for yt-dlp.")
+    auth_group.add_argument(
+        "--cookies-from-browser",
+        help="Browser name for yt-dlp cookie extraction, for example: firefox or chrome.",
+    )
+    parser.add_argument(
+        "--list-subs",
+        action="store_true",
+        help="List available subtitles for the URL without downloading assets.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        need_tool("yt-dlp")
+        common_args = ytdlp_common_args(args)
+
+        if args.list_subs:
+            list_subtitles(args.url, common_args)
+            return 0
+
+        need_tool("ffmpeg")
+
+        info = fetch_metadata(args.url, common_args)
+        metadata = build_metadata(info, args.url)
+        video_id = str(info.get("id") or "youtube-video")
+        title = str(info.get("title") or video_id)
+        folder_name = video_folder_name(title, video_id)
+        output_root = Path(args.output_dir).expanduser().resolve()
+        output_dir = unique_directory(output_root, folder_name)
+
+        write_text(output_dir / "title.txt", info.get("title"))
+        write_text(output_dir / "description.txt", info.get("description"))
+        write_text(output_dir / "source-url.txt", metadata["resolved_url"])
+        write_json(output_dir / "metadata.json", metadata)
+
+        language_patterns = split_language_patterns(args.lang)
+        subtitle_source = select_subtitle_source(info, language_patterns)
+        transcript = download_transcript(args.url, output_dir, common_args, subtitle_source)
+        thumbnail = download_thumbnail(args.url, output_dir, common_args)
+
+        print(f"Output: {output_dir}")
+        if transcript:
+            srt_path, text_path = transcript
+            print(f"Transcript: {srt_path.name}")
+            print(f"Transcript text: {text_path.name}")
+        if thumbnail:
+            print(f"Thumbnail: {thumbnail.name}")
+        return 0
+    except AssetError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return exc.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
