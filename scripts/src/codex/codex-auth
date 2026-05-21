@@ -16,6 +16,7 @@ import traceback
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
@@ -45,6 +46,7 @@ PRIMARY_RESET_WIDTH = 11
 SECONDARY_LEFT_WIDTH = 8
 SECONDARY_RESET_WIDTH = 11
 EMAIL_WIDTH = 28
+ACCOUNT_INFO_WIDTH = 52
 EMPTY_CELL = ""
 ANSI_RESET = "\x1b[0m"
 ANSI_RED = "\x1b[31m"
@@ -63,6 +65,11 @@ NETWORK_ERROR = "network error"
 BAD_RESPONSE = "bad response"
 PROBE_ERROR = "probe error"
 MENU_TITLE = "Codex auth switcher"
+EDIT_ACCOUNT_INFO_LABEL = "Edit Account Info"
+NEW_ACCOUNT_LABEL = "New Account"
+METADATA_SUFFIX = ".metadata.json"
+METADATA_VERSION = 1
+METADATA_CLEAR_TOKEN = "-"
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
 DEFAULT_USAGE_PROXY_URL: str | None = None
 DEFAULT_USAGE_PROXY_DISPLAY = "current environment"
@@ -188,6 +195,18 @@ class ProbeOutcome:
 
 
 @dataclass(frozen=True)
+class AccountMetadata:
+    seller: str = EMPTY_CELL
+    purchased_on: date | None = None
+    valid_for_days: int | None = None
+    note: str = EMPTY_CELL
+    error: str = EMPTY_CELL
+
+    def has_values(self) -> bool:
+        return bool(self.seller or self.purchased_on is not None or self.valid_for_days is not None or self.note)
+
+
+@dataclass(frozen=True)
 class AuthFile:
     path: Path
     suffix: str
@@ -196,6 +215,7 @@ class AuthFile:
     size_bytes: int
     mtime_ns: int
     email: str = EMPTY_CELL
+    metadata: AccountMetadata = field(default_factory=AccountMetadata)
     quota: QuotaView = field(default_factory=QuotaView)
 
     @property
@@ -213,7 +233,8 @@ class AuthFile:
             f"{truncate_text(quota.primary_reset, PRIMARY_RESET_WIDTH):<{PRIMARY_RESET_WIDTH}} "
             f"{truncate_text(quota.secondary_left, SECONDARY_LEFT_WIDTH):<{SECONDARY_LEFT_WIDTH}} "
             f"{truncate_text(quota.secondary_reset, SECONDARY_RESET_WIDTH):<{SECONDARY_RESET_WIDTH}} "
-            f"{truncate_text(self.email, EMAIL_WIDTH):<{EMAIL_WIDTH}}"
+            f"{truncate_text(self.email, EMAIL_WIDTH):<{EMAIL_WIDTH}} "
+            f"{truncate_text(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH):<{ACCOUNT_INFO_WIDTH}}"
         )
 
     def fallback_label(self) -> str:
@@ -234,6 +255,8 @@ class AuthFile:
                 format_plain_cell(quota.secondary_reset, SECONDARY_RESET_WIDTH),
                 " ",
                 format_plain_cell(self.email, EMAIL_WIDTH),
+                " ",
+                format_plain_cell(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH),
             )
         )
 
@@ -254,7 +277,30 @@ class AuthFile:
         fragments.extend(format_prompt_fragments(quota.secondary_reset, SECONDARY_RESET_WIDTH))
         fragments.append(("", " "))
         fragments.extend(format_prompt_fragments(self.email, EMAIL_WIDTH))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_fragments(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH))
         return fragments
+
+
+@dataclass(frozen=True)
+class EditAccountInfoAction:
+    def fallback_label(self) -> str:
+        return EDIT_ACCOUNT_INFO_LABEL
+
+    def prompt_toolkit_label(self) -> list[tuple[str, str]]:
+        return [("", EDIT_ACCOUNT_INFO_LABEL)]
+
+
+@dataclass(frozen=True)
+class NewAccountAction:
+    def fallback_label(self) -> str:
+        return NEW_ACCOUNT_LABEL
+
+    def prompt_toolkit_label(self) -> list[tuple[str, str]]:
+        return [("", NEW_ACCOUNT_LABEL)]
+
+
+AuthChoice = AuthFile | EditAccountInfoAction | NewAccountAction
 
 
 class SwapError(RuntimeError):
@@ -416,14 +462,17 @@ Switch the active Codex auth file inside {AUTH_DIR}.
 Rules:
   - {ACTIVE_NAME} is the active file
   - auth.json<number> files are inactive candidates
-  - only one active file exists at a time
+  - at most one active file exists at a time
   - the menu shows cached or live remaining quota and reset countdowns for each auth file
   - the menu shows each auth file's user email from the local id_token or cache when available
+  - Edit Account Info stores seller, purchase date, validity days, and a note in per-auth metadata sidecars
+  - metadata sidecars move with auth files when codex-auth switches, activates, or archives them
   - quota probes use a read-only HTTPS request with the current auth token
   - quota probes never trigger token refresh or modify your real auth files
   - transient probe failures keep stale cached quota when available and mark it with *
   - live probe failures can surface as statuses such as token expired, timeout, bad auth, or network error
   - after a successful switch, the newly active file timestamp is updated
+  - New Account archives the active auth.json into the next auth.json<number> slot
 
 Options:
   -d, --dir PATH   Override the auth directory (default: {AUTH_DIR})
@@ -591,6 +640,130 @@ def format_prompt_percent_fragments(value: str, percent: int | None, width: int)
     return format_prompt_fragments(value, width, style=style)
 
 
+def metadata_path(auth_path: Path) -> Path:
+    return auth_path.with_name(f"{auth_path.name}{METADATA_SUFFIX}")
+
+
+def parse_metadata_text(value: object) -> str:
+    if value is None:
+        return EMPTY_CELL
+    if not isinstance(value, str):
+        raise ValueError("metadata text must be a string")
+    return value.strip()
+
+
+def parse_metadata_purchase_date(value: object) -> date | None:
+    if value is None or value == EMPTY_CELL:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("metadata purchase date must be a string")
+    return date.fromisoformat(value)
+
+
+def parse_metadata_validity_days(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("metadata validity days must be a positive integer")
+    return value
+
+
+def load_account_metadata(auth_path: Path) -> AccountMetadata:
+    sidecar_path = metadata_path(auth_path)
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return AccountMetadata()
+    except (OSError, json.JSONDecodeError):
+        return AccountMetadata(error="metadata error")
+
+    if not isinstance(payload, dict) or payload.get("version") != METADATA_VERSION:
+        return AccountMetadata(error="metadata error")
+
+    try:
+        return AccountMetadata(
+            seller=parse_metadata_text(payload.get("seller")),
+            purchased_on=parse_metadata_purchase_date(payload.get("purchased_on")),
+            valid_for_days=parse_metadata_validity_days(payload.get("valid_for_days")),
+            note=parse_metadata_text(payload.get("note")),
+        )
+    except (TypeError, ValueError):
+        return AccountMetadata(error="metadata error")
+
+
+def account_metadata_payload(metadata: AccountMetadata) -> dict[str, object]:
+    payload: dict[str, object] = {"version": METADATA_VERSION}
+    if metadata.seller:
+        payload["seller"] = metadata.seller
+    if metadata.purchased_on is not None:
+        payload["purchased_on"] = metadata.purchased_on.isoformat()
+    if metadata.valid_for_days is not None:
+        payload["valid_for_days"] = metadata.valid_for_days
+    if metadata.note:
+        payload["note"] = metadata.note
+    return payload
+
+
+def save_account_metadata(auth_path: Path, metadata: AccountMetadata) -> None:
+    sidecar_path = metadata_path(auth_path)
+    if not metadata.has_values():
+        try:
+            sidecar_path.unlink()
+        except FileNotFoundError:
+            return
+        fsync_directory(sidecar_path.parent)
+        return
+
+    temp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp-{secrets.token_hex(4)}")
+    try:
+        temp_path.write_text(
+            json.dumps(account_metadata_payload(metadata), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, sidecar_path)
+        fsync_directory(sidecar_path.parent)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def account_validity_text(metadata: AccountMetadata, *, today: date | None = None) -> str:
+    if metadata.purchased_on is None and metadata.valid_for_days is None:
+        return EMPTY_CELL
+    if metadata.purchased_on is None:
+        return f"{metadata.valid_for_days}d validity"
+    if metadata.valid_for_days is None:
+        return EMPTY_CELL
+
+    current_date = today or datetime.now().astimezone().date()
+    expires_on = metadata.purchased_on + timedelta(days=metadata.valid_for_days)
+    remaining_days = (expires_on - current_date).days
+    if remaining_days > 0:
+        return f"{remaining_days}d left"
+    if remaining_days == 0:
+        return "expires today"
+    return f"expired {-remaining_days}d"
+
+
+def format_account_info(metadata: AccountMetadata) -> str:
+    if metadata.error:
+        return metadata.error
+
+    parts = []
+    if metadata.seller:
+        parts.append(metadata.seller)
+    if metadata.purchased_on is not None:
+        parts.append(f"bought {metadata.purchased_on.isoformat()}")
+    validity = account_validity_text(metadata)
+    if validity:
+        parts.append(validity)
+    if metadata.note:
+        parts.append(metadata.note)
+    return " | ".join(parts)
+
+
 def menu_header() -> str:
     return (
         f"{'Status':<{STATUS_WIDTH}} "
@@ -599,12 +772,44 @@ def menu_header() -> str:
         f"{'5h in':<{PRIMARY_RESET_WIDTH}} "
         f"{'7d left':<{SECONDARY_LEFT_WIDTH}} "
         f"{'7d in':<{SECONDARY_RESET_WIDTH}} "
-        f"{'Email':<{EMAIL_WIDTH}}"
+        f"{'Email':<{EMAIL_WIDTH}} "
+        f"{'Account Info':<{ACCOUNT_INFO_WIDTH}}"
     )
 
 
 def menu_separator() -> str:
     return "-" * len(menu_header())
+
+
+def format_auth_file_list(auth_files: Sequence[AuthFile]) -> str:
+    lines = [
+        "Auth files found:",
+        f"      {menu_header()}",
+        f"      {menu_separator()}",
+    ]
+    for index, auth_file in enumerate(auth_files, start=1):
+        lines.append(f"  {index:>2}. {auth_file.fallback_label()}")
+    return "\n".join(lines)
+
+
+def active_auth_file(auth_files: Sequence[AuthFile]) -> AuthFile | None:
+    return next((auth_file for auth_file in auth_files if auth_file.is_active), None)
+
+
+def auth_menu_choices(auth_files: Sequence[AuthFile]) -> list[AuthChoice]:
+    choices: list[AuthChoice] = list(auth_files)
+    choices.append(EditAccountInfoAction())
+    if active_auth_file(auth_files) is not None:
+        choices.append(NewAccountAction())
+    return choices
+
+
+def picker_message(auth_files: Sequence[AuthFile]) -> str:
+    message = f"{MENU_TITLE}\n\n"
+    if active_auth_file(auth_files) is None:
+        message += f"No active {ACTIVE_NAME} file found. Select a file to make it active.\n\n"
+    message += f"{menu_header()}\n{menu_separator()}"
+    return message
 
 
 def list_auth_files(directory: Path) -> list[AuthFile]:
@@ -632,6 +837,7 @@ def list_auth_files(directory: Path) -> list[AuthFile]:
                 size_bytes=stat_result.st_size,
                 mtime_ns=stat_result.st_mtime_ns,
                 email=extract_auth_email(path),
+                metadata=load_account_metadata(path),
             )
         )
 
@@ -639,9 +845,15 @@ def list_auth_files(directory: Path) -> list[AuthFile]:
         fail(f"No auth files matching auth.json or auth.json<number> found in {directory}.")
 
     active_count = sum(1 for auth_file in auth_files if auth_file.is_active)
-    if active_count != 1:
+    if active_count > 1:
         fail(
-            f"Expected exactly one active {ACTIVE_NAME} file in {directory}, found {active_count}."
+            "\n".join(
+                (
+                    f"Expected at most one active {ACTIVE_NAME} file in {directory}, found {active_count}.",
+                    "",
+                    format_auth_file_list(auth_files),
+                )
+            )
         )
 
     return auth_files
@@ -1317,20 +1529,26 @@ def auth_priority_key(auth_file: AuthFile) -> tuple[int, float, int, int, float,
     )
 
 
-def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthFile:
+def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthChoice:
+    active_auth = active_auth_file(auth_files)
+    choices = auth_menu_choices(auth_files)
     tty_output.write(f"{MENU_TITLE}\n\n")
+    if active_auth is None:
+        tty_output.write(f"No active {ACTIVE_NAME} file found. Select a file to make it active.\n\n")
     tty_output.write(f"      {menu_header()}\n")
     tty_output.write(f"      {menu_separator()}\n")
-    for index, auth_file in enumerate(auth_files, start=1):
-        tty_output.write(f"  {index:>2}. {auth_file.fallback_label()}\n")
+    for index, choice in enumerate(choices, start=1):
+        tty_output.write(f"  {index:>2}. {choice.fallback_label()}\n")
     tty_output.write("\n")
     tty_output.write("      * stale cache, reset columns show time remaining\n\n")
     tty_output.flush()
 
     while True:
-        tty_output.write(
-            f"Select an auth file [1-{len(auth_files)}] (Enter keeps current, Ctrl-C cancels): "
-        )
+        if active_auth is None:
+            prompt = f"Select an option [1-{len(choices)}] (Ctrl-C cancels): "
+        else:
+            prompt = f"Select an option [1-{len(choices)}] (Enter keeps current, Ctrl-C cancels): "
+        tty_output.write(prompt)
         tty_output.flush()
         selection = tty_input.readline()
         if selection == "":
@@ -1338,20 +1556,19 @@ def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> Au
 
         selection = selection.strip()
         if not selection:
-            for auth_file in auth_files:
-                if auth_file.is_active:
-                    return auth_file
+            if active_auth is not None:
+                return active_auth
 
         if selection.isdigit():
             selected_index = int(selection)
-            if 1 <= selected_index <= len(auth_files):
-                return auth_files[selected_index - 1]
+            if 1 <= selected_index <= len(choices):
+                return choices[selected_index - 1]
 
         tty_output.write("Invalid selection. Please enter one of the listed numbers.\n")
         tty_output.flush()
 
 
-def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthFile:
+def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthChoice:
     from prompt_toolkit.application.current import create_app_session
     from prompt_toolkit.input.defaults import create_input
     from prompt_toolkit.output.defaults import create_output
@@ -1372,13 +1589,14 @@ def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output)
 
     tty_ui_input = create_input(stdin=tty_input, always_prefer_tty=True)
     tty_ui_output = create_output(stdout=tty_output, always_prefer_tty=True)
+    choices = auth_menu_choices(auth_files)
 
     try:
         with create_app_session(input=tty_ui_input, output=tty_ui_output):
             result = choice(
-                message=f"{MENU_TITLE}\n\n{menu_header()}\n{menu_separator()}",
-                options=[(auth_file, auth_file.prompt_toolkit_label()) for auth_file in auth_files],
-                default=next(auth_file for auth_file in auth_files if auth_file.is_active),
+                message=picker_message(auth_files),
+                options=[(item, item.prompt_toolkit_label()) for item in choices],
+                default=active_auth_file(auth_files) or choices[0],
                 style=style,
                 symbol=">",
                 show_frame=True,
@@ -1395,7 +1613,7 @@ def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output)
     return result
 
 
-def choose_auth_file(auth_files: Sequence[AuthFile]) -> AuthFile:
+def choose_auth_file(auth_files: Sequence[AuthFile]) -> AuthChoice:
     try:
         tty_input = open("/dev/tty", "r", encoding="utf-8")
         tty_output = open("/dev/tty", "w", encoding="utf-8")
@@ -1412,9 +1630,158 @@ def choose_auth_file(auth_files: Sequence[AuthFile]) -> AuthFile:
         tty_output.close()
 
 
+def fallback_account_info_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthFile:
+    default_auth = active_auth_file(auth_files) or auth_files[0]
+    tty_output.write(f"{EDIT_ACCOUNT_INFO_LABEL}\n\n")
+    tty_output.write(f"      {menu_header()}\n")
+    tty_output.write(f"      {menu_separator()}\n")
+    for index, auth_file in enumerate(auth_files, start=1):
+        tty_output.write(f"  {index:>2}. {auth_file.fallback_label()}\n")
+    tty_output.write("\n")
+    tty_output.flush()
+
+    while True:
+        tty_output.write(
+            f"Select an auth file to edit [1-{len(auth_files)}] "
+            f"(Enter edits {default_auth.name}, Ctrl-C cancels): "
+        )
+        tty_output.flush()
+        selection = tty_input.readline()
+        if selection == "":
+            fail("Account info editor was interrupted.", exit_code=130)
+
+        selection = selection.strip()
+        if not selection:
+            return default_auth
+        if selection.isdigit():
+            selected_index = int(selection)
+            if 1 <= selected_index <= len(auth_files):
+                return auth_files[selected_index - 1]
+
+        tty_output.write("Invalid selection. Please enter one of the listed numbers.\n")
+        tty_output.flush()
+
+
+def choose_account_info_auth_file(auth_files: Sequence[AuthFile]) -> AuthFile:
+    try:
+        tty_input = open("/dev/tty", "r", encoding="utf-8")
+        tty_output = open("/dev/tty", "w", encoding="utf-8")
+    except OSError:
+        fail("Account info editor requires a terminal.")
+
+    try:
+        return fallback_account_info_choice(auth_files, tty_input, tty_output)
+    finally:
+        tty_input.close()
+        tty_output.close()
+
+
+def prompt_metadata_update(label: str, current: str, tty_input, tty_output) -> tuple[str, str]:
+    display = current or "empty"
+    tty_output.write(f"{label} [{display}] (Enter keeps, {METADATA_CLEAR_TOKEN} clears): ")
+    tty_output.flush()
+    value = tty_input.readline()
+    if value == "":
+        fail("Account info editor was interrupted.", exit_code=130)
+
+    value = value.strip()
+    if not value:
+        return ("keep", EMPTY_CELL)
+    if value == METADATA_CLEAR_TOKEN:
+        return ("clear", EMPTY_CELL)
+    return ("set", value)
+
+
+def prompt_metadata_text(label: str, current: str, tty_input, tty_output) -> str:
+    action, value = prompt_metadata_update(label, current, tty_input, tty_output)
+    if action == "keep":
+        return current
+    if action == "clear":
+        return EMPTY_CELL
+    return value
+
+
+def prompt_metadata_purchase_date(current: date | None, tty_input, tty_output) -> date | None:
+    current_text = current.isoformat() if current is not None else EMPTY_CELL
+    while True:
+        action, value = prompt_metadata_update("Purchased on YYYY-MM-DD", current_text, tty_input, tty_output)
+        if action == "keep":
+            return current
+        if action == "clear":
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            tty_output.write("Purchase date must use YYYY-MM-DD.\n")
+            tty_output.flush()
+
+
+def prompt_metadata_validity_days(current: int | None, tty_input, tty_output) -> int | None:
+    current_text = str(current) if current is not None else EMPTY_CELL
+    while True:
+        action, value = prompt_metadata_update("Validity days", current_text, tty_input, tty_output)
+        if action == "keep":
+            return current
+        if action == "clear":
+            return None
+        if value.isdigit() and int(value) > 0:
+            return int(value)
+
+        tty_output.write("Validity days must be a positive integer.\n")
+        tty_output.flush()
+
+
+def prompt_account_metadata(auth_file: AuthFile, tty_input, tty_output) -> AccountMetadata:
+    current = auth_file.metadata if not auth_file.metadata.error else AccountMetadata()
+    tty_output.write(f"\nEditing account info for {auth_file.name}.\n")
+    if auth_file.metadata.error:
+        tty_output.write("Existing metadata is invalid. Saving will replace it with the fields below.\n")
+    tty_output.write(f"Use {METADATA_CLEAR_TOKEN} to clear a field.\n\n")
+    tty_output.flush()
+
+    return AccountMetadata(
+        seller=prompt_metadata_text("Seller", current.seller, tty_input, tty_output),
+        purchased_on=prompt_metadata_purchase_date(current.purchased_on, tty_input, tty_output),
+        valid_for_days=prompt_metadata_validity_days(current.valid_for_days, tty_input, tty_output),
+        note=prompt_metadata_text("Note", current.note, tty_input, tty_output),
+    )
+
+
+def edit_account_info(auth_files: Sequence[AuthFile]) -> None:
+    auth_file = choose_account_info_auth_file(auth_files)
+    try:
+        tty_input = open("/dev/tty", "r", encoding="utf-8")
+        tty_output = open("/dev/tty", "w", encoding="utf-8")
+    except OSError:
+        fail("Account info editor requires a terminal.")
+
+    try:
+        metadata = prompt_account_metadata(auth_file, tty_input, tty_output)
+    finally:
+        tty_input.close()
+        tty_output.close()
+
+    try:
+        save_account_metadata(auth_file.path, metadata)
+    except OSError as error:
+        fail(f"Failed to save account info for {auth_file.name}: {error}")
+
+    if metadata.has_values():
+        print(f"Account info saved for {auth_file.name}.")
+    else:
+        print(f"Account info cleared for {auth_file.name}.")
+
+
 def unique_temp_path(directory: Path) -> Path:
     while True:
         candidate = directory / f"{ACTIVE_NAME}.swap-{secrets.token_hex(4)}"
+        if not candidate.exists():
+            return candidate
+
+
+def unique_path_temp_path(path: Path) -> Path:
+    while True:
+        candidate = path.with_name(f"{path.name}.swap-{secrets.token_hex(4)}")
         if not candidate.exists():
             return candidate
 
@@ -1424,6 +1791,18 @@ def ensure_regular_file(path: Path, role: str) -> None:
         raise SwapError(f"{role} file does not exist: {path}")
     if not path.is_file():
         raise SwapError(f"{role} path is not a regular file: {path}")
+
+
+def ensure_optional_regular_file(path: Path, role: str) -> None:
+    if path.exists() and not path.is_file():
+        raise SwapError(f"{role} path is not a regular file: {path}")
+
+
+def ensure_metadata_target_is_clear(auth_path: Path, role: str) -> None:
+    target_path = metadata_path(auth_path)
+    ensure_optional_regular_file(target_path, role)
+    if target_path.exists():
+        raise SwapError(f"{role} metadata sidecar already exists: {target_path}")
 
 
 def fsync_directory(directory: Path) -> None:
@@ -1443,34 +1822,29 @@ def mark_as_recently_active(path: Path) -> None:
         os.close(descriptor)
 
 
-def rollback_swap(active_path: Path, selected_path: Path, temp_path: Path) -> tuple[bool, str]:
+def rollback_replaced_paths(replaced_paths: Sequence[tuple[Path, Path]]) -> tuple[bool, str]:
     notes: list[str] = []
 
-    try:
-        if temp_path.exists() and not active_path.exists() and selected_path.exists():
-            os.replace(temp_path, active_path)
-            fsync_directory(active_path.parent)
-            return True, "Rolled back after moving the active file to a temporary name."
+    for source_path, target_path in reversed(replaced_paths):
+        if source_path.exists():
+            notes.append(f"rollback source is already occupied at {source_path}")
+            continue
+        if not target_path.exists():
+            notes.append(f"rollback target is missing at {target_path}")
+            continue
+        try:
+            os.replace(target_path, source_path)
+        except OSError as error:
+            notes.append(f"rollback failed for {target_path}: {error}")
 
-        if temp_path.exists() and active_path.exists() and not selected_path.exists():
-            os.replace(active_path, selected_path)
-            os.replace(temp_path, active_path)
-            fsync_directory(active_path.parent)
-            return True, "Rolled back after moving the selected file into the active slot."
-    except OSError as error:
-        notes.append(f"rollback failed: {error}")
+    if notes:
+        return False, "; ".join(notes)
+    return True, "Rolled back completed file moves."
 
-    if temp_path.exists():
-        notes.append(f"temporary backup remains at {temp_path}")
-    if active_path.exists():
-        notes.append(f"active path currently exists at {active_path}")
-    if selected_path.exists():
-        notes.append(f"selected path currently exists at {selected_path}")
 
-    if not notes:
-        notes.append("current on-disk state could not be determined automatically")
-
-    return False, "; ".join(notes)
+def replace_path(source_path: Path, target_path: Path, replaced_paths: list[tuple[Path, Path]]) -> None:
+    os.replace(source_path, target_path)
+    replaced_paths.append((source_path, target_path))
 
 
 def swap_auth_files(active_path: Path, selected_path: Path) -> None:
@@ -1482,16 +1856,32 @@ def swap_auth_files(active_path: Path, selected_path: Path) -> None:
 
     ensure_regular_file(active_path, "Active")
     ensure_regular_file(selected_path, "Selected")
+    active_metadata_path = metadata_path(active_path)
+    selected_metadata_path = metadata_path(selected_path)
+    ensure_optional_regular_file(active_metadata_path, "Active metadata sidecar")
+    ensure_optional_regular_file(selected_metadata_path, "Selected metadata sidecar")
 
     temp_path = unique_temp_path(active_path.parent)
+    temp_metadata_path = unique_path_temp_path(active_metadata_path)
+    has_active_metadata = active_metadata_path.exists()
+    has_selected_metadata = selected_metadata_path.exists()
+    replaced_paths: list[tuple[Path, Path]] = []
 
     try:
-        os.replace(active_path, temp_path)
-        os.replace(selected_path, active_path)
-        os.replace(temp_path, selected_path)
+        replace_path(active_path, temp_path, replaced_paths)
+        if has_active_metadata:
+            replace_path(active_metadata_path, temp_metadata_path, replaced_paths)
+        replace_path(selected_path, active_path, replaced_paths)
+        if has_selected_metadata:
+            replace_path(selected_metadata_path, active_metadata_path, replaced_paths)
+        replace_path(temp_path, selected_path, replaced_paths)
+        if has_active_metadata:
+            replace_path(temp_metadata_path, selected_metadata_path, replaced_paths)
         fsync_directory(active_path.parent)
     except OSError as error:
-        rolled_back, recovery_message = rollback_swap(active_path, selected_path, temp_path)
+        rolled_back, recovery_message = rollback_replaced_paths(replaced_paths)
+        if rolled_back:
+            fsync_directory(active_path.parent)
         if rolled_back:
             raise SwapError(f"Auth swap failed and was rolled back safely: {error}") from error
         raise SwapError(
@@ -1504,6 +1894,85 @@ def swap_auth_files(active_path: Path, selected_path: Path) -> None:
         raise SwapError(
             f"Auth switch completed, but updating the last active timestamp failed: {error}"
         ) from error
+
+
+def activate_auth_file(active_path: Path, selected_path: Path) -> None:
+    if active_path == selected_path:
+        return
+
+    if active_path.parent != selected_path.parent:
+        raise SwapError("Refusing to activate an auth file across different directories.")
+
+    ensure_regular_file(selected_path, "Selected")
+    if active_path.exists():
+        raise SwapError(f"Active file already exists: {active_path}")
+    selected_metadata_path = metadata_path(selected_path)
+    active_metadata_path = metadata_path(active_path)
+    ensure_optional_regular_file(selected_metadata_path, "Selected metadata sidecar")
+    ensure_metadata_target_is_clear(active_path, "Active")
+    replaced_paths: list[tuple[Path, Path]] = []
+
+    try:
+        replace_path(selected_path, active_path, replaced_paths)
+        if selected_metadata_path.exists():
+            replace_path(selected_metadata_path, active_metadata_path, replaced_paths)
+        fsync_directory(active_path.parent)
+    except OSError as error:
+        rolled_back, recovery_message = rollback_replaced_paths(replaced_paths)
+        if rolled_back:
+            fsync_directory(active_path.parent)
+        if not rolled_back:
+            raise SwapError(
+                f"Auth activation failed and automatic recovery was incomplete: {error}. {recovery_message}"
+            ) from error
+        raise SwapError(f"Auth activation failed: {error}") from error
+
+    try:
+        mark_as_recently_active(active_path)
+    except OSError as error:
+        raise SwapError(
+            f"Auth activation completed, but updating the last active timestamp failed: {error}"
+        ) from error
+
+
+def next_auth_slot_path(directory: Path, auth_files: Sequence[AuthFile]) -> Path:
+    highest_suffix = 0
+    for auth_file in auth_files:
+        if auth_file.suffix.isdigit():
+            highest_suffix = max(highest_suffix, int(auth_file.suffix))
+    return directory / f"{ACTIVE_NAME}{highest_suffix + 1}"
+
+
+def archive_active_auth_file(active_path: Path, target_path: Path) -> None:
+    if active_path == target_path:
+        return
+
+    if active_path.parent != target_path.parent:
+        raise SwapError("Refusing to archive an auth file across different directories.")
+
+    ensure_regular_file(active_path, "Active")
+    if target_path.exists():
+        raise SwapError(f"Target archive slot already exists: {target_path}")
+    active_metadata_path = metadata_path(active_path)
+    target_metadata_path = metadata_path(target_path)
+    ensure_optional_regular_file(active_metadata_path, "Active metadata sidecar")
+    ensure_metadata_target_is_clear(target_path, "Target archive")
+    replaced_paths: list[tuple[Path, Path]] = []
+
+    try:
+        replace_path(active_path, target_path, replaced_paths)
+        if active_metadata_path.exists():
+            replace_path(active_metadata_path, target_metadata_path, replaced_paths)
+        fsync_directory(active_path.parent)
+    except OSError as error:
+        rolled_back, recovery_message = rollback_replaced_paths(replaced_paths)
+        if rolled_back:
+            fsync_directory(active_path.parent)
+        if not rolled_back:
+            raise SwapError(
+                f"Auth archive failed and automatic recovery was incomplete: {error}. {recovery_message}"
+            ) from error
+        raise SwapError(f"Auth archive failed: {error}") from error
 
 
 def main() -> None:
@@ -1519,22 +1988,50 @@ def main() -> None:
 
     try:
         directory = options.directory
-        auth_files = list_auth_files(directory)
-        auth_files = enrich_auth_files_with_quota(auth_files, directory, proxy_config)
+        while True:
+            auth_files = list_auth_files(directory)
+            auth_files = enrich_auth_files_with_quota(auth_files, directory, proxy_config)
 
-        active_auth = next(auth_file for auth_file in auth_files if auth_file.is_active)
-        selected_auth = choose_auth_file(auth_files)
+            active_auth = active_auth_file(auth_files)
+            selected_choice = choose_auth_file(auth_files)
 
-        if selected_auth.is_active:
-            print(f"{selected_auth.name} is already active.")
+            if isinstance(selected_choice, EditAccountInfoAction):
+                edit_account_info(auth_files)
+                continue
+
+            if isinstance(selected_choice, NewAccountAction):
+                if active_auth is None:
+                    fail(f"No active {ACTIVE_NAME} file is available to archive.")
+
+                target_path = next_auth_slot_path(directory, auth_files)
+                try:
+                    archive_active_auth_file(active_auth.path, target_path)
+                except SwapError as error:
+                    fail(str(error))
+
+                print(f"Active auth archived: {active_auth.name} -> {target_path.name}")
+                print(f"{ACTIVE_NAME} is now free for a new login.")
+                return
+
+            selected_auth = selected_choice
+
+            if selected_auth.is_active:
+                print(f"{selected_auth.name} is already active.")
+                return
+
+            try:
+                if active_auth is None:
+                    activate_auth_file(directory / ACTIVE_NAME, selected_auth.path)
+                else:
+                    swap_auth_files(active_auth.path, selected_auth.path)
+            except SwapError as error:
+                fail(str(error))
+
+            if active_auth is None:
+                print(f"Active auth created: {selected_auth.name} -> {ACTIVE_NAME}")
+            else:
+                print(f"Active auth switched: {active_auth.name} <-> {selected_auth.name}")
             return
-
-        try:
-            swap_auth_files(active_auth.path, selected_auth.path)
-        except SwapError as error:
-            fail(str(error))
-
-        print(f"Active auth switched: {active_auth.name} <-> {selected_auth.name}")
     finally:
         close_debug_logging()
 
