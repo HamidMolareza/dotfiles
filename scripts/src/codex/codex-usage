@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date
+from datetime import datetime
+from datetime import time
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+from typing import Iterable
+
+
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+DEFAULT_TOP_SESSIONS = 10
+DEFAULT_MODE = "simple"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+RESET = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+RED = "\x1b[31m"
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+BLUE = "\x1b[34m"
+MAGENTA = "\x1b[35m"
+CYAN = "\x1b[36m"
+WHITE = "\x1b[37m"
+MODEL_COLORS = (CYAN, GREEN, YELLOW, MAGENTA, BLUE, RED)
+
+
+@dataclass
+class Usage:
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, other: "Usage") -> None:
+        self.input_tokens += other.input_tokens
+        self.cached_input_tokens += other.cached_input_tokens
+        self.output_tokens += other.output_tokens
+        self.reasoning_output_tokens += other.reasoning_output_tokens
+        self.total_tokens += other.total_tokens
+
+    def to_dict(self) -> dict[str, int]:
+        return {field: getattr(self, field) for field in TOKEN_FIELDS}
+
+    @property
+    def uncached_input_tokens(self) -> int:
+        return max(self.input_tokens - self.cached_input_tokens, 0)
+
+
+@dataclass
+class Aggregate:
+    usage: Usage
+    calls: int = 0
+    sessions: set[Path] | None = None
+
+    def __post_init__(self) -> None:
+        if self.sessions is None:
+            self.sessions = set()
+
+    def add_call(self, session_path: Path, usage: Usage) -> None:
+        self.usage.add(usage)
+        self.calls += 1
+        self.sessions.add(session_path)
+
+    @property
+    def session_count(self) -> int:
+        return len(self.sessions or ())
+
+
+@dataclass(frozen=True)
+class CallUsage:
+    session_path: Path
+    codex_home: Path
+    timestamp: datetime
+    model: str
+    cwd: str
+    usage: Usage
+    fallback_from_cumulative: bool = False
+
+
+@dataclass
+class ScanStats:
+    files_seen: int = 0
+    files_with_usage: int = 0
+    json_errors: int = 0
+    token_events_seen: int = 0
+    fallback_sessions: int = 0
+
+
+def parse_usage(value: Any) -> Usage | None:
+    if not isinstance(value, dict):
+        return None
+
+    input_tokens = read_int(value.get("input_tokens"))
+    output_tokens = read_int(value.get("output_tokens"))
+    total_tokens = read_int(value.get("total_tokens"))
+
+    cached_input_tokens = read_int(value.get("cached_input_tokens"))
+    input_details = value.get("input_token_details")
+    if cached_input_tokens == 0 and isinstance(input_details, dict):
+        cached_input_tokens = read_int(input_details.get("cached_tokens"))
+
+    reasoning_output_tokens = read_int(value.get("reasoning_output_tokens"))
+    output_details = value.get("output_token_details")
+    if reasoning_output_tokens == 0 and isinstance(output_details, dict):
+        reasoning_output_tokens = read_int(output_details.get("reasoning_tokens"))
+
+    if total_tokens == 0 and (input_tokens or output_tokens):
+        total_tokens = input_tokens + output_tokens
+
+    if not any((input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens)):
+        return None
+
+    return Usage(
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def read_int(value: Any) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_timezone())
+    return parsed
+
+
+def parse_bound(value: str | None, *, end: bool = False) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            parsed_date = date.fromisoformat(value)
+            parsed = datetime.combine(parsed_date, time.min, tzinfo=local_timezone())
+            return parsed + timedelta(days=1) if end else parsed
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid date/time: {value}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_timezone())
+    return parsed
+
+
+def local_timezone():
+    return datetime.now().astimezone().tzinfo
+
+
+def discover_codex_homes(args: argparse.Namespace) -> list[Path]:
+    homes: list[Path] = []
+
+    for item in args.codex_home:
+        homes.append(Path(item).expanduser())
+
+    if args.sessions_dir:
+        homes.extend(session_dir_to_home(Path(item).expanduser()) for item in args.sessions_dir)
+
+    if args.all_homes:
+        home_dir = Path.home()
+        for pattern in (".codex*", ".gapcodex*"):
+            for candidate in sorted(home_dir.glob(pattern)):
+                if (candidate / "sessions").is_dir():
+                    homes.append(candidate)
+
+    if not homes:
+        homes.append(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser())
+
+    return unique_paths(homes)
+
+
+def session_dir_to_home(path: Path) -> Path:
+    if path.name == "sessions":
+        return path.parent
+    return path
+
+
+def session_dirs_for_home(home: Path) -> list[Path]:
+    if home.name == "sessions":
+        return [home]
+    return [home / "sessions"]
+
+
+def unique_paths(paths: Iterable[Path]) -> list[Path]:
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            result.append(resolved)
+            seen.add(resolved)
+    return result
+
+
+def iter_session_files(codex_homes: Iterable[Path]) -> Iterable[tuple[Path, Path]]:
+    for codex_home in codex_homes:
+        for sessions_dir in session_dirs_for_home(codex_home):
+            if not sessions_dir.is_dir():
+                continue
+            for path in sorted(sessions_dir.rglob("*.jsonl")):
+                if path.is_file():
+                    yield codex_home, path
+
+
+def scan_session_file(
+    codex_home: Path,
+    path: Path,
+    args: argparse.Namespace,
+    stats: ScanStats,
+) -> list[CallUsage]:
+    current_model = "unknown"
+    current_cwd = ""
+    calls: list[CallUsage] = []
+    cumulative_candidates: list[CallUsage] = []
+
+    stats.files_seen += 1
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    stats.json_errors += 1
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if record.get("type") == "turn_context":
+                    current_model = string_or_default(payload.get("model"), current_model)
+                    current_cwd = string_or_default(payload.get("cwd"), current_cwd)
+                    continue
+
+                if record.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+
+                stats.token_events_seen += 1
+                timestamp = parse_timestamp(record.get("timestamp"))
+                if timestamp is None or not timestamp_in_range(timestamp, args.since, args.until):
+                    continue
+
+                if args.model and args.model.lower() not in current_model.lower():
+                    continue
+                if args.cwd and args.cwd.lower() not in current_cwd.lower():
+                    continue
+
+                info = payload.get("info")
+                if not isinstance(info, dict):
+                    continue
+
+                last_usage = parse_usage(info.get("last_token_usage"))
+                if last_usage is not None:
+                    calls.append(CallUsage(path, codex_home, timestamp, current_model, current_cwd, last_usage))
+                    continue
+
+                total_usage = parse_usage(info.get("total_token_usage"))
+                if total_usage is not None:
+                    cumulative_candidates.append(
+                        CallUsage(path, codex_home, timestamp, current_model, current_cwd, total_usage, True)
+                    )
+    except OSError as exc:
+        print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
+
+    if calls:
+        return calls
+
+    if cumulative_candidates:
+        stats.fallback_sessions += 1
+        return [max(cumulative_candidates, key=lambda item: item.usage.total_tokens)]
+
+    return []
+
+
+def string_or_default(value: Any, default: str) -> str:
+    return value if isinstance(value, str) and value else default
+
+
+def timestamp_in_range(timestamp: datetime, since: datetime | None, until: datetime | None) -> bool:
+    if since is not None and timestamp < since:
+        return False
+    if until is not None and timestamp >= until:
+        return False
+    return True
+
+
+def aggregate_calls(calls: Iterable[CallUsage]) -> tuple[Aggregate, dict[str, Aggregate], dict[str, Aggregate]]:
+    total = Aggregate(Usage())
+    by_model: dict[str, Aggregate] = defaultdict(lambda: Aggregate(Usage()))
+    by_day: dict[str, Aggregate] = defaultdict(lambda: Aggregate(Usage()))
+
+    for call in calls:
+        total.add_call(call.session_path, call.usage)
+        by_model[call.model].add_call(call.session_path, call.usage)
+        day = call.timestamp.astimezone(local_timezone()).date().isoformat()
+        by_day[day].add_call(call.session_path, call.usage)
+
+    return total, dict(by_model), dict(by_day)
+
+
+def session_totals(calls: Iterable[CallUsage]) -> list[tuple[Path, str, str, datetime, int, Usage]]:
+    grouped: dict[Path, tuple[str, str, datetime, int, Usage]] = {}
+    for call in calls:
+        model, cwd, last_seen, count, usage = grouped.get(
+            call.session_path,
+            (call.model, call.cwd, call.timestamp, 0, Usage()),
+        )
+        usage.add(call.usage)
+        if call.timestamp >= last_seen:
+            model = call.model
+            cwd = call.cwd
+            last_seen = call.timestamp
+        grouped[call.session_path] = (model, cwd, last_seen, count + 1, usage)
+
+    rows = [(path, *values) for path, values in grouped.items()]
+    rows.sort(key=lambda item: item[5].total_tokens, reverse=True)
+    return rows
+
+
+def estimate_cost(usage: Usage, input_price: float, cached_input_price: float, output_price: float) -> float:
+    return (
+        (usage.uncached_input_tokens * input_price)
+        + (usage.cached_input_tokens * cached_input_price)
+        + (usage.output_tokens * output_price)
+    ) / 1_000_000
+
+
+def cost_estimate_for_args(usage: Usage, args: argparse.Namespace) -> tuple[float, float] | None:
+    if args.input_price is None or args.output_price is None:
+        return None
+    cached_price = args.cached_input_price if args.cached_input_price is not None else args.input_price
+    return cached_price, estimate_cost(usage, args.input_price, cached_price, args.output_price)
+
+
+def format_int(value: int | float) -> str:
+    if isinstance(value, float):
+        return f"{value:,.1f}"
+    return f"{value:,}"
+
+
+def format_usd(value: float) -> str:
+    if value < 0.01:
+        return f"${value:.6f}"
+    if value < 1:
+        return f"${value:.4f}"
+    return f"${value:,.2f}"
+
+
+def average(total: int, count: int) -> float:
+    return total / count if count else 0.0
+
+
+def color_enabled(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never" or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(text: str, color: str, enabled: bool, *, bold: bool = False, dim: bool = False) -> str:
+    if not enabled:
+        return text
+    styles = []
+    if bold:
+        styles.append(BOLD)
+    if dim:
+        styles.append(DIM)
+    styles.append(color)
+    return "".join(styles) + text + RESET
+
+
+def visible_len(value: str) -> int:
+    return len(ANSI_RE.sub("", value))
+
+
+def pad_cell(value: str, width: int, *, right: bool = False) -> str:
+    padding = " " * max(width - visible_len(value), 0)
+    return padding + value if right else value + padding
+
+
+def render_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    numeric_columns: set[int] | None = None,
+    color: bool = False,
+) -> str:
+    if not rows:
+        return ""
+    numeric_columns = numeric_columns or set()
+    widths = [visible_len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], visible_len(cell))
+    header_cells = [
+        pad_cell(paint(header, WHITE, color, bold=True), widths[index], right=index in numeric_columns)
+        for index, header in enumerate(headers)
+    ]
+    lines = ["  ".join(header_cells)]
+    lines.append(paint("  ".join("-" * width for width in widths), DIM, color))
+    for row in rows:
+        lines.append(
+            "  ".join(
+                pad_cell(cell, widths[index], right=index in numeric_columns)
+                for index, cell in enumerate(row)
+            )
+        )
+    return "\n".join(lines)
+
+
+def print_header(text: str, color: bool) -> None:
+    print(paint(text, MAGENTA, color, bold=True))
+    print(paint("=" * visible_len(text), MAGENTA, color))
+
+
+def print_section(text: str, color: bool) -> None:
+    print()
+    print(paint(text, CYAN, color, bold=True))
+    print(paint("-" * visible_len(text), CYAN, color, dim=True))
+
+
+def print_kv(label: str, value: str, color: bool, *, value_color: str = GREEN) -> None:
+    label_cell = pad_cell(paint(label + ":", DIM, color), 28)
+    print(f"  {label_cell} {paint(value, value_color, color, bold=True)}")
+
+
+def bar(percent: float, color: bool, *, width: int = 18, color_code: str = GREEN) -> str:
+    bounded = max(0.0, min(percent, 100.0))
+    filled = round((bounded / 100.0) * width)
+    raw = "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+    return paint(raw, color_code, color)
+
+
+def color_for_index(index: int) -> str:
+    return MODEL_COLORS[index % len(MODEL_COLORS)]
+
+
+def report_window(calls: list[CallUsage]) -> tuple[str, str]:
+    timestamps = [call.timestamp for call in calls]
+    first_seen = min(timestamps).astimezone(local_timezone()).isoformat(timespec="seconds") if timestamps else "-"
+    last_seen = max(timestamps).astimezone(local_timezone()).isoformat(timespec="seconds") if timestamps else "-"
+    return first_seen, last_seen
+
+
+def print_text_report(
+    calls: list[CallUsage],
+    total: Aggregate,
+    by_model: dict[str, Aggregate],
+    by_day: dict[str, Aggregate],
+    stats: ScanStats,
+    args: argparse.Namespace,
+) -> None:
+    if args.mode == "detailed":
+        print_detailed_report(calls, total, by_model, by_day, stats, args)
+        return
+    print_simple_report(calls, total, by_model, by_day, stats, args)
+
+
+def print_simple_report(
+    calls: list[CallUsage],
+    total: Aggregate,
+    by_model: dict[str, Aggregate],
+    by_day: dict[str, Aggregate],
+    stats: ScanStats,
+    args: argparse.Namespace,
+) -> None:
+    color = color_enabled(args.color)
+    usage = total.usage
+    first_seen, last_seen = report_window(calls)
+    top_model = "-"
+    if by_model:
+        top_model = max(by_model.items(), key=lambda item: item[1].usage.total_tokens)[0]
+
+    print_header("Codex usage", color)
+    print_kv("Period", f"{first_seen} .. {last_seen}", color, value_color=CYAN)
+    print_kv("Sessions", format_int(total.session_count), color)
+    print_kv("Model calls", format_int(total.calls), color)
+    print_kv("Top model", top_model, color, value_color=CYAN)
+    print_kv("Total tokens", format_int(usage.total_tokens), color)
+    print_kv("Avg per call", format_int(average(usage.total_tokens, total.calls)), color)
+    print_kv("Avg per session", format_int(average(usage.total_tokens, total.session_count)), color)
+    cost = cost_estimate_for_args(usage, args)
+    if cost is not None:
+        _, estimated_cost = cost
+        print_kv("Estimated cost", format_usd(estimated_cost), color)
+
+    print_section("Token mix", color)
+    token_rows = [
+        ["uncached input", format_int(usage.uncached_input_tokens), bar(usage.uncached_input_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=YELLOW)],
+        ["cached input", format_int(usage.cached_input_tokens), bar(usage.cached_input_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=CYAN)],
+        ["output", format_int(usage.output_tokens), bar(usage.output_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=GREEN)],
+    ]
+    print(render_table(["kind", "tokens", "share"], token_rows, numeric_columns={1}, color=color))
+
+    if by_model:
+        print_section("Models", color)
+        rows = []
+        for index, (model, aggregate) in enumerate(
+            sorted(by_model.items(), key=lambda item: item[1].usage.total_tokens, reverse=True)
+        ):
+            share = (aggregate.usage.total_tokens / usage.total_tokens * 100) if usage.total_tokens else 0.0
+            model_color = color_for_index(index)
+            rows.append(
+                [
+                    paint(model, model_color, color, bold=True),
+                    format_int(aggregate.usage.total_tokens),
+                    f"{share:.1f}%",
+                    bar(share, color, color_code=model_color),
+                ]
+            )
+        print(render_table(["model", "tokens", "share", "bar"], rows, numeric_columns={1, 2}, color=color))
+
+    if cost is None:
+        print()
+        print(paint("Pass prices to estimate cost: --input-price N --cached-input-price N --output-price N", YELLOW, color))
+    if stats.fallback_sessions or stats.json_errors:
+        print()
+        if stats.fallback_sessions:
+            print(paint(f"{stats.fallback_sessions} cumulative-only session(s) were counted once from the largest total.", YELLOW, color))
+        if stats.json_errors:
+            print(paint(f"{stats.json_errors} malformed JSONL line(s) were skipped.", YELLOW, color))
+
+
+def print_detailed_report(
+    calls: list[CallUsage],
+    total: Aggregate,
+    by_model: dict[str, Aggregate],
+    by_day: dict[str, Aggregate],
+    stats: ScanStats,
+    args: argparse.Namespace,
+) -> None:
+    color = color_enabled(args.color)
+    usage = total.usage
+    source_labels = ", ".join(str(path) for path in discover_codex_homes(args))
+    first_seen, last_seen = report_window(calls)
+
+    print_header("Codex usage summary", color)
+    print_kv("Sources", source_labels, color, value_color=CYAN)
+    print_kv("Period", f"{first_seen} .. {last_seen}", color, value_color=CYAN)
+    print_kv("Files scanned", f"{format_int(stats.files_seen)} ({format_int(stats.files_with_usage)} with usage)", color)
+    print_kv("Model calls", format_int(total.calls), color)
+    print_kv("Sessions", format_int(total.session_count), color)
+
+    print_section("Tokens", color)
+    token_rows = [
+        ["input", format_int(usage.input_tokens), bar(usage.input_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=BLUE)],
+        [
+            "cached input",
+            format_int(usage.cached_input_tokens),
+            bar(usage.cached_input_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=CYAN),
+        ],
+        [
+            "uncached input",
+            format_int(usage.uncached_input_tokens),
+            bar(usage.uncached_input_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=YELLOW),
+        ],
+        ["output", format_int(usage.output_tokens), bar(usage.output_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=GREEN)],
+        [
+            "reasoning output",
+            format_int(usage.reasoning_output_tokens),
+            bar(usage.reasoning_output_tokens / usage.total_tokens * 100 if usage.total_tokens else 0.0, color, color_code=MAGENTA),
+        ],
+        ["total", paint(format_int(usage.total_tokens), GREEN, color, bold=True), bar(100.0, color, color_code=GREEN)],
+    ]
+    print(render_table(["kind", "tokens", "share"], token_rows, numeric_columns={1}, color=color))
+
+    print_section("Averages", color)
+    average_rows = [
+        ["total per model call", format_int(average(usage.total_tokens, total.calls))],
+        ["input per model call", format_int(average(usage.input_tokens, total.calls))],
+        ["output per model call", format_int(average(usage.output_tokens, total.calls))],
+        ["total per session", format_int(average(usage.total_tokens, total.session_count))],
+        ["total per active day", format_int(average(usage.total_tokens, len(by_day)))],
+    ]
+    print(render_table(["metric", "tokens"], average_rows, numeric_columns={1}, color=color))
+
+    if args.input_price is not None or args.output_price is not None:
+        if args.input_price is None or args.output_price is None:
+            print_section("Cost estimate", color)
+            print(paint("Pass both --input-price and --output-price to calculate cost.", YELLOW, color))
+        else:
+            cached_price, cost = cost_estimate_for_args(usage, args) or (args.input_price, 0.0)
+            print_section("Cost estimate", color)
+            cost_rows = [
+                ["input price", f"${args.input_price:g} / 1M uncached input tokens"],
+                ["cached input price", f"${cached_price:g} / 1M cached input tokens"],
+                ["output price", f"${args.output_price:g} / 1M output tokens"],
+                ["estimated total", paint(format_usd(cost), GREEN, color, bold=True)],
+            ]
+            print(render_table(["item", "value"], cost_rows, color=color))
+    else:
+        print_section("Cost estimate", color)
+        print(
+            paint(
+                "Pass --input-price, --cached-input-price, and --output-price using the target model prices.",
+                YELLOW,
+                color,
+            )
+        )
+
+    if by_model:
+        rows = []
+        for index, (model, aggregate) in enumerate(
+            sorted(by_model.items(), key=lambda item: item[1].usage.total_tokens, reverse=True)
+        ):
+            model_usage = aggregate.usage
+            share = (model_usage.total_tokens / usage.total_tokens * 100) if usage.total_tokens else 0.0
+            model_color = color_for_index(index)
+            rows.append(
+                [
+                    paint(model, model_color, color, bold=True),
+                    format_int(aggregate.calls),
+                    format_int(aggregate.session_count),
+                    format_int(model_usage.total_tokens),
+                    format_int(model_usage.input_tokens),
+                    format_int(model_usage.cached_input_tokens),
+                    format_int(model_usage.output_tokens),
+                    format_int(average(model_usage.total_tokens, aggregate.calls)),
+                    f"{share:.1f}%",
+                    bar(share, color, color_code=model_color),
+                ]
+            )
+        print_section("By model", color)
+        print(
+            render_table(
+                ["model", "calls", "sessions", "total", "input", "cached", "output", "avg/call", "share", "bar"],
+                rows,
+                numeric_columns={1, 2, 3, 4, 5, 6, 7, 8},
+                color=color,
+            )
+        )
+
+    if args.by_day and by_day:
+        rows = []
+        for day, aggregate in sorted(by_day.items()):
+            day_usage = aggregate.usage
+            share = (day_usage.total_tokens / usage.total_tokens * 100) if usage.total_tokens else 0.0
+            rows.append(
+                [
+                    day,
+                    format_int(aggregate.calls),
+                    format_int(aggregate.session_count),
+                    format_int(day_usage.total_tokens),
+                    format_int(day_usage.input_tokens),
+                    format_int(day_usage.output_tokens),
+                    bar(share, color, color_code=GREEN),
+                ]
+            )
+        print_section("By day", color)
+        print(render_table(["day", "calls", "sessions", "total", "input", "output", "share"], rows, numeric_columns={1, 2, 3, 4, 5}, color=color))
+
+    if args.top_sessions:
+        rows = []
+        for path, model, cwd, last_seen, call_count, session_usage in session_totals(calls)[: args.top_sessions]:
+            rows.append(
+                [
+                    format_int(session_usage.total_tokens),
+                    format_int(call_count),
+                    last_seen.astimezone(local_timezone()).strftime("%Y-%m-%d %H:%M"),
+                    model,
+                    shorten_path(path),
+                    cwd or "-",
+                ]
+            )
+        if rows:
+            print_section("Top sessions", color)
+            print(render_table(["total", "calls", "last seen", "model", "session", "cwd"], rows, numeric_columns={0, 1}, color=color))
+
+    if stats.fallback_sessions or stats.json_errors:
+        print_section("Notes", color)
+        if stats.fallback_sessions:
+            print(
+                paint(
+                    f"  {stats.fallback_sessions} session(s) had only cumulative totals; those are counted once from the largest total.",
+                    YELLOW,
+                    color,
+                )
+            )
+        if stats.json_errors:
+            print(paint(f"  {stats.json_errors} malformed JSONL line(s) were skipped, usually from interrupted writes.", YELLOW, color))
+    print()
+    print(paint("Usage comes from local Codex token_count events. Pricing is an API-style estimate, not a billing statement.", DIM, color))
+
+
+def shorten_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def print_json_report(
+    calls: list[CallUsage],
+    total: Aggregate,
+    by_model: dict[str, Aggregate],
+    by_day: dict[str, Aggregate],
+    stats: ScanStats,
+    args: argparse.Namespace,
+) -> None:
+    cached_price = None
+    cost = None
+    estimate = cost_estimate_for_args(total.usage, args)
+    if estimate is not None:
+        cached_price, cost = estimate
+
+    payload = {
+        "sources": [str(path) for path in discover_codex_homes(args)],
+        "files_scanned": stats.files_seen,
+        "files_with_usage": stats.files_with_usage,
+        "model_calls": total.calls,
+        "sessions": total.session_count,
+        "usage": total.usage.to_dict() | {"uncached_input_tokens": total.usage.uncached_input_tokens},
+        "averages": {
+            "total_per_model_call": average(total.usage.total_tokens, total.calls),
+            "total_per_session": average(total.usage.total_tokens, total.session_count),
+            "total_per_active_day": average(total.usage.total_tokens, len(by_day)),
+        },
+        "by_model": {
+            model: {
+                "calls": aggregate.calls,
+                "sessions": aggregate.session_count,
+                "usage": aggregate.usage.to_dict() | {"uncached_input_tokens": aggregate.usage.uncached_input_tokens},
+            }
+            for model, aggregate in by_model.items()
+        },
+        "by_day": {
+            day: {
+                "calls": aggregate.calls,
+                "sessions": aggregate.session_count,
+                "usage": aggregate.usage.to_dict() | {"uncached_input_tokens": aggregate.usage.uncached_input_tokens},
+            }
+            for day, aggregate in by_day.items()
+        },
+        "cost_estimate": {
+            "input_price_per_1m": args.input_price,
+            "cached_input_price_per_1m": cached_price,
+            "output_price_per_1m": args.output_price,
+            "estimated_usd": cost,
+        },
+        "stats": {
+            "token_events_seen": stats.token_events_seen,
+            "fallback_sessions": stats.fallback_sessions,
+            "json_errors": stats.json_errors,
+        },
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Analyze local Codex session token usage and estimate API-style costs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  codex-usage
+  codex-usage --mode detailed
+  codex-usage --since 2026-05-01 --by-day
+  codex-usage --all-homes
+  codex-usage --color always --top-sessions 3
+  codex-usage --input-price 1.25 --cached-input-price 0.125 --output-price 10
+
+Prices are USD per 1M tokens. If --cached-input-price is omitted, cached input is
+estimated at the same rate as uncached input.
+""",
+    )
+    parser.add_argument("--codex-home", action="append", default=[], help="Codex home to scan, default: CODEX_HOME or ~/.codex")
+    parser.add_argument("--sessions-dir", action="append", default=[], help="Scan an explicit sessions directory")
+    parser.add_argument("--all-homes", action="store_true", help="Scan ~/.codex*, ~/.gapcodex* directories that have sessions")
+    parser.add_argument("--since", type=lambda value: parse_bound(value, end=False), help="Include usage at or after this date/time")
+    parser.add_argument("--until", type=lambda value: parse_bound(value, end=True), help="Include usage before this date/time")
+    parser.add_argument("--model", help="Only include models containing this text, case-insensitive")
+    parser.add_argument("--cwd", help="Only include sessions whose cwd contains this text, case-insensitive")
+    parser.add_argument("--input-price", type=float, help="USD per 1M uncached input tokens")
+    parser.add_argument("--cached-input-price", type=float, help="USD per 1M cached input tokens")
+    parser.add_argument("--output-price", type=float, help="USD per 1M output tokens")
+    parser.add_argument("--mode", choices=("simple", "detailed"), default=DEFAULT_MODE, help=f"Text report detail level, default: {DEFAULT_MODE}")
+    parser.add_argument("--by-day", action="store_true", help="Print daily totals in detailed mode")
+    parser.add_argument("--top-sessions", type=int, default=DEFAULT_TOP_SESSIONS, help="Number of largest sessions to show in detailed mode, 0 disables")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="Colorize text output, default: auto")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.top_sessions < 0:
+        parser.error("--top-sessions cannot be negative")
+
+    codex_homes = discover_codex_homes(args)
+    stats = ScanStats()
+    calls: list[CallUsage] = []
+
+    for codex_home, session_file in iter_session_files(codex_homes):
+        file_calls = scan_session_file(codex_home, session_file, args, stats)
+        if file_calls:
+            stats.files_with_usage += 1
+            calls.extend(file_calls)
+
+    total, by_model, by_day = aggregate_calls(calls)
+
+    if args.json:
+        print_json_report(calls, total, by_model, by_day, stats, args)
+    else:
+        print_text_report(calls, total, by_model, by_day, stats, args)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
