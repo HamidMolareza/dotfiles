@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
 import ssl
 import sys
@@ -79,6 +80,14 @@ PROXY_ENV_VAR = "CODEX_AUTH_PROXY"
 DEBUG_BODY_PREVIEW_LIMIT = 240
 DEBUG_STREAM: TextIO | None = None
 DEBUG_STREAM_OWNED = False
+PROC_ROOT = Path("/proc")
+CODEX_THREAD_ENV_VAR = "CODEX_THREAD_ID"
+CODEX_TERMINATE_TIMEOUT_SECONDS = 4.0
+CODEX_KILL_TIMEOUT_SECONDS = 2.0
+CODEX_SESSION_LOG_TAIL_BYTES = 512 * 1024
+CODEX_STATE_IN_PROGRESS = "in_progress"
+CODEX_STATE_IDLE = "idle"
+CODEX_STATE_UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -301,6 +310,29 @@ class NewAccountAction:
 
 
 AuthChoice = AuthFile | EditAccountInfoAction | NewAccountAction
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    ppid: int
+    comm: str
+    argv: tuple[str, ...]
+    codex_thread_id: str = EMPTY_CELL
+
+    @property
+    def name(self) -> str:
+        if self.argv:
+            return Path(self.argv[0]).name
+        return self.comm
+
+
+@dataclass(frozen=True)
+class CodexProcessGroup:
+    root: ProcessInfo
+    members: tuple[ProcessInfo, ...]
+    state: str
+    reason: str
 
 
 class SwapError(RuntimeError):
@@ -804,8 +836,22 @@ def auth_menu_choices(auth_files: Sequence[AuthFile]) -> list[AuthChoice]:
     return choices
 
 
-def picker_message(auth_files: Sequence[AuthFile]) -> str:
-    message = f"{MENU_TITLE}\n\n"
+def format_open_codex_summary(groups: Sequence[CodexProcessGroup]) -> str:
+    if not groups:
+        return EMPTY_CELL
+    in_progress_count = sum(1 for group in groups if group.state == CODEX_STATE_IN_PROGRESS)
+    return f"Codex running: {len(groups)}, in progress: {in_progress_count}"
+
+
+def picker_title(process_summary: str = EMPTY_CELL) -> str:
+    message = f"{MENU_TITLE}\n"
+    if process_summary:
+        message += f"{process_summary}\n"
+    return f"{message}\n"
+
+
+def picker_message(auth_files: Sequence[AuthFile], process_summary: str = EMPTY_CELL) -> str:
+    message = picker_title(process_summary)
     if active_auth_file(auth_files) is None:
         message += f"No active {ACTIVE_NAME} file found. Select a file to make it active.\n\n"
     message += f"{menu_header()}\n{menu_separator()}"
@@ -1529,10 +1575,15 @@ def auth_priority_key(auth_file: AuthFile) -> tuple[int, float, int, int, float,
     )
 
 
-def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthChoice:
+def fallback_choice(
+    auth_files: Sequence[AuthFile],
+    tty_input,
+    tty_output,
+    process_summary: str = EMPTY_CELL,
+) -> AuthChoice:
     active_auth = active_auth_file(auth_files)
     choices = auth_menu_choices(auth_files)
-    tty_output.write(f"{MENU_TITLE}\n\n")
+    tty_output.write(picker_title(process_summary))
     if active_auth is None:
         tty_output.write(f"No active {ACTIVE_NAME} file found. Select a file to make it active.\n\n")
     tty_output.write(f"      {menu_header()}\n")
@@ -1568,7 +1619,12 @@ def fallback_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> Au
         tty_output.flush()
 
 
-def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output) -> AuthChoice:
+def prompt_toolkit_choice(
+    auth_files: Sequence[AuthFile],
+    tty_input,
+    tty_output,
+    process_summary: str = EMPTY_CELL,
+) -> AuthChoice:
     from prompt_toolkit.application.current import create_app_session
     from prompt_toolkit.input.defaults import create_input
     from prompt_toolkit.output.defaults import create_output
@@ -1594,7 +1650,7 @@ def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output)
     try:
         with create_app_session(input=tty_ui_input, output=tty_ui_output):
             result = choice(
-                message=picker_message(auth_files),
+                message=picker_message(auth_files, process_summary),
                 options=[(item, item.prompt_toolkit_label()) for item in choices],
                 default=active_auth_file(auth_files) or choices[0],
                 style=style,
@@ -1613,7 +1669,7 @@ def prompt_toolkit_choice(auth_files: Sequence[AuthFile], tty_input, tty_output)
     return result
 
 
-def choose_auth_file(auth_files: Sequence[AuthFile]) -> AuthChoice:
+def choose_auth_file(auth_files: Sequence[AuthFile], process_summary: str = EMPTY_CELL) -> AuthChoice:
     try:
         tty_input = open("/dev/tty", "r", encoding="utf-8")
         tty_output = open("/dev/tty", "w", encoding="utf-8")
@@ -1622,9 +1678,9 @@ def choose_auth_file(auth_files: Sequence[AuthFile]) -> AuthChoice:
 
     try:
         try:
-            return prompt_toolkit_choice(auth_files, tty_input, tty_output)
+            return prompt_toolkit_choice(auth_files, tty_input, tty_output, process_summary)
         except ImportError:
-            return fallback_choice(auth_files, tty_input, tty_output)
+            return fallback_choice(auth_files, tty_input, tty_output, process_summary)
     finally:
         tty_input.close()
         tty_output.close()
@@ -1770,6 +1826,424 @@ def edit_account_info(auth_files: Sequence[AuthFile]) -> None:
         print(f"Account info saved for {auth_file.name}.")
     else:
         print(f"Account info cleared for {auth_file.name}.")
+
+
+def read_proc_cmdline(process_dir: Path) -> tuple[str, ...]:
+    try:
+        raw = (process_dir / "cmdline").read_bytes()
+    except OSError:
+        return ()
+    return tuple(part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part)
+
+
+def read_proc_ppid(process_dir: Path) -> int:
+    try:
+        stat_text = (process_dir / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+
+    try:
+        fields = stat_text.rsplit(") ", 1)[1].split()
+        return int(fields[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def read_proc_comm(process_dir: Path) -> str:
+    try:
+        return (process_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return EMPTY_CELL
+
+
+def read_proc_environ_value(process_dir: Path, name: str) -> str:
+    prefix = f"{name}=".encode()
+    try:
+        raw = (process_dir / "environ").read_bytes()
+    except OSError:
+        return EMPTY_CELL
+
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix) :].decode("utf-8", errors="replace").strip()
+    return EMPTY_CELL
+
+
+def read_process_table(proc_root: Path = PROC_ROOT) -> dict[int, ProcessInfo]:
+    processes: dict[int, ProcessInfo] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return processes
+
+    for process_dir in entries:
+        if not process_dir.name.isdigit():
+            continue
+        pid = int(process_dir.name)
+        argv = read_proc_cmdline(process_dir)
+        comm = read_proc_comm(process_dir)
+        ppid = read_proc_ppid(process_dir)
+        if not argv and not comm:
+            continue
+        processes[pid] = ProcessInfo(
+            pid=pid,
+            ppid=ppid,
+            comm=comm,
+            argv=argv,
+            codex_thread_id=read_proc_environ_value(process_dir, CODEX_THREAD_ENV_VAR),
+        )
+    return processes
+
+
+def process_arg_basename(value: str) -> str:
+    return Path(value).name
+
+
+def is_codex_auth_process(process: ProcessInfo) -> bool:
+    return process.comm == "codex-auth" or any(process_arg_basename(arg) == "codex-auth" for arg in process.argv[:3])
+
+
+def has_codex_artifact_arg(process: ProcessInfo) -> bool:
+    return any("@openai/codex" in arg or "/codex/codex" in arg for arg in process.argv)
+
+
+def is_codex_sandbox_process(process: ProcessInfo) -> bool:
+    if process.comm == "codex-linux-sandbox" or process.name == "codex-linux-sandbox":
+        return True
+    if "codex-linux-sandbox" in process.argv:
+        return True
+    return "--sandbox-policy-cwd" in process.argv and has_codex_artifact_arg(process)
+
+
+def is_codex_candidate_process(process: ProcessInfo) -> bool:
+    if is_codex_auth_process(process):
+        return False
+
+    first_arg = process_arg_basename(process.argv[0]) if process.argv else EMPTY_CELL
+    if process.comm == "codex" or first_arg in {"codex", "gapcodex"}:
+        return True
+    if is_codex_sandbox_process(process):
+        return True
+    if first_arg in {"node", "nodejs"} and has_codex_artifact_arg(process):
+        return True
+    return has_codex_artifact_arg(process)
+
+
+def process_children_by_parent(processes: dict[int, ProcessInfo]) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for process in processes.values():
+        children.setdefault(process.ppid, []).append(process.pid)
+    return children
+
+
+def process_tree_pids(root_pid: int, processes: dict[int, ProcessInfo]) -> set[int]:
+    children = process_children_by_parent(processes)
+    seen: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pending.extend(children.get(pid, ()))
+    return seen
+
+
+def process_ancestor_pids(pid: int, processes: dict[int, ProcessInfo]) -> set[int]:
+    ancestors: set[int] = set()
+    current = processes.get(pid)
+    while current is not None and current.ppid > 0 and current.ppid not in ancestors:
+        ancestors.add(current.ppid)
+        current = processes.get(current.ppid)
+    return ancestors
+
+
+def has_candidate_ancestor(pid: int, processes: dict[int, ProcessInfo], candidate_pids: set[int]) -> bool:
+    current = processes.get(pid)
+    visited: set[int] = set()
+    while current is not None and current.ppid > 0 and current.ppid not in visited:
+        if current.ppid in candidate_pids:
+            return True
+        visited.add(current.ppid)
+        current = processes.get(current.ppid)
+    return False
+
+
+def session_log_path_for_thread(thread_id: str) -> Path | None:
+    if not thread_id:
+        return None
+    sessions_dir = Path.home() / ".codex" / "sessions"
+    try:
+        candidates = list(sessions_dir.rglob(f"rollout-*{thread_id}.jsonl"))
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def read_tail_text(path: Path, byte_count: int) -> str:
+    with path.open("rb") as stream:
+        try:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - byte_count), os.SEEK_SET)
+        except OSError:
+            return EMPTY_CELL
+        return stream.read().decode("utf-8", errors="replace")
+
+
+def classify_session_log(path: Path) -> str:
+    try:
+        tail_text = read_tail_text(path, CODEX_SESSION_LOG_TAIL_BYTES)
+    except OSError:
+        return CODEX_STATE_UNKNOWN
+
+    last_state = EMPTY_CELL
+    for line in tail_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        record_type = record.get("type")
+        payload = record.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+
+        if record_type == "turn_context":
+            last_state = CODEX_STATE_IN_PROGRESS
+            continue
+
+        if record_type == "response_item":
+            payload_type = payload.get("type")
+            if payload_type == "function_call":
+                last_state = CODEX_STATE_IN_PROGRESS
+            elif payload_type == "message" and payload.get("role") == "assistant":
+                if payload.get("phase") == "final_answer":
+                    last_state = CODEX_STATE_IDLE
+            elif payload_type == "message" and payload.get("role") == "user":
+                last_state = CODEX_STATE_IN_PROGRESS
+            continue
+
+        if record_type != "event_msg":
+            continue
+
+        payload_type = payload.get("type")
+        if payload_type == "task_complete":
+            last_state = CODEX_STATE_IDLE
+        elif payload_type == "agent_message":
+            phase = payload.get("phase")
+            if phase == "final_answer":
+                last_state = CODEX_STATE_IDLE
+            elif phase == "commentary":
+                last_state = CODEX_STATE_IN_PROGRESS
+        elif payload_type in {"patch_apply_begin", "exec_command_begin", "tool_call_begin"}:
+            last_state = CODEX_STATE_IN_PROGRESS
+
+    return last_state or CODEX_STATE_UNKNOWN
+
+
+def classify_codex_process_group(
+    root: ProcessInfo,
+    members: Sequence[ProcessInfo],
+    processes: dict[int, ProcessInfo],
+    current_pid: int,
+) -> CodexProcessGroup:
+    member_pids = {process.pid for process in members}
+    root_tree = process_tree_pids(root.pid, processes)
+    if current_pid in root_tree or member_pids.intersection(process_ancestor_pids(current_pid, processes)):
+        return CodexProcessGroup(
+            root=root,
+            members=tuple(members),
+            state=CODEX_STATE_IN_PROGRESS,
+            reason="current codex-auth is running inside this Codex session",
+        )
+
+    if any(is_codex_sandbox_process(process) for process in members):
+        return CodexProcessGroup(
+            root=root,
+            members=tuple(members),
+            state=CODEX_STATE_IN_PROGRESS,
+            reason="active Codex sandbox/tool process is running",
+        )
+
+    saw_idle_log = False
+    for thread_id in sorted({process.codex_thread_id for process in members if process.codex_thread_id}):
+        log_path = session_log_path_for_thread(thread_id)
+        if log_path is None:
+            continue
+        log_state = classify_session_log(log_path)
+        if log_state == CODEX_STATE_IN_PROGRESS:
+            return CodexProcessGroup(
+                root=root,
+                members=tuple(members),
+                state=CODEX_STATE_IN_PROGRESS,
+                reason=f"session log {log_path.name} has an unfinished turn",
+            )
+        if log_state == CODEX_STATE_IDLE:
+            saw_idle_log = True
+
+    if saw_idle_log:
+        return CodexProcessGroup(
+            root=root,
+            members=tuple(members),
+            state=CODEX_STATE_IDLE,
+            reason="session log shows the last turn completed",
+        )
+
+    return CodexProcessGroup(
+        root=root,
+        members=tuple(members),
+        state=CODEX_STATE_UNKNOWN,
+        reason="could not reliably detect whether this Codex session is idle",
+    )
+
+
+def discover_open_codex_process_groups(
+    proc_root: Path = PROC_ROOT,
+    current_pid: int | None = None,
+) -> list[CodexProcessGroup]:
+    processes = read_process_table(proc_root)
+    current = os.getpid() if current_pid is None else current_pid
+    candidate_pids = {pid for pid, process in processes.items() if is_codex_candidate_process(process)}
+    roots = [
+        processes[pid]
+        for pid in sorted(candidate_pids)
+        if not has_candidate_ancestor(pid, processes, candidate_pids)
+    ]
+
+    groups: list[CodexProcessGroup] = []
+    for root in roots:
+        tree_pids = process_tree_pids(root.pid, processes)
+        members = tuple(processes[pid] for pid in sorted(candidate_pids.intersection(tree_pids)))
+        groups.append(classify_codex_process_group(root, members, processes, current))
+    return groups
+
+
+def format_process_command(process: ProcessInfo) -> str:
+    if not process.argv:
+        return process.comm or "unknown"
+    visible_args = [process_arg_basename(process.argv[0]), *process.argv[1:4]]
+    command = " ".join(visible_args)
+    if len(process.argv) > len(visible_args):
+        command = f"{command} ..."
+    return truncate_text(command, 120)
+
+
+def describe_codex_process_group(group: CodexProcessGroup) -> str:
+    return (
+        f"pid={group.root.pid} state={group.state} "
+        f"reason={group.reason}; command={format_process_command(group.root)}"
+    )
+
+
+def confirm_terminate_codex_process_groups(groups: Sequence[CodexProcessGroup]) -> bool:
+    try:
+        tty_input = open("/dev/tty", "r", encoding="utf-8")
+        tty_output = open("/dev/tty", "w", encoding="utf-8")
+    except OSError:
+        fail("Open Codex sessions were found, but confirmation requires an interactive terminal.")
+
+    try:
+        tty_output.write(
+            f"Warning: {len(groups)} open Codex session(s) must be terminated before changing auth.\n"
+        )
+        for group in groups:
+            tty_output.write(f"  - {describe_codex_process_group(group)}\n")
+        tty_output.write("Terminate these Codex sessions and continue? [y/N]: ")
+        tty_output.flush()
+        answer = tty_input.readline()
+    finally:
+        tty_input.close()
+        tty_output.close()
+
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_pids_to_exit(pids: set[int], timeout_seconds: float) -> set[int]:
+    deadline = time.monotonic() + timeout_seconds
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        remaining = {pid for pid in remaining if pid_exists(pid)}
+        if remaining:
+            time.sleep(0.1)
+    return {pid for pid in remaining if pid_exists(pid)}
+
+
+def terminate_process_tree(root_pid: int, processes: dict[int, ProcessInfo]) -> set[int]:
+    current_pid = os.getpid()
+    targets = process_tree_pids(root_pid, processes)
+    targets.discard(current_pid)
+    if not targets:
+        return set()
+
+    for pid in sorted(targets, reverse=True):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+
+    remaining = wait_for_pids_to_exit(targets, CODEX_TERMINATE_TIMEOUT_SECONDS)
+    for pid in sorted(remaining, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+
+    return wait_for_pids_to_exit(remaining, CODEX_KILL_TIMEOUT_SECONDS)
+
+
+def terminate_codex_process_groups(groups: Sequence[CodexProcessGroup]) -> None:
+    processes = read_process_table()
+    remaining: set[int] = set()
+    for group in groups:
+        remaining.update(terminate_process_tree(group.root.pid, processes))
+    if remaining:
+        fail(f"Failed to terminate Codex process(es): {', '.join(str(pid) for pid in sorted(remaining))}")
+
+
+def guard_auth_change_against_open_codex() -> None:
+    groups = discover_open_codex_process_groups()
+    if not groups:
+        return
+
+    in_progress = [group for group in groups if group.state == CODEX_STATE_IN_PROGRESS]
+    if in_progress:
+        details = "\n".join(f"  - {describe_codex_process_group(group)}" for group in in_progress)
+        fail(f"{len(in_progress)} codex are in progress and we can't change auth.\n{details}")
+
+    if not confirm_terminate_codex_process_groups(groups):
+        fail("Auth change cancelled; open Codex sessions were not terminated.", exit_code=130)
+
+    groups = discover_open_codex_process_groups()
+    in_progress = [group for group in groups if group.state == CODEX_STATE_IN_PROGRESS]
+    if in_progress:
+        details = "\n".join(f"  - {describe_codex_process_group(group)}" for group in in_progress)
+        fail(f"{len(in_progress)} codex are in progress and we can't change auth.\n{details}")
+
+    if groups:
+        terminate_codex_process_groups(groups)
+
+    remaining_groups = discover_open_codex_process_groups()
+    if remaining_groups:
+        details = "\n".join(f"  - {describe_codex_process_group(group)}" for group in remaining_groups)
+        fail(f"Codex process(es) are still open after termination attempt.\n{details}")
 
 
 def unique_temp_path(directory: Path) -> Path:
@@ -1993,7 +2467,8 @@ def main() -> None:
             auth_files = enrich_auth_files_with_quota(auth_files, directory, proxy_config)
 
             active_auth = active_auth_file(auth_files)
-            selected_choice = choose_auth_file(auth_files)
+            process_summary = format_open_codex_summary(discover_open_codex_process_groups())
+            selected_choice = choose_auth_file(auth_files, process_summary)
 
             if isinstance(selected_choice, EditAccountInfoAction):
                 edit_account_info(auth_files)
@@ -2004,6 +2479,7 @@ def main() -> None:
                     fail(f"No active {ACTIVE_NAME} file is available to archive.")
 
                 target_path = next_auth_slot_path(directory, auth_files)
+                guard_auth_change_against_open_codex()
                 try:
                     archive_active_auth_file(active_auth.path, target_path)
                 except SwapError as error:
@@ -2019,6 +2495,7 @@ def main() -> None:
                 print(f"{selected_auth.name} is already active.")
                 return
 
+            guard_auth_change_against_open_codex()
             try:
                 if active_auth is None:
                     activate_auth_file(directory / ACTIVE_NAME, selected_auth.path)
