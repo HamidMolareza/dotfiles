@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    bold='\033[1m'
+    dim='\033[2m'
+    red='\033[31m'
+    green='\033[32m'
+    yellow='\033[33m'
+    blue='\033[34m'
+    magenta='\033[35m'
+    cyan='\033[36m'
+    reset='\033[0m'
+else
+    bold=''
+    dim=''
+    red=''
+    green=''
+    yellow=''
+    blue=''
+    magenta=''
+    cyan=''
+    reset=''
+fi
+
+script_name="$(basename "$0")"
+
+print_help() {
+    printf "%b\n" "${bold}${cyan}port-owner${reset} ${dim}- inspect and optionally terminate a local TCP listener${reset}"
+    echo
+    printf "%b\n" "${bold}Usage:${reset} $script_name [options] <port>"
+    echo
+    printf "%b\n" "${bold}Options:${reset}"
+    printf "  %-18s %s\n" "--no-kill" "Inspect only; do not prompt to terminate."
+    printf "  %-18s %s\n" "-y, --yes" "Terminate without a confirmation prompt."
+    printf "  %-18s %s\n" "-f, --force" "Use SIGKILL instead of SIGTERM."
+    printf "  %-18s %s\n" "-h, --help" "Show this help text."
+    echo
+    printf "%b\n" "${bold}Examples:${reset}"
+    printf "  %s\n" "$script_name 7027"
+    printf "  %s\n" "$script_name --no-kill 7027"
+    printf "  %s\n" "$script_name --yes 7027"
+    printf "  %s\n" "$script_name --force 7027"
+    echo
+    printf "%b\n" "${bold}Notes:${reset}"
+    printf "  %s\n" "Only local TCP listening sockets are inspected."
+    printf "  %s\n" "SIGTERM is used by default. SIGKILL requires --force."
+    printf "  %s\n" "Set NO_COLOR=1 to disable colors."
+}
+
+error() {
+    printf "%b\n" "${red}ERROR:${reset} $1" >&2
+}
+
+info() {
+    printf "%b\n" "${blue}INFO:${reset} $1"
+}
+
+success() {
+    printf "%b\n" "${green}OK:${reset} $1"
+}
+
+warn() {
+    printf "%b\n" "${yellow}WARN:${reset} $1"
+}
+
+die() {
+    error "$1"
+    exit "${2:-2}"
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        die "$1 is required but was not found."
+    fi
+}
+
+port=''
+inspect_only=0
+assume_yes=0
+signal_name='TERM'
+
+while (($# > 0)); do
+    case "$1" in
+        -h | --help | help)
+            print_help
+            exit 0
+            ;;
+        --no-kill)
+            inspect_only=1
+            ;;
+        -y | --yes)
+            assume_yes=1
+            ;;
+        -f | --force)
+            signal_name='KILL'
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            if [[ -n "$port" ]]; then
+                die "only one port can be provided."
+            fi
+            port="$1"
+            ;;
+    esac
+    shift
+done
+
+while (($# > 0)); do
+    if [[ -n "$port" ]]; then
+        die "only one port can be provided."
+    fi
+    port="$1"
+    shift
+done
+
+if [[ -z "$port" ]]; then
+    print_help >&2
+    exit 2
+fi
+
+if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+    die "port must be an integer between 1 and 65535."
+fi
+
+require_command ss
+require_command ps
+
+get_listener_lines() {
+    ss -H -ltnp "sport = :$port" 2>/dev/null || true
+}
+
+extract_pids() {
+    grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -un
+}
+
+print_listener_lines() {
+    local lines="$1"
+
+    printf "%b\n" "${bold}${magenta}Listening sockets${reset}"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        printf "  %s\n" "$line"
+    done <<< "$lines"
+}
+
+print_lsof_details() {
+    local output
+
+    if ! command -v lsof >/dev/null 2>&1; then
+        return 0
+    fi
+
+    output="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -z "$output" ]]; then
+        return 0
+    fi
+
+    echo
+    printf "%b\n" "${bold}${magenta}lsof details${reset}"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        printf "  %s\n" "$line"
+    done <<< "$output"
+}
+
+print_process_details() {
+    local pid
+    local output
+
+    echo
+    printf "%b\n" "${bold}${magenta}Process details${reset}"
+    for pid in "$@"; do
+        output="$(ps -ww -o pid=,ppid=,user=,stat=,comm=,args= -p "$pid" 2>/dev/null || true)"
+        if [[ -z "$output" ]]; then
+            printf "  PID %s: %bprocess no longer exists or is not visible%b\n" "$pid" "$dim" "$reset"
+            continue
+        fi
+
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            printf "  %s\n" "$line"
+        done <<< "$output"
+    done
+}
+
+confirm_termination() {
+    local count="$1"
+    local answer
+
+    if ((assume_yes)); then
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        warn "Port $port is in use, but this shell is not interactive."
+        error "Pass --yes to terminate without a prompt, or --no-kill to inspect only."
+        exit 1
+    fi
+
+    printf "%b" "${yellow}Terminate $count process(es) with SIG$signal_name? [y/N] ${reset}"
+    read -r answer
+
+    case "$answer" in
+        y | Y | yes | YES | Yes)
+            return 0
+            ;;
+        *)
+            warn "No process was terminated."
+            exit 1
+            ;;
+    esac
+}
+
+terminate_pids() {
+    local pid
+    local failed=0
+
+    for pid in "$@"; do
+        if [[ "$pid" == "$$" ]]; then
+            warn "Skipping current shell process PID $pid."
+            continue
+        fi
+
+        if kill "-$signal_name" "$pid" 2>/dev/null; then
+            success "Sent SIG$signal_name to PID $pid."
+        else
+            error "Failed to send SIG$signal_name to PID $pid. Try rerunning with sudo if it is owned by another user."
+            failed=1
+        fi
+    done
+
+    return "$failed"
+}
+
+listener_lines="$(get_listener_lines)"
+
+printf "%b\n" "${bold}${cyan}Port:${reset} $port"
+
+if [[ -z "$listener_lines" ]]; then
+    success "Port $port is free."
+    exit 0
+fi
+
+warn "Port $port is in use."
+print_listener_lines "$listener_lines"
+print_lsof_details
+
+mapfile -t pids < <(printf "%s\n" "$listener_lines" | extract_pids)
+
+if ((${#pids[@]} == 0)); then
+    echo
+    warn "No listener PID was visible from ss output."
+    warn "If this is a privileged or foreign-owned process, rerun with sudo for process details."
+    exit 1
+fi
+
+print_process_details "${pids[@]}"
+
+if ((inspect_only)); then
+    exit 0
+fi
+
+echo
+confirm_termination "${#pids[@]}"
+
+if ! terminate_pids "${pids[@]}"; then
+    exit 1
+fi
+
+sleep 1
+remaining_lines="$(get_listener_lines)"
+
+if [[ -n "$remaining_lines" ]]; then
+    echo
+    warn "Port $port is still in use after SIG$signal_name."
+    print_listener_lines "$remaining_lines"
+    if [[ "$signal_name" != 'KILL' ]]; then
+        warn "Use --force to send SIGKILL if graceful termination is not enough."
+    fi
+    exit 1
+fi
+
+success "Port $port is now free."
