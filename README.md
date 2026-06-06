@@ -33,6 +33,7 @@ This repository contains configuration files and scripts to set up and manage a 
 - Add agent prompts and skills under `agent-helpers/`, then run `./install.sh` to refresh symlinks into agent homes.
 - Place custom icons in `.icons/`.
 - Add scripts to `scripts/` for automation or setup tasks.
+- SSH transfer helpers live under `scripts/src/ssh`; see `scp-download` and `scp-upload` for easier `scp` downloads and uploads.
 
 ## License
 

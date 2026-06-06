@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+trap 'exit 130' INT TERM
+
+direction="${1:-}"
+if [[ "$direction" != "download" && "$direction" != "upload" ]]; then
+    printf 'Error: internal transfer direction must be download or upload.\n' >&2
+    exit 2
+fi
+shift
+
+command_name="scp-$direction"
+destination=''
+destination_set=0
+port=''
+identity_file=''
+ssh_config=''
+jump_host=''
+compression=0
+preserve=0
+verbose=0
+quiet=0
+dry_run=0
+assume_yes=0
+declare -a ssh_options=()
+declare -a positional=()
+
+print_help() {
+    local source_label destination_label default_destination example_source example_destination
+
+    if [[ "$direction" == "download" ]]; then
+        source_label='remote-source'
+        destination_label='local path'
+        default_destination='current local directory'
+        example_source='/var/log/app.log'
+        example_destination='./logs'
+    else
+        source_label='local-source'
+        destination_label='remote path'
+        default_destination='remote home directory'
+        example_source='./backup.tar.gz'
+        example_destination='/srv/backups/'
+    fi
+
+    cat <<EOF
+Usage: $command_name [options] <host> <$source_label>...
+
+$(tr '[:lower:]' '[:upper:]' <<< "${direction:0:1}")${direction:1} files and directories with scp.
+Missing host or source values are prompted for when run interactively.
+
+Arguments:
+  host                       SSH alias or [user@]hostname.
+  $source_label              One or more source paths.
+
+Options:
+  -t, --to <path>            Destination $destination_label. Default: $default_destination.
+  -P, --port <port>          SSH port, from 1 to 65535.
+  -i, --identity <path>      SSH private key file.
+  -F, --config <path>        SSH client configuration file.
+  -J, --jump-host <host>     SSH jump host.
+  -o, --ssh-option <option>  Additional SSH option; may be repeated.
+  -C, --compress             Enable SSH compression.
+  -p, --preserve             Preserve modification times and file modes.
+  -v, --verbose              Enable verbose scp output.
+  -q, --quiet                Disable scp progress and warning output.
+      --dry-run              Print the scp command without executing it.
+  -y, --yes                  Execute without a confirmation prompt.
+  -h, --help                 Show this help text.
+
+Examples:
+  $command_name my-server '$example_source'
+  $command_name --to '$example_destination' my-server '$example_source'
+  $command_name --port 2222 --identity ~/.ssh/id_ed25519 user@example.com '$example_source'
+  $command_name --dry-run my-server '$example_source'
+
+Notes:
+  Directory transfers are recursive automatically.
+  Quote paths containing spaces or shell-special characters.
+  Non-interactive execution requires --yes; --dry-run never connects.
+EOF
+}
+
+fail() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 2
+}
+
+require_value() {
+    local option="$1"
+    local value="${2-}"
+
+    [[ -n "$value" ]] || fail "$option requires a value."
+}
+
+while (($# > 0)); do
+    case "$1" in
+        -h | --help | help)
+            print_help
+            exit 0
+            ;;
+        -t | --to)
+            require_value "$1" "${2-}"
+            destination="$2"
+            destination_set=1
+            shift 2
+            ;;
+        --to=*)
+            destination="${1#*=}"
+            [[ -n "$destination" ]] || fail "--to requires a value."
+            destination_set=1
+            shift
+            ;;
+        -P | --port)
+            require_value "$1" "${2-}"
+            port="$2"
+            shift 2
+            ;;
+        --port=*)
+            port="${1#*=}"
+            [[ -n "$port" ]] || fail "--port requires a value."
+            shift
+            ;;
+        -i | --identity)
+            require_value "$1" "${2-}"
+            identity_file="$2"
+            shift 2
+            ;;
+        --identity=*)
+            identity_file="${1#*=}"
+            [[ -n "$identity_file" ]] || fail "--identity requires a value."
+            shift
+            ;;
+        -F | --config)
+            require_value "$1" "${2-}"
+            ssh_config="$2"
+            shift 2
+            ;;
+        --config=*)
+            ssh_config="${1#*=}"
+            [[ -n "$ssh_config" ]] || fail "--config requires a value."
+            shift
+            ;;
+        -J | --jump-host)
+            require_value "$1" "${2-}"
+            jump_host="$2"
+            shift 2
+            ;;
+        --jump-host=*)
+            jump_host="${1#*=}"
+            [[ -n "$jump_host" ]] || fail "--jump-host requires a value."
+            shift
+            ;;
+        -o | --ssh-option)
+            require_value "$1" "${2-}"
+            ssh_options+=("$2")
+            shift 2
+            ;;
+        --ssh-option=*)
+            value="${1#*=}"
+            [[ -n "$value" ]] || fail "--ssh-option requires a value."
+            ssh_options+=("$value")
+            shift
+            ;;
+        -C | --compress)
+            compression=1
+            shift
+            ;;
+        -p | --preserve)
+            preserve=1
+            shift
+            ;;
+        -v | --verbose)
+            verbose=1
+            shift
+            ;;
+        -q | --quiet)
+            quiet=1
+            shift
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        -y | --yes)
+            assume_yes=1
+            shift
+            ;;
+        --)
+            shift
+            positional+=("$@")
+            break
+            ;;
+        -*)
+            fail "unknown option: $1"
+            ;;
+        *)
+            positional+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -n "$port" ]]; then
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        fail "port must be an integer between 1 and 65535."
+    fi
+fi
+
+if [[ -n "$identity_file" && ! -f "$identity_file" ]]; then
+    fail "identity file not found: $identity_file"
+fi
+
+if [[ -n "$ssh_config" && ! -f "$ssh_config" ]]; then
+    fail "SSH config file not found: $ssh_config"
+fi
+
+host=''
+declare -a sources=()
+
+if ((${#positional[@]} > 0)); then
+    host="${positional[0]}"
+fi
+if ((${#positional[@]} > 1)); then
+    sources=("${positional[@]:1}")
+fi
+
+if [[ -z "$host" ]]; then
+    [[ -t 0 ]] || fail "host is required. Run $command_name --help for usage."
+    read -r -p 'SSH host or alias: ' host
+    [[ -n "$host" ]] || fail "host cannot be empty."
+fi
+
+if ((${#sources[@]} == 0)); then
+    [[ -t 0 ]] || fail "at least one source path is required. Run $command_name --help for usage."
+    if [[ "$direction" == "download" ]]; then
+        read -r -p 'Remote source path: ' source
+    else
+        read -r -p 'Local source path: ' source
+    fi
+    [[ -n "$source" ]] || fail "source path cannot be empty."
+    sources+=("$source")
+fi
+
+[[ "$host" != -* ]] || fail "host cannot start with '-'."
+[[ "$host" != *$'\n'* && "$host" != *$'\r'* ]] || fail "host cannot contain a newline."
+
+for source in "${sources[@]}"; do
+    [[ -n "$source" ]] || fail "source paths cannot be empty."
+    [[ "$source" != *$'\n'* && "$source" != *$'\r'* ]] || fail "source paths cannot contain newlines."
+done
+
+if ((destination_set)) && [[ "$destination" == *$'\n'* || "$destination" == *$'\r'* ]]; then
+    fail "destination cannot contain a newline."
+fi
+
+if [[ "$direction" == "upload" ]]; then
+    for source in "${sources[@]}"; do
+        [[ -e "$source" || -L "$source" ]] || fail "local source not found: $source"
+    done
+else
+    if ((destination_set == 0)); then
+        destination='.'
+    fi
+    if ((${#sources[@]} > 1)) && [[ ! -d "$destination" ]]; then
+        fail "the local destination must be an existing directory when downloading multiple sources: $destination"
+    fi
+fi
+
+scp_bin="${SCP_BIN:-scp}"
+command -v "$scp_bin" >/dev/null 2>&1 || fail "$scp_bin is required but was not found."
+
+declare -a command=("$scp_bin" -r)
+[[ -z "$port" ]] || command+=(-P "$port")
+[[ -z "$identity_file" ]] || command+=(-i "$identity_file")
+[[ -z "$ssh_config" ]] || command+=(-F "$ssh_config")
+[[ -z "$jump_host" ]] || command+=(-J "$jump_host")
+((compression == 0)) || command+=(-C)
+((preserve == 0)) || command+=(-p)
+((verbose == 0)) || command+=(-v)
+((quiet == 0)) || command+=(-q)
+for ssh_option in "${ssh_options[@]}"; do
+    command+=(-o "$ssh_option")
+done
+command+=(--)
+
+if [[ "$direction" == "download" ]]; then
+    for source in "${sources[@]}"; do
+        command+=("$host:$source")
+    done
+    command+=("$destination")
+else
+    command+=("${sources[@]}")
+    command+=("$host:$destination")
+fi
+
+printf 'Direction: %s\n' "$direction"
+printf 'Host: %s\n' "$host"
+printf 'Sources:\n'
+for source in "${sources[@]}"; do
+    printf '  %s\n' "$source"
+done
+if [[ "$direction" == "upload" && "$destination_set" -eq 0 ]]; then
+    printf 'Destination: remote home directory\n'
+else
+    printf 'Destination: %s\n' "$destination"
+fi
+printf 'Command:'
+printf ' %q' "${command[@]}"
+printf '\n'
+
+if ((dry_run)); then
+    printf 'Dry run: no connection was made.\n'
+    exit 0
+fi
+
+if ((assume_yes == 0)); then
+    [[ -t 0 ]] || fail "confirmation requires an interactive terminal; use --yes or --dry-run."
+    read -r -p 'Start transfer? [y/N] ' answer
+    case "$answer" in
+        y | Y | yes | YES | Yes) ;;
+        *)
+            printf 'Transfer cancelled.\n'
+            exit 1
+            ;;
+    esac
+fi
+
+exec "${command[@]}"
