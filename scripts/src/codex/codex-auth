@@ -53,6 +53,7 @@ ANSI_RESET = "\x1b[0m"
 ANSI_RED = "\x1b[31m"
 ANSI_YELLOW = "\x1b[33m"
 ANSI_GREEN = "\x1b[32m"
+ANSI_GRAY = "\x1b[90m"
 QUOTA_UNKNOWN = "unavailable"
 TOKEN_EXPIRED = "token expired"
 API_KEY_AUTH = "api-key auth"
@@ -68,7 +69,8 @@ PROBE_ERROR = "probe error"
 MENU_TITLE = "Codex auth switcher"
 EDIT_ACCOUNT_INFO_LABEL = "Edit Account Info"
 NEW_ACCOUNT_LABEL = "New Account"
-METADATA_SUFFIX = ".metadata.json"
+METADATA_STORE_NAME = "auth-metadata.json"
+LEGACY_METADATA_SUFFIX = ".metadata.json"
 METADATA_VERSION = 1
 METADATA_CLEAR_TOKEN = "-"
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
@@ -77,6 +79,8 @@ DEFAULT_USAGE_PROXY_DISPLAY = "current environment"
 DEBUG_ENV_VAR = "CODEX_AUTH_DEBUG"
 DEBUG_LOG_ENV_VAR = "CODEX_AUTH_DEBUG_LOG"
 PROXY_ENV_VAR = "CODEX_AUTH_PROXY"
+NETWORK_GUARD_ACTIVE_ENV_VAR = "NETWORK_GUARD_ACTIVE"
+NETWORK_GUARD_COMMAND = "network-guard"
 DEBUG_BODY_PREVIEW_LIMIT = 240
 DEBUG_STREAM: TextIO | None = None
 DEBUG_STREAM_OWNED = False
@@ -197,6 +201,7 @@ class QuotaView:
 class ProbeOutcome:
     quota: QuotaView
     cacheable: bool = True
+    server_confirmed: bool = False
 
     @classmethod
     def status(cls, value: str, *, cacheable: bool = True) -> "ProbeOutcome":
@@ -226,6 +231,7 @@ class AuthFile:
     email: str = EMPTY_CELL
     metadata: AccountMetadata = field(default_factory=AccountMetadata)
     quota: QuotaView = field(default_factory=QuotaView)
+    quota_server_confirmed: bool = False
 
     @property
     def name(self) -> str:
@@ -249,17 +255,26 @@ class AuthFile:
     def fallback_label(self) -> str:
         status = "[active]" if self.is_active else f"[slot {self.suffix}]"
         quota = self.quota
-        return "".join(
+        is_expired = is_auth_file_expired(self)
+        label = "".join(
             (
                 format_plain_cell(status, STATUS_WIDTH),
                 " ",
                 format_plain_cell(self.name, NAME_WIDTH),
                 " ",
-                format_ansi_percent_cell(quota.primary_left, quota.primary_left_percent, PRIMARY_LEFT_WIDTH),
+                (
+                    format_plain_cell(quota.primary_left, PRIMARY_LEFT_WIDTH)
+                    if is_expired
+                    else format_ansi_percent_cell(quota.primary_left, quota.primary_left_percent, PRIMARY_LEFT_WIDTH)
+                ),
                 " ",
                 format_plain_cell(quota.primary_reset, PRIMARY_RESET_WIDTH),
                 " ",
-                format_ansi_percent_cell(quota.secondary_left, quota.secondary_left_percent, SECONDARY_LEFT_WIDTH),
+                (
+                    format_plain_cell(quota.secondary_left, SECONDARY_LEFT_WIDTH)
+                    if is_expired
+                    else format_ansi_percent_cell(quota.secondary_left, quota.secondary_left_percent, SECONDARY_LEFT_WIDTH)
+                ),
                 " ",
                 format_plain_cell(quota.secondary_reset, SECONDARY_RESET_WIDTH),
                 " ",
@@ -268,26 +283,44 @@ class AuthFile:
                 format_plain_cell(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH),
             )
         )
+        if is_expired:
+            return f"{ANSI_GRAY}{label}{ANSI_RESET}"
+        return label
 
     def prompt_toolkit_label(self) -> list[tuple[str, str]]:
         status = "[active]" if self.is_active else f"[slot {self.suffix}]"
         quota = self.quota
+        expired_style = "fg:#64748b" if is_auth_file_expired(self) else ""
         fragments: list[tuple[str, str]] = []
-        fragments.extend(format_prompt_fragments(status, STATUS_WIDTH))
+        fragments.extend(format_prompt_fragments(status, STATUS_WIDTH, expired_style))
         fragments.append(("", " "))
-        fragments.extend(format_prompt_fragments(self.name, NAME_WIDTH))
+        fragments.extend(format_prompt_fragments(self.name, NAME_WIDTH, expired_style))
         fragments.append(("", " "))
-        fragments.extend(format_prompt_percent_fragments(quota.primary_left, quota.primary_left_percent, PRIMARY_LEFT_WIDTH))
+        fragments.extend(
+            format_prompt_percent_fragments(
+                quota.primary_left,
+                quota.primary_left_percent,
+                PRIMARY_LEFT_WIDTH,
+                override_style=expired_style,
+            )
+        )
         fragments.append(("", " "))
-        fragments.extend(format_prompt_fragments(quota.primary_reset, PRIMARY_RESET_WIDTH))
+        fragments.extend(format_prompt_fragments(quota.primary_reset, PRIMARY_RESET_WIDTH, expired_style))
         fragments.append(("", " "))
-        fragments.extend(format_prompt_percent_fragments(quota.secondary_left, quota.secondary_left_percent, SECONDARY_LEFT_WIDTH))
+        fragments.extend(
+            format_prompt_percent_fragments(
+                quota.secondary_left,
+                quota.secondary_left_percent,
+                SECONDARY_LEFT_WIDTH,
+                override_style=expired_style,
+            )
+        )
         fragments.append(("", " "))
-        fragments.extend(format_prompt_fragments(quota.secondary_reset, SECONDARY_RESET_WIDTH))
+        fragments.extend(format_prompt_fragments(quota.secondary_reset, SECONDARY_RESET_WIDTH, expired_style))
         fragments.append(("", " "))
-        fragments.extend(format_prompt_fragments(self.email, EMAIL_WIDTH))
+        fragments.extend(format_prompt_fragments(self.email, EMAIL_WIDTH, expired_style))
         fragments.append(("", " "))
-        fragments.extend(format_prompt_fragments(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH))
+        fragments.extend(format_prompt_fragments(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH, expired_style))
         return fragments
 
 
@@ -497,11 +530,13 @@ Rules:
   - at most one active file exists at a time
   - the menu shows cached or live remaining quota and reset countdowns for each auth file
   - the menu shows each auth file's user email from the local id_token or cache when available
-  - Edit Account Info stores seller, purchase date, validity days, and a note in per-auth metadata sidecars
-  - metadata sidecars move with auth files when codex-auth switches, activates, or archives them
+  - Edit Account Info stores seller, purchase date, validity days, and a note in {METADATA_STORE_NAME}
+  - account info is keyed by email, so it follows auth files when codex-auth switches or archives them
   - quota probes use a read-only HTTPS request with the current auth token
   - quota probes never trigger token refresh or modify your real auth files
   - transient probe failures keep stale cached quota when available and mark it with *
+  - sorting prioritizes server-confirmed expired accounts, then nearest account expiry,
+    then 7d reset, 5h reset, and lower remaining percentages
   - live probe failures can surface as statuses such as token expired, timeout, bad auth, or network error
   - after a successful switch, the newly active file timestamp is updated
   - New Account archives the active auth.json into the next auth.json<number> slot
@@ -553,6 +588,28 @@ def parse_args(argv: Sequence[str]) -> CliOptions:
         index += 1
 
     return CliOptions(directory=directory, debug=debug, debug_log_path=debug_log_path, proxy_url=proxy_url)
+
+
+def is_help_invocation(argv: Sequence[str]) -> bool:
+    return any(arg in {"-h", "--help"} for arg in argv)
+
+
+def script_invocation_command() -> str:
+    invocation = sys.argv[0] or "codex-auth"
+    if "/" in invocation:
+        return str(Path(invocation).resolve())
+    return invocation
+
+
+def ensure_network_guard(argv: Sequence[str]) -> None:
+    if os.environ.get(NETWORK_GUARD_ACTIVE_ENV_VAR) == "1" or is_help_invocation(argv):
+        return
+
+    command = [NETWORK_GUARD_COMMAND, "exec", "--", script_invocation_command(), *argv]
+    try:
+        os.execvp(command[0], command)
+    except OSError as error:
+        fail(f"Could not start {NETWORK_GUARD_COMMAND}: {error}")
 
 
 def auth_sort_key(name: str) -> tuple[int, int]:
@@ -666,14 +723,24 @@ def format_prompt_fragments(value: str, width: int, style: str = "") -> list[tup
     return [(style, format_plain_cell(value, width))]
 
 
-def format_prompt_percent_fragments(value: str, percent: int | None, width: int) -> list[tuple[str, str]]:
+def format_prompt_percent_fragments(
+    value: str, percent: int | None, width: int, *, override_style: str = ""
+) -> list[tuple[str, str]]:
     color_name = color_style_for_percent(percent)
-    style = f"fg:{color_name}" if color_name else ""
+    style = override_style or (f"fg:{color_name}" if color_name else "")
     return format_prompt_fragments(value, width, style=style)
 
 
-def metadata_path(auth_path: Path) -> Path:
-    return auth_path.with_name(f"{auth_path.name}{METADATA_SUFFIX}")
+def metadata_store_path(directory: Path) -> Path:
+    return directory / METADATA_STORE_NAME
+
+
+def legacy_metadata_path(auth_path: Path) -> Path:
+    return auth_path.with_name(f"{auth_path.name}{LEGACY_METADATA_SUFFIX}")
+
+
+def metadata_key(email: str) -> str:
+    return email.strip().lower()
 
 
 def parse_metadata_text(value: object) -> str:
@@ -700,8 +767,22 @@ def parse_metadata_validity_days(value: object) -> int | None:
     return value
 
 
-def load_account_metadata(auth_path: Path) -> AccountMetadata:
-    sidecar_path = metadata_path(auth_path)
+def parse_account_metadata_payload(payload: object) -> AccountMetadata:
+    if not isinstance(payload, dict):
+        raise ValueError("metadata payload must be an object")
+    try:
+        return AccountMetadata(
+            seller=parse_metadata_text(payload.get("seller")),
+            purchased_on=parse_metadata_purchase_date(payload.get("purchased_on")),
+            valid_for_days=parse_metadata_validity_days(payload.get("valid_for_days")),
+            note=parse_metadata_text(payload.get("note")),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("metadata payload contains invalid values") from None
+
+
+def load_legacy_account_metadata(auth_path: Path) -> AccountMetadata:
+    sidecar_path = legacy_metadata_path(auth_path)
     try:
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -713,18 +794,13 @@ def load_account_metadata(auth_path: Path) -> AccountMetadata:
         return AccountMetadata(error="metadata error")
 
     try:
-        return AccountMetadata(
-            seller=parse_metadata_text(payload.get("seller")),
-            purchased_on=parse_metadata_purchase_date(payload.get("purchased_on")),
-            valid_for_days=parse_metadata_validity_days(payload.get("valid_for_days")),
-            note=parse_metadata_text(payload.get("note")),
-        )
-    except (TypeError, ValueError):
+        return parse_account_metadata_payload(payload)
+    except ValueError:
         return AccountMetadata(error="metadata error")
 
 
 def account_metadata_payload(metadata: AccountMetadata) -> dict[str, object]:
-    payload: dict[str, object] = {"version": METADATA_VERSION}
+    payload: dict[str, object] = {}
     if metadata.seller:
         payload["seller"] = metadata.seller
     if metadata.purchased_on is not None:
@@ -736,24 +812,61 @@ def account_metadata_payload(metadata: AccountMetadata) -> dict[str, object]:
     return payload
 
 
-def save_account_metadata(auth_path: Path, metadata: AccountMetadata) -> None:
-    sidecar_path = metadata_path(auth_path)
-    if not metadata.has_values():
+def load_account_metadata_store(directory: Path) -> dict[str, AccountMetadata] | None:
+    store_path = metadata_store_path(directory)
+    try:
+        payload = json.loads(store_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict) or payload.get("version") != METADATA_VERSION:
+        return None
+
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, dict):
+        return None
+
+    metadata_by_email: dict[str, AccountMetadata] = {}
+    for email, account_payload in accounts.items():
+        if not isinstance(email, str):
+            continue
+        key = metadata_key(email)
+        if not key:
+            continue
         try:
-            sidecar_path.unlink()
+            metadata_by_email[key] = parse_account_metadata_payload(account_payload)
+        except ValueError:
+            metadata_by_email[key] = AccountMetadata(error="metadata error")
+    return metadata_by_email
+
+
+def write_account_metadata_store(directory: Path, metadata_by_email: dict[str, AccountMetadata]) -> None:
+    store_path = metadata_store_path(directory)
+    accounts = {
+        email: account_metadata_payload(metadata)
+        for email, metadata in sorted(metadata_by_email.items())
+        if metadata.has_values() and not metadata.error
+    }
+
+    if not accounts:
+        try:
+            store_path.unlink()
         except FileNotFoundError:
             return
-        fsync_directory(sidecar_path.parent)
+        fsync_directory(store_path.parent)
         return
 
-    temp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp-{secrets.token_hex(4)}")
+    temp_path = store_path.with_name(f"{store_path.name}.tmp-{secrets.token_hex(4)}")
+    payload = {"version": METADATA_VERSION, "accounts": accounts}
     try:
         temp_path.write_text(
-            json.dumps(account_metadata_payload(metadata), indent=2, sort_keys=True) + "\n",
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        os.replace(temp_path, sidecar_path)
-        fsync_directory(sidecar_path.parent)
+        os.replace(temp_path, store_path)
+        fsync_directory(store_path.parent)
     finally:
         try:
             temp_path.unlink()
@@ -761,16 +874,83 @@ def save_account_metadata(auth_path: Path, metadata: AccountMetadata) -> None:
             pass
 
 
+def load_account_metadata(
+    auth_path: Path,
+    email: str,
+    metadata_by_email: dict[str, AccountMetadata] | None,
+) -> AccountMetadata:
+    if not email:
+        return AccountMetadata()
+
+    if metadata_by_email is None:
+        return AccountMetadata(error="metadata error")
+
+    key = metadata_key(email)
+    if key in metadata_by_email:
+        return metadata_by_email[key]
+
+    return load_legacy_account_metadata(auth_path)
+
+
+def save_account_metadata(auth_file: AuthFile, metadata: AccountMetadata) -> None:
+    key = metadata_key(auth_file.email)
+    if not key:
+        raise ValueError(f"No email found for {auth_file.name}; account info cannot be saved.")
+
+    metadata_by_email = load_account_metadata_store(auth_file.path.parent)
+    if metadata_by_email is None:
+        raise ValueError(f"Invalid metadata store: {metadata_store_path(auth_file.path.parent)}")
+
+    if metadata.has_values():
+        metadata_by_email[key] = metadata
+    else:
+        metadata_by_email.pop(key, None)
+    write_account_metadata_store(auth_file.path.parent, metadata_by_email)
+
+
+def migrate_legacy_account_metadata(
+    auth_path: Path,
+    email: str,
+    metadata: AccountMetadata,
+    metadata_by_email: dict[str, AccountMetadata] | None,
+) -> bool:
+    if metadata_by_email is None or not email or metadata.error or not metadata.has_values():
+        return False
+    key = metadata_key(email)
+    if key in metadata_by_email:
+        return False
+    metadata_by_email[key] = metadata
+    debug_log("migrated legacy account metadata", auth_file=auth_path.name, email=email)
+    return True
+
+
+def account_expiration_date(metadata: AccountMetadata) -> date | None:
+    if metadata.purchased_on is None or metadata.valid_for_days is None:
+        return None
+    return metadata.purchased_on + timedelta(days=metadata.valid_for_days)
+
+
+def is_account_expired(metadata: AccountMetadata, *, today: date | None = None) -> bool:
+    expires_on = account_expiration_date(metadata)
+    if expires_on is None:
+        return False
+    current_date = today or datetime.now().astimezone().date()
+    return expires_on < current_date
+
+
+def is_auth_file_expired(auth_file: AuthFile, *, today: date | None = None) -> bool:
+    return is_account_expired(auth_file.metadata, today=today) and not auth_file.quota_server_confirmed
+
+
 def account_validity_text(metadata: AccountMetadata, *, today: date | None = None) -> str:
     if metadata.purchased_on is None and metadata.valid_for_days is None:
         return EMPTY_CELL
     if metadata.purchased_on is None:
         return f"{metadata.valid_for_days}d validity"
-    if metadata.valid_for_days is None:
+    expires_on = account_expiration_date(metadata)
+    if expires_on is None:
         return EMPTY_CELL
-
     current_date = today or datetime.now().astimezone().date()
-    expires_on = metadata.purchased_on + timedelta(days=metadata.valid_for_days)
     remaining_days = (expires_on - current_date).days
     if remaining_days > 0:
         return f"{remaining_days}d left"
@@ -870,10 +1050,17 @@ def list_auth_files(directory: Path) -> list[AuthFile]:
         if path.is_file() and AUTH_PATTERN.fullmatch(path.name) is not None
     ]
 
+    metadata_by_email = load_account_metadata_store(directory)
+    migrated_legacy_metadata = False
     auth_files = []
     for path in sorted(matched_paths, key=lambda item: auth_sort_key(item.name)):
         suffix = path.name.removeprefix(ACTIVE_NAME)
         stat_result = path.stat()
+        email = extract_auth_email(path)
+        metadata = load_account_metadata(path, email, metadata_by_email)
+        migrated_legacy_metadata = (
+            migrate_legacy_account_metadata(path, email, metadata, metadata_by_email) or migrated_legacy_metadata
+        )
         auth_files.append(
             AuthFile(
                 path=path,
@@ -882,10 +1069,16 @@ def list_auth_files(directory: Path) -> list[AuthFile]:
                 last_used_at=stat_result.st_mtime,
                 size_bytes=stat_result.st_size,
                 mtime_ns=stat_result.st_mtime_ns,
-                email=extract_auth_email(path),
-                metadata=load_account_metadata(path),
+                email=email,
+                metadata=metadata,
             )
         )
+
+    if migrated_legacy_metadata and metadata_by_email is not None:
+        try:
+            write_account_metadata_store(directory, metadata_by_email)
+        except OSError as error:
+            debug_exception("failed to save migrated legacy account metadata", error, directory=directory)
 
     if not auth_files:
         fail(f"No auth files matching auth.json or auth.json<number> found in {directory}.")
@@ -1439,7 +1632,7 @@ def probe_quota_view(auth_file: AuthFile, directory: Path, proxy_config: UsagePr
         payload = fetch_usage_payload(endpoint, usage_request_headers(access_token, account_id), proxy_config)
         quota = format_quota_view(payload)
         debug_log("probe completed", auth_file=auth_file.name, status=quota.primary_left)
-        return ProbeOutcome(quota)
+        return ProbeOutcome(quota, server_confirmed=True)
     except QuotaProbeError as error:
         status = error.status
         if status == UNAUTHORIZED and is_access_token_expired(access_token):
@@ -1467,18 +1660,33 @@ def enrich_auth_files_with_quota(
     enriched_auth_files: list[AuthFile] = []
     files_to_probe: list[AuthFile] = []
     stale_fallbacks: dict[Path, QuotaView] = {}
+    metadata_by_email: dict[str, AccountMetadata] | None = None
+    metadata_store_loaded = False
+    metadata_store_changed = False
 
     for auth_file in auth_files:
         fallback_email = cached_email(cache, auth_file)
         if not auth_file.email and fallback_email:
             auth_file = replace(auth_file, email=fallback_email)
+        if auth_file.email and not auth_file.metadata.has_values() and not auth_file.metadata.error:
+            if not metadata_store_loaded:
+                metadata_by_email = load_account_metadata_store(directory)
+                metadata_store_loaded = True
+            metadata = load_account_metadata(auth_file.path, auth_file.email, metadata_by_email)
+            metadata_store_changed = (
+                migrate_legacy_account_metadata(auth_file.path, auth_file.email, metadata, metadata_by_email)
+                or metadata_store_changed
+            )
+            auth_file = replace(auth_file, metadata=metadata)
         if update_cached_email(updated_cache, auth_file):
             cache_changed = True
 
         cached_quota = cached_quota_view(cache, auth_file, now, allow_stale=False)
         if cached_quota is not None:
             debug_log("using fresh cached quota", auth_file=auth_file.name, status=cached_quota.primary_left)
-            enriched_auth_files.append(replace(auth_file, quota=cached_quota))
+            enriched_auth_files.append(
+                replace(auth_file, quota=cached_quota, quota_server_confirmed=is_server_confirmed_quota(cached_quota))
+            )
             continue
 
         stale_quota = cached_quota_view(cache, auth_file, now, allow_stale=True)
@@ -1514,6 +1722,12 @@ def enrich_auth_files_with_quota(
         except OSError:
             pass
 
+    if metadata_store_changed and metadata_by_email is not None:
+        try:
+            write_account_metadata_store(directory, metadata_by_email)
+        except OSError as error:
+            debug_exception("failed to save migrated legacy account metadata", error, directory=directory)
+
     enriched_by_path = {auth_file.path: auth_file for auth_file in enriched_auth_files}
     for auth_file in files_to_probe:
         outcome = probed_outcomes.get(auth_file.path)
@@ -1532,47 +1746,43 @@ def enrich_auth_files_with_quota(
         else:
             quota = outcome.quota
             debug_log("using live probe quota", auth_file=auth_file.name, status=quota.primary_left)
-        enriched_by_path[auth_file.path] = replace(auth_file, quota=quota)
+        enriched_by_path[auth_file.path] = replace(
+            auth_file,
+            quota=quota,
+            quota_server_confirmed=outcome.server_confirmed if outcome is not None else False,
+        )
 
     final_auth_files = [enriched_by_path[auth_file.path] for auth_file in auth_files]
     return sorted(final_auth_files, key=auth_priority_key)
 
 
-def auth_priority_key(auth_file: AuthFile) -> tuple[int, float, int, int, float, int, int, int]:
+def is_server_confirmed_quota(quota: QuotaView) -> bool:
+    return quota.is_data_view() or quota.primary_left == "unlimited" or quota.primary_left.startswith("credits ")
+
+
+def quota_priority_key(auth_file: AuthFile) -> tuple[int | float, ...]:
     quota = auth_file.quota
-    has_secondary_data = quota.secondary_reset_at is not None and quota.secondary_left_percent is not None
-    has_primary_data = quota.primary_reset_at is not None and quota.primary_left_percent is not None
-    if has_secondary_data:
-        return (
-            0,
-            quota.secondary_reset_at,
-            quota.secondary_left_percent,
-            0 if has_primary_data else 1,
-            quota.primary_reset_at if quota.primary_reset_at is not None else float("inf"),
-            quota.primary_left_percent if quota.primary_left_percent is not None else 101,
-            *auth_sort_key(auth_file.name),
-        )
-
-    if has_primary_data:
-        return (
-            1,
-            float("inf"),
-            101,
-            0,
-            quota.primary_reset_at,
-            quota.primary_left_percent,
-            *auth_sort_key(auth_file.name),
-        )
-
     return (
-        2,
-        float("inf"),
-        101,
-        1,
-        float("inf"),
-        101,
+        0 if quota.secondary_reset_at is not None else 1,
+        quota.secondary_reset_at if quota.secondary_reset_at is not None else float("inf"),
+        0 if quota.primary_reset_at is not None else 1,
+        quota.primary_reset_at if quota.primary_reset_at is not None else float("inf"),
+        quota.secondary_left_percent if quota.secondary_left_percent is not None else 101,
+        quota.primary_left_percent if quota.primary_left_percent is not None else 101,
         *auth_sort_key(auth_file.name),
     )
+
+
+def auth_priority_key(auth_file: AuthFile) -> tuple[int | float, ...]:
+    expires_on = account_expiration_date(auth_file.metadata)
+    today = datetime.now().astimezone().date()
+    if expires_on is None:
+        return (2, 0, *quota_priority_key(auth_file))
+    if expires_on < today:
+        if auth_file.quota_server_confirmed:
+            return (0, 0, *quota_priority_key(auth_file))
+        return (3, 0, *quota_priority_key(auth_file))
+    return (1, expires_on.toordinal(), *quota_priority_key(auth_file))
 
 
 def fallback_choice(
@@ -1789,7 +1999,7 @@ def prompt_metadata_validity_days(current: int | None, tty_input, tty_output) ->
 
 def prompt_account_metadata(auth_file: AuthFile, tty_input, tty_output) -> AccountMetadata:
     current = auth_file.metadata if not auth_file.metadata.error else AccountMetadata()
-    tty_output.write(f"\nEditing account info for {auth_file.name}.\n")
+    tty_output.write(f"\nEditing account info for {auth_file.email} ({auth_file.name}).\n")
     if auth_file.metadata.error:
         tty_output.write("Existing metadata is invalid. Saving will replace it with the fields below.\n")
     tty_output.write(f"Use {METADATA_CLEAR_TOKEN} to clear a field.\n\n")
@@ -1805,6 +2015,9 @@ def prompt_account_metadata(auth_file: AuthFile, tty_input, tty_output) -> Accou
 
 def edit_account_info(auth_files: Sequence[AuthFile]) -> None:
     auth_file = choose_account_info_auth_file(auth_files)
+    if not auth_file.email:
+        fail(f"Cannot edit account info for {auth_file.name}: no email found in its local id_token.")
+
     try:
         tty_input = open("/dev/tty", "r", encoding="utf-8")
         tty_output = open("/dev/tty", "w", encoding="utf-8")
@@ -1818,14 +2031,14 @@ def edit_account_info(auth_files: Sequence[AuthFile]) -> None:
         tty_output.close()
 
     try:
-        save_account_metadata(auth_file.path, metadata)
-    except OSError as error:
+        save_account_metadata(auth_file, metadata)
+    except (OSError, ValueError) as error:
         fail(f"Failed to save account info for {auth_file.name}: {error}")
 
     if metadata.has_values():
-        print(f"Account info saved for {auth_file.name}.")
+        print(f"Account info saved for {auth_file.email}.")
     else:
-        print(f"Account info cleared for {auth_file.name}.")
+        print(f"Account info cleared for {auth_file.email}.")
 
 
 def read_proc_cmdline(process_dir: Path) -> tuple[str, ...]:
@@ -2253,30 +2466,11 @@ def unique_temp_path(directory: Path) -> Path:
             return candidate
 
 
-def unique_path_temp_path(path: Path) -> Path:
-    while True:
-        candidate = path.with_name(f"{path.name}.swap-{secrets.token_hex(4)}")
-        if not candidate.exists():
-            return candidate
-
-
 def ensure_regular_file(path: Path, role: str) -> None:
     if not path.exists():
         raise SwapError(f"{role} file does not exist: {path}")
     if not path.is_file():
         raise SwapError(f"{role} path is not a regular file: {path}")
-
-
-def ensure_optional_regular_file(path: Path, role: str) -> None:
-    if path.exists() and not path.is_file():
-        raise SwapError(f"{role} path is not a regular file: {path}")
-
-
-def ensure_metadata_target_is_clear(auth_path: Path, role: str) -> None:
-    target_path = metadata_path(auth_path)
-    ensure_optional_regular_file(target_path, role)
-    if target_path.exists():
-        raise SwapError(f"{role} metadata sidecar already exists: {target_path}")
 
 
 def fsync_directory(directory: Path) -> None:
@@ -2330,27 +2524,14 @@ def swap_auth_files(active_path: Path, selected_path: Path) -> None:
 
     ensure_regular_file(active_path, "Active")
     ensure_regular_file(selected_path, "Selected")
-    active_metadata_path = metadata_path(active_path)
-    selected_metadata_path = metadata_path(selected_path)
-    ensure_optional_regular_file(active_metadata_path, "Active metadata sidecar")
-    ensure_optional_regular_file(selected_metadata_path, "Selected metadata sidecar")
 
     temp_path = unique_temp_path(active_path.parent)
-    temp_metadata_path = unique_path_temp_path(active_metadata_path)
-    has_active_metadata = active_metadata_path.exists()
-    has_selected_metadata = selected_metadata_path.exists()
     replaced_paths: list[tuple[Path, Path]] = []
 
     try:
         replace_path(active_path, temp_path, replaced_paths)
-        if has_active_metadata:
-            replace_path(active_metadata_path, temp_metadata_path, replaced_paths)
         replace_path(selected_path, active_path, replaced_paths)
-        if has_selected_metadata:
-            replace_path(selected_metadata_path, active_metadata_path, replaced_paths)
         replace_path(temp_path, selected_path, replaced_paths)
-        if has_active_metadata:
-            replace_path(temp_metadata_path, selected_metadata_path, replaced_paths)
         fsync_directory(active_path.parent)
     except OSError as error:
         rolled_back, recovery_message = rollback_replaced_paths(replaced_paths)
@@ -2380,16 +2561,10 @@ def activate_auth_file(active_path: Path, selected_path: Path) -> None:
     ensure_regular_file(selected_path, "Selected")
     if active_path.exists():
         raise SwapError(f"Active file already exists: {active_path}")
-    selected_metadata_path = metadata_path(selected_path)
-    active_metadata_path = metadata_path(active_path)
-    ensure_optional_regular_file(selected_metadata_path, "Selected metadata sidecar")
-    ensure_metadata_target_is_clear(active_path, "Active")
     replaced_paths: list[tuple[Path, Path]] = []
 
     try:
         replace_path(selected_path, active_path, replaced_paths)
-        if selected_metadata_path.exists():
-            replace_path(selected_metadata_path, active_metadata_path, replaced_paths)
         fsync_directory(active_path.parent)
     except OSError as error:
         rolled_back, recovery_message = rollback_replaced_paths(replaced_paths)
@@ -2427,16 +2602,10 @@ def archive_active_auth_file(active_path: Path, target_path: Path) -> None:
     ensure_regular_file(active_path, "Active")
     if target_path.exists():
         raise SwapError(f"Target archive slot already exists: {target_path}")
-    active_metadata_path = metadata_path(active_path)
-    target_metadata_path = metadata_path(target_path)
-    ensure_optional_regular_file(active_metadata_path, "Active metadata sidecar")
-    ensure_metadata_target_is_clear(target_path, "Target archive")
     replaced_paths: list[tuple[Path, Path]] = []
 
     try:
         replace_path(active_path, target_path, replaced_paths)
-        if active_metadata_path.exists():
-            replace_path(active_metadata_path, target_metadata_path, replaced_paths)
         fsync_directory(active_path.parent)
     except OSError as error:
         rolled_back, recovery_message = rollback_replaced_paths(replaced_paths)
@@ -2450,6 +2619,7 @@ def archive_active_auth_file(active_path: Path, target_path: Path) -> None:
 
 
 def main() -> None:
+    ensure_network_guard(sys.argv[1:])
     options = parse_args(sys.argv[1:])
     configure_debug_logging(options.debug, options.debug_log_path)
     proxy_config = load_usage_proxy_config(options.directory, options.proxy_url)
