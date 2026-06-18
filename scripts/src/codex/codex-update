@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 PACKAGE='@openai/codex'
-REGISTRY='https://registry.npmjs.org/'
 NETWORK_MODE='current'
+QUARANTINE_ROOT=''
 
 run_npm_direct() {
   env \
@@ -54,6 +54,182 @@ run_npm() {
       exit 1
       ;;
   esac
+}
+
+ensure_quarantine_root() {
+  if [[ -z "$QUARANTINE_ROOT" ]]; then
+    QUARANTINE_ROOT="$GLOBAL_ROOT/.codex-update-quarantine/$(date +%Y%m%dT%H%M%S)-$$"
+  fi
+
+  mkdir -p "$QUARANTINE_ROOT"
+}
+
+quarantine_stale_codex_stage_entries() {
+  local reason search_dir candidate relative_path destination destination_dir
+  reason="$1"
+  shift
+
+  for search_dir in "$@"; do
+    [[ -d "$search_dir" ]] || continue
+
+    for candidate in "$search_dir"/.codex-*; do
+      [[ -e "$candidate" || -L "$candidate" ]] || continue
+
+      ensure_quarantine_root
+      relative_path="${candidate#/}"
+      destination="$QUARANTINE_ROOT/$relative_path"
+      destination_dir="${destination%/*}"
+
+      mkdir -p "$destination_dir"
+
+      if [[ -e "$destination" || -L "$destination" ]]; then
+        destination="$destination.$(date +%s).$$"
+      fi
+
+      printf 'Quarantining stale npm Codex staging entry (%s): %s -> %s\n' \
+        "$reason" "$candidate" "$destination" >&2
+      mv -- "$candidate" "$destination"
+    done
+  done
+}
+
+is_codex_stale_stage_error() {
+  local output_file
+  output_file="$1"
+
+  grep -q 'ENOTEMPTY' "$output_file" \
+    && grep -q 'rename' "$output_file" \
+    && grep -Eq '(/@openai/\.codex-|/bin/\.codex-)' "$output_file"
+}
+
+npm_with_stale_stage_retry() {
+  local description output_file
+  local -a stage_dirs npm_args
+
+  description="$1"
+  shift
+
+  stage_dirs=()
+  while [[ $# -gt 0 && "$1" != '--' ]]; do
+    stage_dirs+=("$1")
+    shift
+  done
+
+  if [[ $# -eq 0 ]]; then
+    printf 'Internal error: missing npm argument separator for %s.\n' "$description" >&2
+    exit 1
+  fi
+  shift
+
+  npm_args=("$@")
+  output_file="$(mktemp -t codex-update-npm.XXXXXX)"
+
+  if run_npm "${npm_args[@]}" 2>&1 | tee "$output_file"; then
+    rm -f "$output_file"
+    return 0
+  fi
+
+  if is_codex_stale_stage_error "$output_file"; then
+    printf 'npm hit a stale Codex staging directory while %s; quarantining leftovers and retrying once.\n' \
+      "$description" >&2
+    quarantine_stale_codex_stage_entries 'npm ENOTEMPTY retry' "${stage_dirs[@]}"
+
+    if run_npm "${npm_args[@]}"; then
+      rm -f "$output_file"
+      return 0
+    fi
+  fi
+
+  rm -f "$output_file"
+  return 1
+}
+
+append_registry() {
+  local registry existing
+  registry="$1"
+
+  [[ -n "$registry" ]] || return 0
+
+  for existing in "${REGISTRIES[@]}"; do
+    [[ "$existing" != "$registry" ]] || return 0
+  done
+
+  REGISTRIES+=("$registry")
+}
+
+build_registries() {
+  local configured_registry
+
+  REGISTRIES=()
+
+  if [[ -n "${CODEX_NPM_REGISTRY:-}" ]]; then
+    append_registry "$CODEX_NPM_REGISTRY"
+  else
+    configured_registry="$(run_npm config get registry 2>/dev/null || true)"
+    [[ "$configured_registry" != 'undefined' ]] || configured_registry=''
+    append_registry "$configured_registry"
+  fi
+
+  append_registry 'https://package-mirror.liara.ir/repository/npm/'
+  append_registry 'https://registry.npmjs.org/'
+  append_registry 'https://registry.npmmirror.com/'
+}
+
+resolve_latest_version() {
+  local registry version
+
+  for registry in "${REGISTRIES[@]}"; do
+    printf 'Resolving latest %s version from %s...\n' "$PACKAGE" "$registry" >&2
+    if version="$(run_npm view "$PACKAGE" version --registry="$registry" 2>/dev/null | tr -d '[:space:]')" && [[ -n "$version" ]]; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+install_codex_package() {
+  local registry
+
+  for registry in "${REGISTRIES[@]}"; do
+    printf 'Installing %s@%s from %s...\n' "$PACKAGE" "$TARGET_VERSION" "$registry"
+    if npm_with_stale_stage_retry \
+      "installing $PACKAGE@$TARGET_VERSION from $registry" \
+      "$GLOBAL_ROOT/@openai" \
+      "$GLOBAL_PREFIX/bin" \
+      -- \
+      install -g "$PACKAGE@$TARGET_VERSION" --include=optional --registry="$registry"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+install_platform_package() {
+  local codex_package_dir registry
+  codex_package_dir="$1"
+
+  for registry in "${REGISTRIES[@]}"; do
+    printf 'Installing missing platform package %s from %s...\n' "$PLATFORM_PACKAGE" "$registry"
+    if npm_with_stale_stage_retry \
+      "installing $PLATFORM_PACKAGE for $PACKAGE@$TARGET_VERSION from $registry" \
+      "$codex_package_dir/node_modules/@openai" \
+      "$codex_package_dir/node_modules/.bin" \
+      -- \
+      install \
+      --prefix "$codex_package_dir" \
+      --no-save \
+      --package-lock=false \
+      "${PLATFORM_PACKAGE}@npm:${PACKAGE}@${TARGET_VERSION}-${PLATFORM_SUFFIX}" \
+      --include=optional \
+      --registry="$registry"; then
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 platform_package() {
@@ -134,7 +310,7 @@ usage() {
   cat <<'EOF'
 Usage: codex-update [options] [version]
 
-Update Codex CLI from npmjs.org.
+Update Codex CLI from npm.
 
 Options:
   --direct     Bypass proxy environment and npm proxy config.
@@ -150,6 +326,9 @@ Arguments:
   version    Optional explicit version to install, for example 0.122.0.
              When omitted, the script resolves the current latest version
              first and then installs that exact version.
+
+Environment:
+  CODEX_NPM_REGISTRY  Optional registry to try before the built-in fallbacks.
 EOF
 }
 
@@ -209,9 +388,12 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+build_registries
+
 if [[ -z "$TARGET_VERSION" ]]; then
-  printf 'Resolving latest %s version from %s...\n' "$PACKAGE" "$REGISTRY"
-  TARGET_VERSION="$(run_npm view "$PACKAGE" version --registry="$REGISTRY" | tr -d '[:space:]')"
+  if ! TARGET_VERSION="$(resolve_latest_version)"; then
+    TARGET_VERSION=''
+  fi
 fi
 
 if [[ -z "$TARGET_VERSION" ]]; then
@@ -221,18 +403,29 @@ fi
 
 PLATFORM_PACKAGE="$(platform_package)"
 PLATFORM_SUFFIX="$(platform_suffix)"
-
-printf 'Removing %s...\n' "$PACKAGE"
-run_npm uninstall -g "$PACKAGE" --registry="$REGISTRY" || true
-
-printf 'Installing %s@%s from %s...\n' "$PACKAGE" "$TARGET_VERSION" "$REGISTRY"
-run_npm install -g "$PACKAGE@$TARGET_VERSION" --include=optional --registry="$REGISTRY"
-
 GLOBAL_ROOT="$(run_npm root -g)"
+GLOBAL_PREFIX="$(run_npm prefix -g)"
+CODEX_PACKAGE_DIR="$GLOBAL_ROOT/@openai/codex"
+
+quarantine_stale_codex_stage_entries 'preflight' \
+  "$GLOBAL_ROOT/@openai" \
+  "$GLOBAL_PREFIX/bin"
+
+if ! install_codex_package; then
+  printf 'Could not install %s@%s from any configured registry.\n' "$PACKAGE" "$TARGET_VERSION" >&2
+  exit 1
+fi
 
 if ! verify_platform_package_resolves "$GLOBAL_ROOT"; then
-  printf 'Installing missing platform package %s...\n' "$PLATFORM_PACKAGE"
-  run_npm install -g "${PLATFORM_PACKAGE}@npm:${PACKAGE}@${TARGET_VERSION}-${PLATFORM_SUFFIX}" --include=optional --registry="$REGISTRY"
+  quarantine_stale_codex_stage_entries 'platform package preflight' \
+    "$CODEX_PACKAGE_DIR/node_modules/@openai" \
+    "$CODEX_PACKAGE_DIR/node_modules/.bin"
+
+  if ! install_platform_package "$CODEX_PACKAGE_DIR"; then
+    printf 'Could not install %s for %s@%s from any configured registry.\n' \
+      "$PLATFORM_PACKAGE" "$PACKAGE" "$TARGET_VERSION" >&2
+    exit 1
+  fi
 fi
 
 if ! verify_platform_package_resolves "$GLOBAL_ROOT"; then
