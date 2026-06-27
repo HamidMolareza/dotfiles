@@ -44,6 +44,7 @@ alias dema='dotnet ef migrations add'
 alias dedu='dotnet ef database update'
 alias dap='dotnet add package'
 alias dotnet-outdated='dotnet outdated'
+alias bale='dotnet run --project /home/home/my-files/projects/bale-client-library/samples/Bale.Net.Samples.AccountExplorer/Bale.Net.Samples.AccountExplorer.csproj --'
 
 alias restart-wifi='sudo systemctl restart NetworkManager; nmcli radio wifi off; nmcli radio wifi on'
 
