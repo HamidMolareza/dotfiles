@@ -123,3 +123,6 @@ fi
 if command_exists codex; then
     eval "$(codex completion zsh)"
 fi
+
+
+export PATH="$HOME/.local/bin:$PATH"

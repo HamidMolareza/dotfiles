@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""Manage soft subtitles and SRT timing for video files."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+SRT_TIME_RE = re.compile(
+    r"^(?P<start>\d{2,}:\d{2}:\d{2},\d{3})\s+-->\s+"
+    r"(?P<end>\d{2,}:\d{2}:\d{2},\d{3})(?P<rest>.*)$"
+)
+ISO_639_2_JSON = Path("/usr/share/iso-codes/json/iso_639-2.json")
+FALLBACK_LANGUAGE_MAP = {
+    "ar": "ara",
+    "de": "deu",
+    "en": "eng",
+    "es": "spa",
+    "fa": "fas",
+    "fr": "fra",
+    "it": "ita",
+    "ja": "jpn",
+    "ko": "kor",
+    "pt": "por",
+    "ru": "rus",
+    "tr": "tur",
+    "zh": "zho",
+}
+LANGUAGE_ALIASES: dict[str, str] | None = None
+LANGUAGE_ALPHA3: set[str] | None = None
+
+
+class SubtitleError(Exception):
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def die(message: str, exit_code: int = 1) -> None:
+    raise SubtitleError(message, exit_code)
+
+
+def load_language_data() -> tuple[dict[str, str], set[str]]:
+    global LANGUAGE_ALIASES, LANGUAGE_ALPHA3
+    if LANGUAGE_ALIASES is not None and LANGUAGE_ALPHA3 is not None:
+        return LANGUAGE_ALIASES, LANGUAGE_ALPHA3
+
+    aliases = dict(FALLBACK_LANGUAGE_MAP)
+    alpha3_values = set(FALLBACK_LANGUAGE_MAP.values())
+    alpha3_values.add("und")
+
+    if ISO_639_2_JSON.is_file():
+        try:
+            data = json.loads(ISO_639_2_JSON.read_text(encoding="utf-8"))
+            for row in data.get("639-2", []):
+                alpha3 = row.get("alpha_3")
+                if not alpha3:
+                    continue
+
+                alpha3 = alpha3.lower()
+                alpha3_values.add(alpha3)
+                aliases[alpha3] = alpha3
+                alpha2 = row.get("alpha_2")
+                if alpha2:
+                    aliases[alpha2.lower()] = alpha3
+                bibliographic = row.get("bibliographic")
+                if bibliographic:
+                    aliases[bibliographic.lower()] = bibliographic.lower()
+                    alpha3_values.add(bibliographic.lower())
+
+                for name_part in row.get("name", "").split(";"):
+                    name = name_part.strip().lower()
+                    if name:
+                        aliases[name] = alpha3
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    LANGUAGE_ALIASES = aliases
+    LANGUAGE_ALPHA3 = alpha3_values
+    return aliases, alpha3_values
+
+
+def normalize_language_code(value: str | None) -> str:
+    if value is None:
+        return "und"
+
+    language = value.strip().lower().replace("_", "-")
+    if not language:
+        return "und"
+
+    aliases, alpha3_values = load_language_data()
+    if language in aliases:
+        return aliases[language]
+
+    primary = language.split("-", 1)[0]
+    if primary in aliases:
+        return aliases[primary]
+
+    if len(language) == 3 and language.isalpha():
+        if language in alpha3_values:
+            return language
+        die(f"unknown ISO 639-2 language code: {value}")
+
+    die(f"unknown language code: {value}. Use a code like en/eng or fa/fas.")
+    raise AssertionError("unreachable")
+
+
+def need_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        die(f"{name} is required but was not found.")
+
+
+def require_file(path: Path, label: str) -> None:
+    if not path.is_file():
+        die(f"{label} not found: {path}")
+
+
+def ensure_output(path: Path, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        die(f"output already exists: {path} (use --overwrite to replace it)")
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve() == right.expanduser().resolve()
+
+
+def temp_sibling(final_path: Path) -> Path:
+    fd, temp_name = tempfile.mkstemp(
+        dir=final_path.parent,
+        prefix=f".{final_path.stem}.subtitle-tmp.",
+        suffix=final_path.suffix,
+    )
+    os.close(fd)
+    Path(temp_name).unlink()
+    return Path(temp_name)
+
+
+def default_output(input_path: Path, suffix: str, extension: str | None = None) -> Path:
+    ext = extension if extension is not None else input_path.suffix
+    return input_path.with_name(f"{input_path.stem}.{suffix}{ext}")
+
+
+def resolve_write_target(
+    input_path: Path,
+    requested_output: Path | None,
+    overwrite: bool,
+) -> tuple[Path, Path, bool]:
+    if requested_output is None:
+        final_path = input_path
+        return final_path, temp_sibling(final_path), True
+
+    final_path = requested_output
+    if same_path(input_path, final_path):
+        return final_path, temp_sibling(final_path), True
+
+    ensure_output(final_path, overwrite)
+    return final_path, final_path, False
+
+
+def finalize_output(temp_path: Path, final_path: Path, in_place: bool) -> None:
+    if in_place:
+        os.replace(temp_path, final_path)
+
+
+def cleanup_temp(temp_path: Path, final_path: Path, in_place: bool) -> None:
+    if in_place and temp_path != final_path:
+        temp_path.unlink(missing_ok=True)
+
+
+def run_ffmpeg_replace(cmd: list[str], temp_path: Path, final_path: Path, in_place: bool) -> None:
+    try:
+        run_command(cmd)
+        finalize_output(temp_path, final_path, in_place)
+    except BaseException:
+        cleanup_temp(temp_path, final_path, in_place)
+        raise
+
+
+def run_command(cmd: list[str], capture_json: bool = False) -> Any:
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE if capture_json else None,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        die(str(exc))
+
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        if detail:
+            die(detail)
+        die(f"command failed: {' '.join(cmd)}")
+
+    if capture_json:
+        try:
+            return json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            die(f"failed to parse ffprobe output: {exc}")
+
+    return None
+
+
+def ffprobe_streams(video: Path) -> list[dict[str, Any]]:
+    need_tool("ffprobe")
+    require_file(video, "input video")
+    data = run_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            str(video),
+        ],
+        capture_json=True,
+    )
+    return list(data.get("streams", []))
+
+
+def subtitle_streams(video: Path) -> list[dict[str, Any]]:
+    streams = ffprobe_streams(video)
+    subtitles: list[dict[str, Any]] = []
+    for stream in streams:
+        if stream.get("codec_type") == "subtitle":
+            item = dict(stream)
+            item["subtitle_index"] = len(subtitles)
+            subtitles.append(item)
+    return subtitles
+
+
+def get_subtitle_stream(video: Path, subtitle_index: int) -> dict[str, Any]:
+    streams = subtitle_streams(video)
+    for stream in streams:
+        if stream["subtitle_index"] == subtitle_index:
+            return stream
+    available = ", ".join(str(s["subtitle_index"]) for s in streams) or "none"
+    die(f"subtitle stream {subtitle_index} not found. Available subtitle streams: {available}")
+    raise AssertionError("unreachable")
+
+
+def subtitle_language(stream: dict[str, Any]) -> str:
+    return (stream.get("tags") or {}).get("language") or "und"
+
+
+def subtitle_title(stream: dict[str, Any]) -> str:
+    tags = stream.get("tags") or {}
+    return tags.get("title") or tags.get("handler_name") or ""
+
+
+def subtitle_is_default(stream: dict[str, Any]) -> bool:
+    return ((stream.get("disposition") or {}).get("default") == 1)
+
+
+def subtitle_label(stream: dict[str, Any]) -> str:
+    default = "*" if subtitle_is_default(stream) else " "
+    title = subtitle_title(stream) or "(no title)"
+    return (
+        f"{default} #{stream['subtitle_index']} "
+        f"stream {stream.get('index', '?')} "
+        f"{stream.get('codec_name') or 'unknown'} "
+        f"{subtitle_language(stream)} "
+        f"{title}"
+    )
+
+
+def list_subtitles(args: argparse.Namespace) -> None:
+    streams = subtitle_streams(args.video)
+    if not streams:
+        print("No subtitle streams found.")
+        return
+
+    print("sub  stream  codec       lang  default  title")
+    print("---  ------  ----------  ----  -------  -----")
+    for stream in streams:
+        sub_index = stream["subtitle_index"]
+        stream_index = stream.get("index", "?")
+        codec = stream.get("codec_name") or "unknown"
+        language = subtitle_language(stream)
+        title = subtitle_title(stream)
+        default = "yes" if subtitle_is_default(stream) else "no"
+        print(f"{sub_index:<3}  {stream_index!s:<6}  {codec:<10}  {language:<4}  {default:<7}  {title}")
+
+
+def codec_for_subtitle(output: Path) -> str:
+    ext = output.suffix.lower()
+    if ext in {".mp4", ".m4v", ".mov"}:
+        return "mov_text"
+    if ext in {".mkv", ".webm"}:
+        return "copy"
+    die(f"unsupported output container for subtitle add: {output.suffix or '(none)'}")
+    raise AssertionError("unreachable")
+
+
+def add_subtitle(args: argparse.Namespace) -> None:
+    need_tool("ffmpeg")
+    require_file(args.video, "input video")
+    require_file(args.subtitle_file, "subtitle file")
+
+    final_output, ffmpeg_output, in_place = resolve_write_target(
+        args.video,
+        args.output,
+        args.overwrite,
+    )
+
+    existing_sub_count = len(subtitle_streams(args.video))
+    subtitle_codec = codec_for_subtitle(final_output)
+    language = normalize_language_code(args.lang)
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "warning",
+        "-stats",
+        "-y" if args.overwrite else "-n",
+        "-i",
+        str(args.video),
+        "-i",
+        str(args.subtitle_file),
+        "-map",
+        "0",
+        "-map",
+        "1:0",
+        "-c",
+        "copy",
+        "-c:s",
+        subtitle_codec,
+        f"-metadata:s:s:{existing_sub_count}",
+        f"language={language}",
+    ]
+
+    if args.title:
+        cmd.extend([f"-metadata:s:s:{existing_sub_count}", f"title={args.title}"])
+        cmd.extend([f"-metadata:s:s:{existing_sub_count}", f"handler_name={args.title}"])
+    if args.default:
+        cmd.extend([f"-disposition:s:{existing_sub_count}", "default"])
+
+    cmd.append(str(ffmpeg_output))
+    run_ffmpeg_replace(cmd, ffmpeg_output, final_output, in_place)
+    print(f"{'Updated' if in_place else 'Wrote'}: {final_output}")
+
+
+def remove_subtitles(args: argparse.Namespace) -> None:
+    need_tool("ffmpeg")
+    require_file(args.video, "input video")
+
+    streams = subtitle_streams(args.video)
+    if not streams:
+        die("no subtitle streams found")
+
+    final_output, ffmpeg_output, in_place = resolve_write_target(
+        args.video,
+        args.output,
+        args.overwrite,
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "warning",
+        "-stats",
+        "-y" if args.overwrite else "-n",
+        "-i",
+        str(args.video),
+        "-map",
+        "0",
+    ]
+
+    if args.all or args.stream is None:
+        cmd.extend(["-map", "-0:s"])
+    else:
+        get_subtitle_stream(args.video, args.stream)
+        cmd.extend(["-map", f"-0:s:{args.stream}"])
+
+    cmd.extend(["-c", "copy", str(ffmpeg_output)])
+    run_ffmpeg_replace(cmd, ffmpeg_output, final_output, in_place)
+    print(f"{'Updated' if in_place else 'Wrote'}: {final_output}")
+
+
+def edit_subtitle_metadata(
+    video: Path,
+    subtitle_index: int,
+    output: Path | None,
+    overwrite: bool,
+    title: str | None,
+    language: str | None,
+    set_default: bool,
+) -> Path:
+    need_tool("ffmpeg")
+    require_file(video, "input video")
+    streams = subtitle_streams(video)
+    get_subtitle_stream(video, subtitle_index)
+
+    if title is None and language is None and not set_default:
+        die("nothing to update; pass --title, --lang, or --default")
+
+    final_output, ffmpeg_output, in_place = resolve_write_target(video, output, overwrite)
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "warning",
+        "-stats",
+        "-y" if overwrite else "-n",
+        "-i",
+        str(video),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+    ]
+
+    if title is not None:
+        cmd.extend([f"-metadata:s:s:{subtitle_index}", f"title={title}"])
+        cmd.extend([f"-metadata:s:s:{subtitle_index}", f"handler_name={title}"])
+    if language is not None:
+        lang = normalize_language_code(language)
+        cmd.extend([f"-metadata:s:s:{subtitle_index}", f"language={lang}"])
+    if set_default:
+        for index in range(len(streams)):
+            cmd.extend([f"-disposition:s:{index}", "0"])
+        cmd.extend([f"-disposition:s:{subtitle_index}", "default"])
+
+    cmd.append(str(ffmpeg_output))
+    run_ffmpeg_replace(cmd, ffmpeg_output, final_output, in_place)
+    return final_output
+
+
+def edit_subtitle(args: argparse.Namespace) -> None:
+    output = edit_subtitle_metadata(
+        args.video,
+        args.stream,
+        args.output,
+        args.overwrite,
+        args.title,
+        args.lang,
+        args.default,
+    )
+    print(f"{'Updated' if args.output is None or same_path(args.video, output) else 'Wrote'}: {output}")
+
+
+def extract_subtitle(args: argparse.Namespace) -> None:
+    need_tool("ffmpeg")
+    require_file(args.video, "input video")
+    get_subtitle_stream(args.video, args.stream)
+
+    output = args.output or default_output(args.video, f"stream{args.stream}", ".srt")
+    ensure_output(output, args.overwrite)
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "warning",
+        "-stats",
+        "-y" if args.overwrite else "-n",
+        "-i",
+        str(args.video),
+        "-map",
+        f"0:s:{args.stream}",
+        str(output),
+    ]
+    run_command(cmd)
+    print(f"Wrote: {output}")
+
+
+def parse_srt_time(value: str) -> int:
+    match = re.fullmatch(r"(\d{2,}):(\d{2}):(\d{2}),(\d{3})", value)
+    if not match:
+        die(f"invalid SRT timestamp: {value}")
+    hours, minutes, seconds, millis = (int(part) for part in match.groups())
+    if minutes > 59 or seconds > 59:
+        die(f"invalid SRT timestamp: {value}")
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis
+
+
+def format_srt_time(total_ms: int) -> str:
+    total_ms = max(0, total_ms)
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def parse_seconds(value: str) -> int:
+    try:
+        seconds = float(value)
+    except ValueError:
+        die(f"invalid seconds value: {value}")
+    return int(round(seconds * 1000))
+
+
+def shift_srt(args: argparse.Namespace) -> None:
+    require_file(args.subtitle_file, "subtitle file")
+    final_output, write_output, in_place = resolve_write_target(
+        args.subtitle_file,
+        args.output,
+        args.overwrite,
+    )
+
+    offset_ms = parse_seconds(args.seconds)
+    lines = args.subtitle_file.read_text(encoding="utf-8-sig").splitlines()
+    shifted: list[str] = []
+    seen_timestamp = False
+
+    for line in lines:
+        match = SRT_TIME_RE.match(line)
+        if not match:
+            shifted.append(line)
+            continue
+
+        start_ms = parse_srt_time(match.group("start")) + offset_ms
+        end_ms = parse_srt_time(match.group("end")) + offset_ms
+        start_ms = max(0, start_ms)
+        end_ms = max(start_ms, end_ms)
+        shifted.append(f"{format_srt_time(start_ms)} --> {format_srt_time(end_ms)}{match.group('rest')}")
+        seen_timestamp = True
+
+    if not seen_timestamp:
+        die("no SRT timestamp lines found")
+
+    try:
+        write_output.write_text("\n".join(shifted) + "\n", encoding="utf-8")
+        finalize_output(write_output, final_output, in_place)
+    except BaseException:
+        cleanup_temp(write_output, final_output, in_place)
+        raise
+    print(f"{'Updated' if in_place else 'Wrote'}: {final_output}")
+
+
+def prompt_toolkit_dialogs() -> tuple[Any, Any, Any, Any, Any]:
+    try:
+        from prompt_toolkit.shortcuts import input_dialog, message_dialog, radiolist_dialog, yes_no_dialog
+        from prompt_toolkit.styles import Style
+    except ImportError:
+        die("prompt_toolkit is required for the interactive menu.")
+
+    style = Style.from_dict(
+        {
+            "dialog": "bg:#1f2937",
+            "dialog frame-label": "bg:#1f2937 #ffffff",
+            "dialog.body": "bg:#111827 #ffffff",
+            "button": "bg:#374151 #ffffff",
+            "button.focused": "bg:#2563eb #ffffff",
+            "radio-selected": "#93c5fd",
+            "radio": "#d1d5db",
+        }
+    )
+    return radiolist_dialog, input_dialog, yes_no_dialog, message_dialog, style
+
+
+def run_menu_action(message_dialog: Any, style: Any, title: str, action: Any) -> bool:
+    try:
+        message = action()
+    except SubtitleError as exc:
+        message_dialog(title="Error", text=str(exc), style=style).run()
+        return False
+    message_dialog(title=title, text=message or "Done.", style=style).run()
+    return True
+
+
+def menu_add_subtitle(video: Path, input_dialog: Any, yes_no_dialog: Any, message_dialog: Any, style: Any) -> bool:
+    subtitle_text = input_dialog(
+        title="Add subtitle",
+        text="Subtitle file path:",
+        style=style,
+    ).run()
+    if not subtitle_text:
+        return False
+
+    subtitle_file = Path(subtitle_text).expanduser()
+    default_title = subtitle_file.stem
+    title = input_dialog(
+        title="Add subtitle",
+        text="Subtitle title:",
+        default=default_title,
+        style=style,
+    ).run()
+    if title is None:
+        return False
+
+    lang = input_dialog(
+        title="Add subtitle",
+        text="Language code (en or eng):",
+        default="eng",
+        style=style,
+    ).run()
+    if lang is None:
+        return False
+
+    make_default = yes_no_dialog(
+        title="Add subtitle",
+        text="Set this subtitle as default?",
+        style=style,
+    ).run()
+
+    return run_menu_action(
+        message_dialog,
+        style,
+        "Add subtitle",
+        lambda: (
+            add_subtitle(
+                argparse.Namespace(
+                    video=video,
+                    subtitle_file=subtitle_file,
+                    output=None,
+                    lang=lang,
+                    title=title,
+                    default=make_default,
+                    overwrite=False,
+                )
+            )
+            or "Subtitle track added."
+        ),
+    )
+
+
+def menu_extract_subtitle(
+    video: Path,
+    subtitle_index: int,
+    input_dialog: Any,
+    yes_no_dialog: Any,
+    message_dialog: Any,
+    style: Any,
+) -> bool:
+    default_path = default_output(video, f"stream{subtitle_index}", ".srt")
+    output_text = input_dialog(
+        title="Extract subtitle",
+        text="Output SRT path:",
+        default=str(default_path),
+        style=style,
+    ).run()
+    if not output_text:
+        return False
+
+    output = Path(output_text).expanduser()
+    overwrite = False
+    if output.exists():
+        overwrite = yes_no_dialog(
+            title="Extract subtitle",
+            text=f"Replace existing file?\n{output}",
+            style=style,
+        ).run()
+        if not overwrite:
+            return False
+
+    return run_menu_action(
+        message_dialog,
+        style,
+        "Extract subtitle",
+        lambda: (
+            extract_subtitle(
+                argparse.Namespace(
+                    video=video,
+                    stream=subtitle_index,
+                    output=output,
+                    overwrite=overwrite,
+                )
+            )
+            or f"Extracted to:\n{output}"
+        ),
+    )
+
+
+def menu_stream_actions(
+    video: Path,
+    subtitle_index: int,
+    radiolist_dialog: Any,
+    input_dialog: Any,
+    yes_no_dialog: Any,
+    message_dialog: Any,
+    style: Any,
+) -> bool:
+    while True:
+        stream = get_subtitle_stream(video, subtitle_index)
+        choice = radiolist_dialog(
+            title=f"Subtitle #{subtitle_index}",
+            text=subtitle_label(stream),
+            values=[
+                ("title", "Edit title"),
+                ("lang", "Edit language"),
+                ("default", "Set as default"),
+                ("extract", "Extract to SRT"),
+                ("remove", "Remove subtitle"),
+                ("back", "Back"),
+            ],
+            default="title",
+            style=style,
+        ).run()
+
+        if choice in {None, "back"}:
+            return False
+
+        if choice == "title":
+            new_title = input_dialog(
+                title=f"Subtitle #{subtitle_index}",
+                text="Title:",
+                default=subtitle_title(stream),
+                style=style,
+            ).run()
+            if new_title is None:
+                continue
+            changed = run_menu_action(
+                message_dialog,
+                style,
+                "Edit title",
+                lambda: (
+                    edit_subtitle_metadata(video, subtitle_index, None, False, new_title, None, False)
+                    and "Title updated."
+                ),
+            )
+            if changed:
+                return True
+
+        if choice == "lang":
+            new_lang = input_dialog(
+                title=f"Subtitle #{subtitle_index}",
+                text="Language code (en or eng):",
+                default=subtitle_language(stream),
+                style=style,
+            ).run()
+            if new_lang is None:
+                continue
+            changed = run_menu_action(
+                message_dialog,
+                style,
+                "Edit language",
+                lambda: (
+                    edit_subtitle_metadata(video, subtitle_index, None, False, None, new_lang, False)
+                    and "Language updated."
+                ),
+            )
+            if changed:
+                return True
+
+        if choice == "default":
+            changed = run_menu_action(
+                message_dialog,
+                style,
+                "Set default",
+                lambda: (
+                    edit_subtitle_metadata(video, subtitle_index, None, False, None, None, True)
+                    and "Default subtitle updated."
+                ),
+            )
+            if changed:
+                return True
+
+        if choice == "extract":
+            if menu_extract_subtitle(video, subtitle_index, input_dialog, yes_no_dialog, message_dialog, style):
+                return True
+
+        if choice == "remove":
+            confirm = yes_no_dialog(
+                title=f"Remove subtitle #{subtitle_index}",
+                text=f"Remove this subtitle track?\n{subtitle_label(stream)}",
+                style=style,
+            ).run()
+            if not confirm:
+                continue
+            changed = run_menu_action(
+                message_dialog,
+                style,
+                "Remove subtitle",
+                lambda: (
+                    remove_subtitles(
+                        argparse.Namespace(
+                            video=video,
+                            output=None,
+                            stream=subtitle_index,
+                            all=False,
+                            overwrite=False,
+                        )
+                    )
+                    or "Subtitle removed."
+                ),
+            )
+            if changed:
+                return True
+
+
+def manage_subtitles(args: argparse.Namespace) -> None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        die("menu requires an interactive terminal")
+
+    need_tool("ffmpeg")
+    need_tool("ffprobe")
+    require_file(args.video, "input video")
+    radiolist_dialog, input_dialog, yes_no_dialog, message_dialog, style = prompt_toolkit_dialogs()
+
+    while True:
+        streams = subtitle_streams(args.video)
+        values: list[tuple[str, str]] = [("add", "Add subtitle track")]
+        values.extend((f"stream:{stream['subtitle_index']}", subtitle_label(stream)) for stream in streams)
+        values.append(("quit", "Quit"))
+
+        choice = radiolist_dialog(
+            title="Subtitle manager",
+            text=str(args.video),
+            values=values,
+            default="add" if not streams else f"stream:{streams[0]['subtitle_index']}",
+            style=style,
+        ).run()
+
+        if choice in {None, "quit"}:
+            return
+
+        if choice == "add":
+            menu_add_subtitle(args.video, input_dialog, yes_no_dialog, message_dialog, style)
+            continue
+
+        if choice.startswith("stream:"):
+            subtitle_index = int(choice.split(":", 1)[1])
+            menu_stream_actions(
+                args.video,
+                subtitle_index,
+                radiolist_dialog,
+                input_dialog,
+                yes_no_dialog,
+                message_dialog,
+                style,
+            )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="subtitle",
+        description="Manage soft subtitles in videos and shift SRT timing.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list", help="list subtitle streams in a video")
+    list_parser.add_argument("video", type=Path)
+    list_parser.set_defaults(func=list_subtitles)
+
+    add_parser = subparsers.add_parser(
+        "add",
+        help="add a soft subtitle track to a video in place",
+        description="Add a soft subtitle track in place. Use -o to write a separate output file.",
+    )
+    add_parser.add_argument("video", type=Path)
+    add_parser.add_argument("subtitle_file", type=Path)
+    add_parser.add_argument("-o", "--output", type=Path, help="write to a separate output file")
+    add_parser.add_argument("--lang", default="eng")
+    add_parser.add_argument("--title")
+    add_parser.add_argument("--default", action="store_true")
+    add_parser.add_argument("--overwrite", action="store_true", help="replace an existing -o output file")
+    add_parser.set_defaults(func=add_subtitle)
+
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="remove subtitle streams from a video in place",
+        description="Remove subtitle streams in place. Use -o to write a separate output file.",
+    )
+    remove_parser.add_argument("video", type=Path)
+    remove_parser.add_argument("-o", "--output", type=Path, help="write to a separate output file")
+    remove_parser.add_argument("--stream", type=int)
+    remove_parser.add_argument("--all", action="store_true")
+    remove_parser.add_argument("--overwrite", action="store_true", help="replace an existing -o output file")
+    remove_parser.set_defaults(func=remove_subtitles)
+
+    edit_parser = subparsers.add_parser(
+        "edit",
+        help="edit subtitle metadata in place",
+        description="Edit subtitle title, language, or default flag in place. Use -o to write a separate output file.",
+    )
+    edit_parser.add_argument("video", type=Path)
+    edit_parser.add_argument("--stream", type=int, required=True)
+    edit_parser.add_argument("--title")
+    edit_parser.add_argument("--lang")
+    edit_parser.add_argument("--default", action="store_true", help="set this subtitle as the default")
+    edit_parser.add_argument("-o", "--output", type=Path, help="write to a separate output file")
+    edit_parser.add_argument("--overwrite", action="store_true", help="replace an existing -o output file")
+    edit_parser.set_defaults(func=edit_subtitle)
+
+    extract_parser = subparsers.add_parser("extract", help="extract one subtitle stream")
+    extract_parser.add_argument("video", type=Path)
+    extract_parser.add_argument("--stream", type=int, required=True)
+    extract_parser.add_argument("-o", "--output", type=Path)
+    extract_parser.add_argument("--overwrite", action="store_true")
+    extract_parser.set_defaults(func=extract_subtitle)
+
+    shift_parser = subparsers.add_parser(
+        "shift",
+        help="shift SRT timestamps in place",
+        description="Shift SRT timestamps in place. Use -o to write a separate output file.",
+    )
+    shift_parser.add_argument("subtitle_file", type=Path)
+    shift_parser.add_argument("seconds")
+    shift_parser.add_argument("-o", "--output", type=Path, help="write to a separate output file")
+    shift_parser.add_argument("--overwrite", action="store_true", help="replace an existing -o output file")
+    shift_parser.set_defaults(func=shift_srt)
+
+    menu_parser = subparsers.add_parser("menu", help="open an interactive subtitle manager")
+    menu_parser.add_argument("video", type=Path)
+    menu_parser.set_defaults(func=manage_subtitles)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        args.func(args)
+        return 0
+    except SubtitleError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from typing import Iterable
+from typing import Sequence
+
+
+PROC_ROOT = Path("/proc")
+CODEX_THREAD_ENV_VAR = "CODEX_THREAD_ID"
+SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+CODEX_STATE_IN_PROGRESS = "in_progress"
+CODEX_STATE_IDLE = "idle"
+CODEX_STATE_UNKNOWN = "unknown"
+CODEX_STATE_PROTECTED = "protected"
+DEFAULT_RECENT_LIMIT = 20
+DEFAULT_ACTIVE_LIMIT = 100
+TERMINATE_TIMEOUT_SECONDS = 4.0
+KILL_TIMEOUT_SECONDS = 2.0
+EMPTY = ""
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    ppid: int
+    comm: str
+    argv: tuple[str, ...]
+    codex_thread_id: str = EMPTY
+
+    @property
+    def name(self) -> str:
+        if self.argv:
+            return Path(self.argv[0]).name
+        return self.comm
+
+
+@dataclass(frozen=True)
+class SessionLog:
+    path: Path
+    codex_home: Path
+    thread_id: str
+    started_at: datetime | None
+    updated_at: datetime | None
+    cwd: str
+    model: str
+    cli_version: str
+    state: str
+    turns: int
+    last_event: str
+
+
+@dataclass(frozen=True)
+class CodexProcessGroup:
+    root: ProcessInfo
+    members: tuple[ProcessInfo, ...]
+    state: str
+    reason: str
+    thread_ids: tuple[str, ...]
+    session: SessionLog | None
+    protected: bool = False
+
+
+def fail(message: str, exit_code: int = 1) -> None:
+    print(f"codex-sessions: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return None
+
+
+def local_timezone():
+    return datetime.now().astimezone().tzinfo
+
+
+def short_time(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    return value.astimezone(local_timezone()).strftime("%Y-%m-%d %H:%M")
+
+
+def age(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    seconds = max(int((datetime.now(tz=local_timezone()) - value.astimezone(local_timezone())).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
+def truncate_text(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return f"{value[: width - 3]}..."
+
+
+def first_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, list):
+        return EMPTY
+
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("output_text")
+            if isinstance(text, str):
+                parts.append(text)
+        elif isinstance(item, str):
+            parts.append(item)
+    return " ".join(part.strip() for part in parts if part.strip())
+
+
+def session_dirs_for_home(home: Path) -> list[Path]:
+    if home.name == "sessions":
+        return [home]
+    return [home / "sessions"]
+
+
+def session_dir_to_home(path: Path) -> Path:
+    return path.parent if path.name == "sessions" else path
+
+
+def unique_paths(paths: Iterable[Path]) -> list[Path]:
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if resolved not in seen:
+            result.append(resolved)
+            seen.add(resolved)
+    return result
+
+
+def discover_codex_homes(args: argparse.Namespace) -> list[Path]:
+    homes: list[Path] = []
+    for item in args.codex_home:
+        homes.append(Path(item))
+    for item in args.sessions_dir:
+        homes.append(session_dir_to_home(Path(item)))
+    if args.all_homes:
+        for pattern in (".codex*", ".gapcodex*"):
+            for candidate in sorted(Path.home().glob(pattern)):
+                if (candidate / "sessions").is_dir():
+                    homes.append(candidate)
+    if not homes:
+        homes.append(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
+    return unique_paths(homes)
+
+
+def iter_session_files(codex_homes: Iterable[Path]) -> Iterable[tuple[Path, Path]]:
+    for codex_home in codex_homes:
+        for sessions_dir in session_dirs_for_home(codex_home):
+            if not sessions_dir.is_dir():
+                continue
+            for path in sessions_dir.rglob("rollout-*.jsonl"):
+                if path.is_file():
+                    yield codex_home, path
+
+
+def parse_session_log(codex_home: Path, path: Path) -> SessionLog:
+    thread_id = EMPTY
+    started_at: datetime | None = None
+    updated_at: datetime | None = None
+    cwd = EMPTY
+    model = EMPTY
+    cli_version = EMPTY
+    state = CODEX_STATE_UNKNOWN
+    turns = 0
+    last_event = EMPTY
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                timestamp = parse_timestamp(record.get("timestamp"))
+                if timestamp is not None:
+                    updated_at = timestamp
+
+                payload = record.get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                record_type = record.get("type")
+
+                if record_type == "session_meta":
+                    thread_id = str(payload.get("id") or thread_id)
+                    started_at = parse_timestamp(payload.get("timestamp")) or started_at or timestamp
+                    cwd = str(payload.get("cwd") or cwd)
+                    cli_version = str(payload.get("cli_version") or cli_version)
+                    last_event = "session created"
+                    continue
+
+                if record_type == "turn_context":
+                    turns += 1
+                    model = str(payload.get("model") or model)
+                    cwd = str(payload.get("cwd") or cwd)
+                    state = CODEX_STATE_IN_PROGRESS
+                    last_event = "turn started"
+                    continue
+
+                if record_type == "response_item":
+                    payload_type = payload.get("type")
+                    if payload_type == "function_call":
+                        state = CODEX_STATE_IN_PROGRESS
+                        last_event = f"tool call: {payload.get('name') or 'unknown'}"
+                    elif payload_type == "message" and payload.get("role") == "assistant":
+                        text = first_text(payload.get("content"))
+                        last_event = truncate_text(text, 80) if text else "assistant message"
+                        if payload.get("phase") == "final_answer":
+                            state = CODEX_STATE_IDLE
+                    elif payload_type == "message" and payload.get("role") == "user":
+                        text = first_text(payload.get("content"))
+                        state = CODEX_STATE_IN_PROGRESS
+                        last_event = truncate_text(text, 80) if text else "user message"
+                    continue
+
+                if record_type != "event_msg":
+                    continue
+
+                payload_type = payload.get("type")
+                if payload_type == "task_complete":
+                    state = CODEX_STATE_IDLE
+                    last_event = "task complete"
+                elif payload_type == "agent_message":
+                    message = str(payload.get("message") or EMPTY)
+                    last_event = truncate_text(message, 80) if message else "agent message"
+                    if payload.get("phase") == "final_answer":
+                        state = CODEX_STATE_IDLE
+                    elif payload.get("phase") == "commentary":
+                        state = CODEX_STATE_IN_PROGRESS
+                elif payload_type in {"patch_apply_begin", "exec_command_begin", "tool_call_begin"}:
+                    state = CODEX_STATE_IN_PROGRESS
+                    last_event = str(payload_type)
+                elif payload_type == "token_count" and not last_event:
+                    last_event = "token count"
+    except OSError:
+        pass
+
+    if not thread_id:
+        match = SESSION_ID_RE.search(path.name)
+        if match:
+            thread_id = match.group(0)
+
+    if updated_at is None:
+        try:
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=local_timezone())
+        except OSError:
+            updated_at = None
+
+    return SessionLog(
+        path=path,
+        codex_home=codex_home,
+        thread_id=thread_id,
+        started_at=started_at,
+        updated_at=updated_at,
+        cwd=cwd,
+        model=model,
+        cli_version=cli_version,
+        state=state,
+        turns=turns,
+        last_event=last_event,
+    )
+
+
+def load_sessions(args: argparse.Namespace) -> list[SessionLog]:
+    sessions = [parse_session_log(codex_home, path) for codex_home, path in iter_session_files(discover_codex_homes(args))]
+    return sorted(sessions, key=lambda item: item.updated_at or datetime.min.replace(tzinfo=local_timezone()), reverse=True)
+
+
+def read_proc_cmdline(process_dir: Path) -> tuple[str, ...]:
+    try:
+        raw = (process_dir / "cmdline").read_bytes()
+    except OSError:
+        return ()
+    return tuple(part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part)
+
+
+def read_proc_ppid(process_dir: Path) -> int:
+    try:
+        stat_text = (process_dir / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    try:
+        fields = stat_text.rsplit(") ", 1)[1].split()
+        return int(fields[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def read_proc_comm(process_dir: Path) -> str:
+    try:
+        return (process_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return EMPTY
+
+
+def read_proc_environ_value(process_dir: Path, name: str) -> str:
+    prefix = f"{name}=".encode()
+    try:
+        raw = (process_dir / "environ").read_bytes()
+    except OSError:
+        return EMPTY
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix) :].decode("utf-8", errors="replace").strip()
+    return EMPTY
+
+
+def read_process_table(proc_root: Path = PROC_ROOT) -> dict[int, ProcessInfo]:
+    processes: dict[int, ProcessInfo] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return processes
+
+    for process_dir in entries:
+        if not process_dir.name.isdigit():
+            continue
+        pid = int(process_dir.name)
+        argv = read_proc_cmdline(process_dir)
+        comm = read_proc_comm(process_dir)
+        ppid = read_proc_ppid(process_dir)
+        if not argv and not comm:
+            continue
+        processes[pid] = ProcessInfo(pid, ppid, comm, argv, read_proc_environ_value(process_dir, CODEX_THREAD_ENV_VAR))
+    return processes
+
+
+def process_arg_basename(value: str) -> str:
+    return Path(value).name
+
+
+def has_codex_artifact_arg(process: ProcessInfo) -> bool:
+    return any("@openai/codex" in arg or "/codex/codex" in arg for arg in process.argv)
+
+
+def is_codex_sandbox_process(process: ProcessInfo) -> bool:
+    if process.comm == "codex-linux-sandbox" or process.name == "codex-linux-sandbox":
+        return True
+    if "codex-linux-sandbox" in process.argv:
+        return True
+    return "--sandbox-policy-cwd" in process.argv and has_codex_artifact_arg(process)
+
+
+def is_this_tool(process: ProcessInfo) -> bool:
+    return process.comm == "codex-sessions" or any(process_arg_basename(arg) == "codex-sessions" for arg in process.argv[:3])
+
+
+def is_codex_candidate_process(process: ProcessInfo) -> bool:
+    if is_this_tool(process):
+        return False
+    first_arg = process_arg_basename(process.argv[0]) if process.argv else EMPTY
+    if process.comm == "codex" or first_arg in {"codex", "gapcodex"}:
+        return True
+    if is_codex_sandbox_process(process):
+        return True
+    if first_arg in {"node", "nodejs"} and has_codex_artifact_arg(process):
+        return True
+    return has_codex_artifact_arg(process)
+
+
+def process_children_by_parent(processes: dict[int, ProcessInfo]) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for process in processes.values():
+        children.setdefault(process.ppid, []).append(process.pid)
+    return children
+
+
+def process_tree_pids(root_pid: int, processes: dict[int, ProcessInfo]) -> set[int]:
+    children = process_children_by_parent(processes)
+    seen: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pending.extend(children.get(pid, ()))
+    return seen
+
+
+def process_ancestor_pids(pid: int, processes: dict[int, ProcessInfo]) -> set[int]:
+    ancestors: set[int] = set()
+    current = processes.get(pid)
+    while current is not None and current.ppid > 0 and current.ppid not in ancestors:
+        ancestors.add(current.ppid)
+        current = processes.get(current.ppid)
+    return ancestors
+
+
+def has_candidate_ancestor(pid: int, processes: dict[int, ProcessInfo], candidate_pids: set[int]) -> bool:
+    current = processes.get(pid)
+    visited: set[int] = set()
+    while current is not None and current.ppid > 0 and current.ppid not in visited:
+        if current.ppid in candidate_pids:
+            return True
+        visited.add(current.ppid)
+        current = processes.get(current.ppid)
+    return False
+
+
+def extract_thread_ids(processes: Sequence[ProcessInfo]) -> tuple[str, ...]:
+    ids: set[str] = set()
+    for process in processes:
+        if process.codex_thread_id:
+            ids.add(process.codex_thread_id)
+        for arg in process.argv:
+            ids.update(match.group(0) for match in SESSION_ID_RE.finditer(arg))
+    return tuple(sorted(ids))
+
+
+def find_session_for_group(thread_ids: Sequence[str], sessions_by_id: dict[str, SessionLog]) -> SessionLog | None:
+    for thread_id in thread_ids:
+        if thread_id in sessions_by_id:
+            return sessions_by_id[thread_id]
+    return None
+
+
+def classify_group(
+    root: ProcessInfo,
+    members: Sequence[ProcessInfo],
+    processes: dict[int, ProcessInfo],
+    current_pid: int,
+    sessions_by_id: dict[str, SessionLog],
+) -> CodexProcessGroup:
+    thread_ids = extract_thread_ids(members)
+    session = find_session_for_group(thread_ids, sessions_by_id)
+    member_pids = {process.pid for process in members}
+    root_tree = process_tree_pids(root.pid, processes)
+    current_inside = current_pid in root_tree or bool(member_pids.intersection(process_ancestor_pids(current_pid, processes)))
+    if current_inside:
+        return CodexProcessGroup(
+            root=root,
+            members=tuple(members),
+            state=CODEX_STATE_PROTECTED,
+            reason="current codex-sessions command is running inside this session",
+            thread_ids=thread_ids,
+            session=session,
+            protected=True,
+        )
+
+    if any(is_codex_sandbox_process(process) for process in members):
+        return CodexProcessGroup(root, tuple(members), CODEX_STATE_IN_PROGRESS, "active Codex sandbox/tool process is running", thread_ids, session)
+
+    if session is not None and session.state == CODEX_STATE_IN_PROGRESS:
+        return CodexProcessGroup(root, tuple(members), CODEX_STATE_IN_PROGRESS, "session log has an unfinished turn", thread_ids, session)
+
+    if session is not None and session.state == CODEX_STATE_IDLE:
+        return CodexProcessGroup(root, tuple(members), CODEX_STATE_IDLE, "session log shows the last turn completed", thread_ids, session)
+
+    return CodexProcessGroup(root, tuple(members), CODEX_STATE_UNKNOWN, "could not reliably detect session state", thread_ids, session)
+
+
+def discover_active_groups(sessions: Sequence[SessionLog]) -> list[CodexProcessGroup]:
+    sessions_by_id = {session.thread_id: session for session in sessions if session.thread_id}
+    processes = read_process_table()
+    candidate_pids = {pid for pid, process in processes.items() if is_codex_candidate_process(process)}
+    roots = [processes[pid] for pid in sorted(candidate_pids) if not has_candidate_ancestor(pid, processes, candidate_pids)]
+
+    groups: list[CodexProcessGroup] = []
+    for root in roots:
+        tree_pids = process_tree_pids(root.pid, processes)
+        members = tuple(processes[pid] for pid in sorted(candidate_pids.intersection(tree_pids)))
+        groups.append(classify_group(root, members, processes, os.getpid(), sessions_by_id))
+    return groups
+
+
+def format_process_command(process: ProcessInfo) -> str:
+    if not process.argv:
+        return process.comm or "unknown"
+    visible_args = [process_arg_basename(process.argv[0]), *process.argv[1:4]]
+    command = " ".join(visible_args)
+    if len(process.argv) > len(visible_args):
+        command = f"{command} ..."
+    return truncate_text(command, 90)
+
+
+def render_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    values = [[str(value) for value in row] for row in rows]
+    widths = [len(header) for header in headers]
+    for row in values:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+    lines = ["  ".join(header.ljust(widths[index]) for index, header in enumerate(headers))]
+    lines.append("  ".join("-" * width for width in widths))
+    for row in values:
+        lines.append("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+    return "\n".join(lines)
+
+
+def group_to_row(group: CodexProcessGroup) -> list[str]:
+    session = group.session
+    return [
+        str(group.root.pid),
+        group.state,
+        age(session.updated_at if session else None),
+        (session.thread_id[:8] if session and session.thread_id else ",".join(item[:8] for item in group.thread_ids) or "-"),
+        truncate_text(session.cwd if session else "-", 44),
+        truncate_text(group.reason, 44),
+        format_process_command(group.root),
+    ]
+
+
+def session_to_row(session: SessionLog) -> list[str]:
+    return [
+        session.thread_id[:8] if session.thread_id else "-",
+        session.state,
+        age(session.updated_at),
+        short_time(session.updated_at),
+        str(session.turns),
+        truncate_text(session.model or "-", 20),
+        truncate_text(session.cwd or "-", 48),
+        truncate_text(session.last_event or "-", 50),
+    ]
+
+
+def print_active(groups: Sequence[CodexProcessGroup], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps([group_to_dict(group) for group in groups], indent=2, ensure_ascii=False))
+        return
+    if not groups:
+        print("No active Codex processes found.")
+        return
+    rows = [group_to_row(group) for group in groups]
+    print(render_table(["pid", "state", "age", "session", "cwd", "reason", "command"], rows))
+
+
+def print_recent(sessions: Sequence[SessionLog], limit: int, *, json_output: bool) -> None:
+    shown = sessions[:limit] if limit > 0 else sessions
+    if json_output:
+        print(json.dumps([session_to_dict(session) for session in shown], indent=2, ensure_ascii=False))
+        return
+    if not shown:
+        print("No Codex session logs found.")
+        return
+    print(render_table(["session", "state", "age", "updated", "turns", "model", "cwd", "last event"], [session_to_row(item) for item in shown]))
+
+
+def print_summary(groups: Sequence[CodexProcessGroup], sessions: Sequence[SessionLog]) -> None:
+    active = len(groups)
+    in_progress = sum(1 for group in groups if group.state in {CODEX_STATE_IN_PROGRESS, CODEX_STATE_PROTECTED})
+    idle = sum(1 for group in groups if group.state == CODEX_STATE_IDLE)
+    unknown = sum(1 for group in groups if group.state == CODEX_STATE_UNKNOWN)
+    print(f"Active: {active} total, {in_progress} in progress, {idle} idle, {unknown} unknown")
+    print(f"Recent logs scanned: {len(sessions)}")
+
+
+def session_to_dict(session: SessionLog) -> dict[str, Any]:
+    return {
+        "thread_id": session.thread_id,
+        "state": session.state,
+        "started_at": session.started_at.isoformat() if session.started_at else None,
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+        "cwd": session.cwd,
+        "model": session.model,
+        "cli_version": session.cli_version,
+        "turns": session.turns,
+        "last_event": session.last_event,
+        "path": str(session.path),
+        "codex_home": str(session.codex_home),
+    }
+
+
+def group_to_dict(group: CodexProcessGroup) -> dict[str, Any]:
+    return {
+        "pid": group.root.pid,
+        "state": group.state,
+        "reason": group.reason,
+        "protected": group.protected,
+        "thread_ids": list(group.thread_ids),
+        "member_pids": [member.pid for member in group.members],
+        "command": format_process_command(group.root),
+        "session": session_to_dict(group.session) if group.session else None,
+    }
+
+
+def pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_pids_to_exit(pids: set[int], timeout_seconds: float) -> set[int]:
+    deadline = time.monotonic() + timeout_seconds
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        remaining = {pid for pid in remaining if pid_exists(pid)}
+        if remaining:
+            time.sleep(0.1)
+    return {pid for pid in remaining if pid_exists(pid)}
+
+
+def terminate_process_tree(root_pid: int, processes: dict[int, ProcessInfo], *, kill: bool) -> set[int]:
+    targets = process_tree_pids(root_pid, processes)
+    targets.discard(os.getpid())
+    if not targets:
+        return set()
+
+    for pid in sorted(targets, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL if kill else signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+    if kill:
+        return wait_for_pids_to_exit(targets, KILL_TIMEOUT_SECONDS)
+
+    remaining = wait_for_pids_to_exit(targets, TERMINATE_TIMEOUT_SECONDS)
+    for pid in sorted(remaining, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    return wait_for_pids_to_exit(remaining, KILL_TIMEOUT_SECONDS)
+
+
+def select_groups(groups: Sequence[CodexProcessGroup], target: str) -> list[CodexProcessGroup]:
+    if target == "all":
+        return list(groups)
+    if target == "idle":
+        return [group for group in groups if group.state == CODEX_STATE_IDLE]
+    if target == "in-progress":
+        return [group for group in groups if group.state in {CODEX_STATE_IN_PROGRESS, CODEX_STATE_PROTECTED}]
+
+    selected: list[CodexProcessGroup] = []
+    for group in groups:
+        session_id = group.session.thread_id if group.session else EMPTY
+        thread_matches = any(thread_id.startswith(target) for thread_id in group.thread_ids)
+        if str(group.root.pid) == target or session_id.startswith(target) or thread_matches:
+            selected.append(group)
+    return selected
+
+
+def confirm(message: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        fail("refusing to terminate without --yes because stdin is not interactive")
+    answer = input(f"{message} [y/N]: ")
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def terminate_groups(groups: Sequence[CodexProcessGroup], args: argparse.Namespace) -> int:
+    selected = select_groups(groups, args.target)
+    if not selected:
+        fail(f"no active session matched {args.target!r}", exit_code=2)
+
+    if args.dry_run:
+        print_active(selected, json_output=args.json)
+        return 0
+
+    protected = [group for group in selected if group.protected]
+    if protected and not args.include_current:
+        details = ", ".join(str(group.root.pid) for group in protected)
+        fail(f"refusing to terminate the current Codex session ({details}); pass --include-current to override")
+
+    in_progress = [group for group in selected if group.state in {CODEX_STATE_IN_PROGRESS, CODEX_STATE_PROTECTED}]
+    if in_progress and not args.force:
+        details = ", ".join(f"{group.root.pid}:{group.state}" for group in in_progress)
+        fail(f"refusing to terminate in-progress session(s) without --force: {details}")
+
+    label = ", ".join(str(group.root.pid) for group in selected)
+    if not confirm(f"Terminate {len(selected)} Codex session(s): {label}?", args.yes):
+        fail("termination cancelled", exit_code=130)
+
+    processes = read_process_table()
+    remaining: set[int] = set()
+    for group in selected:
+        remaining.update(terminate_process_tree(group.root.pid, processes, kill=args.kill))
+
+    if remaining:
+        fail(f"failed to terminate process(es): {', '.join(str(pid) for pid in sorted(remaining))}")
+
+    print(f"Terminated {len(selected)} Codex session(s).")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    def add_json_option(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Print machine-readable JSON where supported",
+        )
+
+    parser = argparse.ArgumentParser(
+        description="Inspect and terminate local Codex CLI sessions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  codex-sessions
+  codex-sessions active
+  codex-sessions recent --limit 30
+  codex-sessions summary
+  codex-sessions terminate 12345 --yes
+  codex-sessions terminate 019e5e35 --force --yes
+  codex-sessions terminate all --force --yes
+
+States:
+  in_progress  A tool/sandbox process is active or the session log has an unfinished turn.
+  idle         A Codex process is open, but the last logged turn completed.
+  protected    This command is running inside that Codex session.
+  unknown      A process was found, but it could not be matched to a reliable log state.
+""",
+    )
+    parser.add_argument("--codex-home", action="append", default=[], help="Codex home to scan, default: CODEX_HOME or ~/.codex")
+    parser.add_argument("--sessions-dir", action="append", default=[], help="Explicit sessions directory to scan")
+    parser.add_argument("--all-homes", action="store_true", help="Scan ~/.codex* and ~/.gapcodex* homes that contain sessions")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON where supported")
+
+    subparsers = parser.add_subparsers(dest="command")
+    active = subparsers.add_parser("active", help="Show active Codex processes")
+    add_json_option(active)
+    recent = subparsers.add_parser("recent", help="Show recent Codex session logs")
+    add_json_option(recent)
+    recent.add_argument("--limit", type=int, default=DEFAULT_RECENT_LIMIT, help=f"Rows to show, default: {DEFAULT_RECENT_LIMIT}; use 0 for all")
+    summary = subparsers.add_parser("summary", help="Show active session counts")
+    add_json_option(summary)
+
+    terminate = subparsers.add_parser("terminate", aliases=["kill"], help="Terminate one or more active sessions")
+    add_json_option(terminate)
+    terminate.add_argument("target", help="PID, session id prefix, all, idle, or in-progress")
+    terminate.add_argument("--force", action="store_true", help="Allow terminating in-progress sessions")
+    terminate.add_argument("--kill", action="store_true", help="Send SIGKILL immediately instead of trying SIGTERM first")
+    terminate.add_argument("--yes", "-y", action="store_true", help="Do not prompt for confirmation")
+    terminate.add_argument("--dry-run", action="store_true", help="Show matched sessions without terminating")
+    terminate.add_argument("--include-current", action="store_true", help="Allow terminating the Codex session running this command")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    command = args.command or "active"
+
+    sessions = load_sessions(args)
+    groups = discover_active_groups(sessions)
+
+    if command == "active":
+        print_active(groups[:DEFAULT_ACTIVE_LIMIT], json_output=args.json)
+        return 0
+    if command == "recent":
+        if args.limit < 0:
+            parser.error("--limit cannot be negative")
+        print_recent(sessions, args.limit, json_output=args.json)
+        return 0
+    if command == "summary":
+        print_summary(groups, sessions)
+        return 0
+    if command in {"terminate", "kill"}:
+        return terminate_groups(groups, args)
+
+    parser.error(f"unknown command: {command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

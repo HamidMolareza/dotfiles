@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options] <repository> [directory] [-- <git clone flags>...]
+
+Clone a GitHub repository with retry handling around gh repo clone.
+
+Arguments:
+  repository                 Repository accepted by gh repo clone, such as owner/repo,
+                             repo, https://github.com/owner/repo, or git@github.com:owner/repo.git.
+  directory                  Optional destination directory.
+
+Options:
+  -m, --main, --default-branch
+                             Clone only the detected default branch with depth 1,
+                             no tags, and HTTP/1.1.
+  -r, --retries <num>        Total clone attempts. Default: 5.
+  -d, --retry-delay <sec>    Delay between failed attempts. Default: 4.
+      --blobless             With --main/--default-branch, add --filter=blob:none.
+                             Best with -- --no-checkout on very unstable networks.
+      --full                 With --main/--default-branch, do not add no-tags,
+                             HTTP/1.1, or blobless clone defaults.
+      --git-direct           Use git clone directly instead of gh repo clone.
+                             This avoids gh clone GraphQL calls on unstable networks.
+      --no-upstream          Forward to gh repo clone.
+  -u, --upstream-remote-name <name>
+                             Forward to gh repo clone.
+  -h, --help                 Show this help.
+
+Examples:
+  gh-repo-clone cli/cli
+  gh-repo-clone cli/cli ~/projects/cli
+  gh-repo-clone --main cli/cli
+  gh-repo-clone --git-direct --main hovancik/stretchly
+  gh-repo-clone --main --blobless hovancik/stretchly -- --no-checkout
+  gh-repo-clone --default-branch hovancik/stretchly
+  gh-repo-clone --retries 10 --retry-delay 8 cli/cli -- --filter=blob:none
+
+Proxy handling:
+  gh and git use the current process proxy environment and Git configuration.
+
+Progress:
+  Git clone progress is forced by default, even when output is not attached to a terminal.
+  Pass -- --quiet or -- --no-progress to disable it.
+EOF
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+command_available() {
+  if command -v command-exists >/dev/null 2>&1; then
+    command-exists "$1"
+  else
+    command -v "$1" >/dev/null 2>&1
+  fi
+}
+
+require_command() {
+  local name="$1"
+  command_available "$name" || fail "$name is required but was not found in PATH."
+}
+
+is_nonnegative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+derive_target_dir() {
+  local repository="$1"
+  local value
+
+  value="${repository%/}"
+  value="${value%.git}"
+  value="${value##*/}"
+  value="${value##*:}"
+
+  [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+}
+
+cleanup_incomplete_clone() {
+  local target_dir="$1"
+
+  [[ -n "$target_dir" ]] || return 0
+  [[ -e "$target_dir" || -L "$target_dir" ]] || return 0
+
+  printf 'Removing incomplete clone directory: %s\n' "$target_dir" >&2
+  rm -rf -- "$target_dir"
+}
+
+git_flags_disable_progress() {
+  local flag
+
+  for flag in "$@"; do
+    case "$flag" in
+      -q | --quiet | --no-progress)
+        return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+repository_ls_remote_url() {
+  local repository="$1"
+
+  case "$repository" in
+    http://* | https://* | ssh://* | git://* | file://* | *@*:*)
+      printf '%s' "$repository"
+      return 0
+      ;;
+  esac
+
+  if [[ "$repository" == */* ]]; then
+    printf 'https://github.com/%s.git' "${repository%.git}"
+    return 0
+  fi
+
+  return 1
+}
+
+detect_default_branch_with_gh() {
+  local repository="$1"
+  local branch
+
+  command_available gh || return 1
+
+  branch="$(gh repo view "$repository" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
+  [[ -n "$branch" && "$branch" != "null" ]] || return 1
+
+  printf '%s' "$branch"
+}
+
+detect_default_branch_with_git() {
+  local repository="$1"
+  local remote_url
+  local output
+  local branch
+
+  remote_url="$(repository_ls_remote_url "$repository")" || return 1
+  output="$(timeout 20s git ls-remote --symref "$remote_url" HEAD 2>/dev/null || true)"
+  branch="$(printf '%s\n' "$output" | sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' | head -n 1)"
+  [[ -n "$branch" ]] || return 1
+
+  printf '%s' "$branch"
+}
+
+detect_default_branch() {
+  local repository="$1"
+
+  detect_default_branch_with_gh "$repository" && return 0
+  detect_default_branch_with_git "$repository" && return 0
+
+  return 1
+}
+
+default_branch_only=0
+full_clone=0
+blobless=0
+git_direct=0
+retries=5
+retry_delay=4
+repository=""
+directory=""
+gh_clone_options=()
+git_clone_flags=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -m | --main | --default-branch)
+      default_branch_only=1
+      shift
+      ;;
+    --full)
+      full_clone=1
+      shift
+      ;;
+    --blobless)
+      blobless=1
+      shift
+      ;;
+    --git-direct)
+      git_direct=1
+      shift
+      ;;
+    -r | --retries)
+      [[ $# -ge 2 ]] || fail "$1 requires a value."
+      retries="$2"
+      shift 2
+      ;;
+    --retries=*)
+      retries="${1#*=}"
+      shift
+      ;;
+    -d | --retry-delay)
+      [[ $# -ge 2 ]] || fail "$1 requires a value."
+      retry_delay="$2"
+      shift 2
+      ;;
+    --retry-delay=*)
+      retry_delay="${1#*=}"
+      shift
+      ;;
+    --no-upstream)
+      gh_clone_options+=("$1")
+      shift
+      ;;
+    -u | --upstream-remote-name)
+      [[ $# -ge 2 ]] || fail "$1 requires a value."
+      gh_clone_options+=("$1" "$2")
+      shift 2
+      ;;
+    --upstream-remote-name=*)
+      gh_clone_options+=("$1")
+      shift
+      ;;
+    --)
+      shift
+      git_clone_flags+=("$@")
+      break
+      ;;
+    -*)
+      fail "Unknown option: $1"
+      ;;
+    *)
+      if [[ -z "$repository" ]]; then
+        repository="$1"
+      elif [[ -z "$directory" ]]; then
+        directory="$1"
+      else
+        fail "Unexpected argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$repository" ]] || {
+  usage >&2
+  exit 1
+}
+
+is_nonnegative_integer "$retries" || fail "--retries must be a positive integer."
+[[ "$retries" -gt 0 ]] || fail "--retries must be greater than 0."
+is_nonnegative_integer "$retry_delay" || fail "--retry-delay must be a non-negative integer."
+
+require_command git
+if [[ "$git_direct" -eq 0 ]]; then
+  require_command gh
+fi
+
+if [[ "$git_direct" -eq 1 && "${#gh_clone_options[@]}" -gt 0 ]]; then
+  fail "--git-direct cannot be combined with gh-specific clone options like --no-upstream."
+fi
+
+target_dir="$directory"
+if [[ -z "$target_dir" ]]; then
+  target_dir="$(derive_target_dir "$repository")" || fail "Could not derive a destination directory from repository: $repository"
+fi
+
+if [[ -e "$target_dir" ]]; then
+  fail "destination already exists: $target_dir"
+fi
+
+if [[ "$default_branch_only" -eq 1 ]]; then
+  printf 'Detecting default branch for %s...\n' "$repository" >&2
+  default_branch="$(detect_default_branch "$repository")" || fail "could not detect the default branch for $repository."
+  printf 'Default branch: %s\n' "$default_branch" >&2
+  git_clone_flags+=(--branch "$default_branch" --single-branch --depth 1)
+  if [[ "$full_clone" -eq 0 ]]; then
+    git_clone_flags+=(--no-tags -c http.version=HTTP/1.1)
+    if [[ "$blobless" -eq 1 ]]; then
+      git_clone_flags+=(--filter=blob:none)
+    fi
+  fi
+fi
+
+if ! git_flags_disable_progress "${git_clone_flags[@]}"; then
+  git_clone_flags+=(--progress)
+fi
+
+attempt=1
+while true; do
+  printf 'Clone attempt %s/%s: %s\n' "$attempt" "$retries" "$repository" >&2
+
+  if [[ "$git_direct" -eq 1 ]]; then
+    remote_url="$(repository_ls_remote_url "$repository")" || fail "--git-direct needs an owner/repo value or a repository URL."
+    clone_args=(clone "${git_clone_flags[@]}" "$remote_url")
+    if [[ -n "$directory" ]]; then
+      clone_args+=("$directory")
+    fi
+  else
+    clone_args=(repo clone "$repository")
+    if [[ -n "$directory" ]]; then
+      clone_args+=("$directory")
+    fi
+    clone_args+=("${gh_clone_options[@]}")
+    if [[ "${#git_clone_flags[@]}" -gt 0 ]]; then
+      clone_args+=(-- "${git_clone_flags[@]}")
+    fi
+  fi
+
+  set +e
+  if [[ "$git_direct" -eq 1 ]]; then
+    git "${clone_args[@]}"
+  else
+    gh "${clone_args[@]}"
+  fi
+  exit_code="$?"
+  set -e
+
+  [[ "$exit_code" -eq 0 ]] && exit 0
+
+  printf 'Clone failed with exit code %s.\n' "$exit_code" >&2
+
+  if [[ "$attempt" -ge "$retries" ]]; then
+    printf 'Maximum clone attempts reached.\n' >&2
+    exit "$exit_code"
+  fi
+
+  cleanup_incomplete_clone "$target_dir"
+
+  attempt=$((attempt + 1))
+  printf 'Retrying in %s seconds...\n' "$retry_delay" >&2
+  sleep "$retry_delay"
+done

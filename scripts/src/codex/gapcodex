@@ -11,7 +11,7 @@ Special behavior:
   --model, -m    Open an interactive picker for a supported model
 
 Supported models:
-  gpt-5.4
+  gpt-5.5
   claude-sonnet-4-6
   claude-opus-4-6
   qwen3-coder
@@ -21,7 +21,7 @@ Examples:
   gapcodex
   gapcodex --model
   gapcodex -m
-  gapcodex --model gpt-5.4
+  gapcodex --model gpt-5.5
 EOF
 }
 
@@ -36,7 +36,7 @@ import sys
 from typing import List
 
 MODELS = [
-    "gpt-5.4",
+    "gpt-5.5",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "qwen3-coder",

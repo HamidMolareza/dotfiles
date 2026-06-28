@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROXY_VARS=(
+    http_proxy
+    https_proxy
+    all_proxy
+    ftp_proxy
+    rsync_proxy
+    HTTP_PROXY
+    HTTPS_PROXY
+    ALL_PROXY
+    FTP_PROXY
+    RSYNC_PROXY
+    no_proxy
+    NO_PROXY
+    npm_config_proxy
+    npm_config_https_proxy
+    npm_config_noproxy
+    yarn_proxy
+    yarn_https_proxy
+)
+
+show_help() {
+    cat <<'EOF'
+Usage:
+  proxy-show
+
+Show proxy-related environment variables exported in this terminal session.
+Values are printed as NAME=value, with URL-style credentials redacted.
+
+Options:
+  -h, --help  Show this help text.
+
+Notes:
+  proxy-show reads the exported environment inherited by this process, like env.
+  Shell-local variables that were not exported are not visible here.
+EOF
+}
+
+redact_proxy_value() {
+    local value=$1
+
+    if [[ $value =~ ^([A-Za-z][A-Za-z0-9+.-]*://)([^/@[:space:]]*@)(.*)$ ]]; then
+        printf '%s***@%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
+        return
+    fi
+
+    printf '%s' "$value"
+}
+
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        printf 'proxy-show: unknown option: %s\n' "$1" >&2
+        printf 'Run proxy-show --help for usage.\n' >&2
+        exit 2
+        ;;
+esac
+
+found=0
+
+for name in "${PROXY_VARS[@]}"; do
+    if value=$(printenv "$name"); then
+        printf '%s=%s\n' "$name" "$(redact_proxy_value "$value")"
+        found=1
+    fi
+done
+
+if [ "$found" -eq 0 ]; then
+    printf 'No proxy environment variables are set.\n'
+fi

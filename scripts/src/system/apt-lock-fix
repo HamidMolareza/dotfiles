@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+TIMEOUT_SECONDS=1800
+INTERVAL_SECONDS=5
+ASSUME_YES=0
+FORCE_STOP=0
+RUN_REPAIR=1
+RUN_UPDATE=0
+DRY_RUN=0
+
+LOCK_FILES=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/cache/apt/archives/lock
+    /var/lib/apt/lists/lock
+)
+
+usage() {
+    cat <<'EOF'
+Usage: apt-lock-fix [options]
+
+Wait for apt/dpkg cache locks to clear, then repair interrupted package state.
+
+This fixes errors like:
+  Could not get lock /var/lib/dpkg/lock-frontend. It is held by process ... (unattended-upgr)
+
+By default this command:
+  - waits up to 30 minutes for active apt/dpkg lock holders to finish
+  - does not kill unattended-upgrades or other package managers
+  - runs dpkg --configure -a
+  - runs apt-get -f install
+  - runs apt-get check
+
+Options:
+  --timeout SECONDS  Maximum wait time for lock holders. Default: 1800.
+  --interval SECONDS Seconds between lock checks. Default: 5.
+  -y, --yes          Pass -y to apt-get and use noninteractive dpkg/apt mode.
+  --force-stop       After timeout, stop apt timers/services and terminate lock holders.
+                     Use only when you are sure the package manager is stuck.
+  --no-repair        Only wait for locks; do not run dpkg/apt repair commands.
+  --update           Run apt-get update after repair.
+  --dry-run          Print the planned actions without changing package state.
+  -h, --help         Show this help text.
+
+Examples:
+  apt-lock-fix
+  apt-lock-fix --timeout 3600
+  apt-lock-fix --yes --update
+  apt-lock-fix --timeout 120 --force-stop --yes
+
+Notes:
+  - Waiting is the safest fix when unattended-upgrades is running normally.
+  - Do not remove dpkg lock files while a process still holds them.
+  - Network operations honor the current proxy environment.
+EOF
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "==> $*"
+}
+
+have_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+    have_command "$1" || die "Required command not found: $1"
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" > 0 ))
+}
+
+parse_args() {
+    while (($#)); do
+        case "$1" in
+            --timeout)
+                [[ $# -ge 2 ]] || die "--timeout requires a value."
+                is_positive_integer "$2" || die "--timeout must be a positive integer."
+                TIMEOUT_SECONDS="$2"
+                shift 2
+                ;;
+            --interval)
+                [[ $# -ge 2 ]] || die "--interval requires a value."
+                is_positive_integer "$2" || die "--interval must be a positive integer."
+                INTERVAL_SECONDS="$2"
+                shift 2
+                ;;
+            -y|--yes)
+                ASSUME_YES=1
+                shift
+                ;;
+            --force-stop)
+                FORCE_STOP=1
+                shift
+                ;;
+            --no-repair)
+                RUN_REPAIR=0
+                shift
+                ;;
+            --update)
+                RUN_UPDATE=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+    done
+}
+
+resolve_script_path() {
+    local candidate="$0"
+
+    if [[ "$candidate" == */* ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    command -v -- "$candidate"
+}
+
+ensure_root() {
+    local script_path=""
+    local env_args=()
+    local name=""
+
+    if [[ "${EUID:-$(id -u)}" -eq 0 || "$DRY_RUN" -eq 1 ]]; then
+        return 0
+    fi
+
+    have_command sudo || die "sudo is required to repair apt/dpkg state."
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        die "Interactive sudo is required. Re-run this command with sudo."
+    fi
+
+    script_path="$(resolve_script_path)" || die "Could not resolve script path for sudo re-exec."
+
+    for name in \
+        ALL_PROXY \
+        all_proxy \
+        HTTP_PROXY \
+        http_proxy \
+        HTTPS_PROXY \
+        https_proxy \
+        FTP_PROXY \
+        ftp_proxy \
+        NO_PROXY \
+        no_proxy
+    do
+        if [[ -v "$name" ]]; then
+            env_args+=("$name=${!name}")
+        fi
+    done
+
+    exec sudo env "${env_args[@]}" "$script_path" "$@"
+}
+
+check_platform() {
+    require_command apt-get
+    require_command dpkg
+    require_command ps
+    require_command date
+}
+
+append_unique_pid() {
+    local pid="$1"
+    local existing=""
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+
+    for existing in "${LOCK_HOLDERS[@]}"; do
+        [[ "$existing" == "$pid" ]] && return 0
+    done
+
+    LOCK_HOLDERS+=("$pid")
+}
+
+collect_lock_holders_for_file() {
+    local lock_file="$1"
+    local line=""
+    local pid=""
+    local path=""
+
+    [[ -e "$lock_file" ]] || return 0
+
+    if have_command fuser; then
+        while IFS= read -r pid; do
+            append_unique_pid "$pid"
+        done < <(fuser "$lock_file" 2>/dev/null | tr ' ' '\n')
+    fi
+
+    if have_command lslocks; then
+        while IFS= read -r line; do
+            pid="${line%% *}"
+            path="${line#* }"
+            [[ "$path" == "$lock_file" ]] || continue
+            append_unique_pid "$pid"
+        done < <(lslocks --noheadings --raw --output PID,PATH 2>/dev/null || true)
+    fi
+}
+
+collect_lock_holders() {
+    local lock_file=""
+
+    LOCK_HOLDERS=()
+    for lock_file in "${LOCK_FILES[@]}"; do
+        collect_lock_holders_for_file "$lock_file"
+    done
+}
+
+print_lock_holders() {
+    local pid=""
+    local args=""
+
+    for pid in "${LOCK_HOLDERS[@]}"; do
+        args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+        if [[ -n "$args" ]]; then
+            echo "  $pid  $args"
+        else
+            echo "  $pid"
+        fi
+    done
+}
+
+stop_apt_services() {
+    have_command systemctl || return 0
+
+    info "Stopping apt timers/services to prevent immediate restarts."
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+}
+
+terminate_lock_holders() {
+    local pid=""
+
+    collect_lock_holders
+    ((${#LOCK_HOLDERS[@]} == 0)) && return 0
+
+    info "Sending SIGTERM to package lock holders."
+    print_lock_holders
+    for pid in "${LOCK_HOLDERS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    sleep 5
+    collect_lock_holders
+    ((${#LOCK_HOLDERS[@]} == 0)) && return 0
+
+    info "Some lock holders are still running; sending SIGKILL."
+    print_lock_holders
+    for pid in "${LOCK_HOLDERS[@]}"; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+}
+
+wait_for_locks() {
+    local start=0
+    local now=0
+    local elapsed=0
+    local last_report=-60
+
+    info "Checking apt/dpkg locks."
+    start="$(date +%s)"
+
+    while true; do
+        collect_lock_holders
+        if ((${#LOCK_HOLDERS[@]} == 0)); then
+            info "No active apt/dpkg lock holders found."
+            return 0
+        fi
+
+        now="$(date +%s)"
+        elapsed=$((now - start))
+
+        if ((elapsed >= TIMEOUT_SECONDS)); then
+            break
+        fi
+
+        if ((elapsed - last_report >= 30)); then
+            echo "Waiting for package manager locks (${elapsed}s/${TIMEOUT_SECONDS}s):"
+            print_lock_holders
+            last_report="$elapsed"
+        fi
+
+        sleep "$INTERVAL_SECONDS"
+    done
+
+    if ((FORCE_STOP == 0)); then
+        echo "Timed out waiting for package manager locks:" >&2
+        print_lock_holders >&2
+        die "Wait longer with --timeout, or use --force-stop only if the package manager is stuck."
+    fi
+
+    info "Timed out; --force-stop was requested."
+    stop_apt_services
+    terminate_lock_holders
+    sleep 2
+
+    collect_lock_holders
+    if ((${#LOCK_HOLDERS[@]} > 0)); then
+        echo "Remaining lock holders:" >&2
+        print_lock_holders >&2
+        die "Could not clear apt/dpkg locks."
+    fi
+
+    info "Package lock holders were stopped."
+}
+
+run_or_print() {
+    if ((DRY_RUN)); then
+        printf 'Would run:'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+
+    "$@"
+}
+
+run_with_optional_noninteractive() {
+    if ((ASSUME_YES)); then
+        run_or_print env DEBIAN_FRONTEND=noninteractive "$@"
+    else
+        run_or_print "$@"
+    fi
+}
+
+repair_package_state() {
+    local apt_fix_args=(apt-get -f install)
+
+    if ((ASSUME_YES)); then
+        apt_fix_args+=(--yes)
+    fi
+
+    info "Running dpkg repair for interrupted package configuration."
+    run_with_optional_noninteractive dpkg --configure -a
+
+    wait_for_locks
+
+    info "Running apt dependency repair."
+    run_with_optional_noninteractive "${apt_fix_args[@]}"
+
+    wait_for_locks
+
+    if ((RUN_UPDATE)); then
+        info "Updating package lists."
+        run_with_optional_noninteractive apt-get update
+        wait_for_locks
+    fi
+
+    info "Checking package database consistency."
+    run_with_optional_noninteractive apt-get check
+}
+
+main() {
+    parse_args "$@"
+    check_platform
+    ensure_root "$@"
+
+    if ((DRY_RUN)); then
+        info "Dry run mode: no package state will be changed."
+        echo "Timeout: ${TIMEOUT_SECONDS}s"
+        echo "Interval: ${INTERVAL_SECONDS}s"
+        echo "Force stop: $FORCE_STOP"
+        echo "Repair: $RUN_REPAIR"
+        echo "Update: $RUN_UPDATE"
+    fi
+
+    wait_for_locks
+
+    if ((RUN_REPAIR)); then
+        repair_package_state
+    fi
+
+    info "apt/dpkg lock recovery completed."
+}
+
+main "$@"

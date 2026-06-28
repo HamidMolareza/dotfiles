@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+
+DEFAULT_SUFFIX = "_private"
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".heic", ".tif", ".tiff"})
+JPEG_EXTENSIONS = {".jpg", ".jpeg"}
+
+
+@dataclass(frozen=True)
+class DetectedTools:
+    commands: dict[str, str | None]
+
+    @property
+    def imagemagick(self) -> bool:
+        return self.path("convert") is not None and self.path("identify") is not None
+
+    def path(self, command: str) -> str | None:
+        return self.commands.get(command)
+
+
+@dataclass(frozen=True)
+class ToolAdapter:
+    name: str
+    priority: int
+    install_hint: str
+    required_commands: tuple[str, ...]
+    supported_extensions: frozenset[str]
+    clean: Callable[[Path, DetectedTools], None]
+
+    def is_available(self, detected_tools: DetectedTools) -> bool:
+        return all(detected_tools.path(command) is not None for command in self.required_commands)
+
+    def supports(self, path: Path) -> bool:
+        return path.suffix.lower() in self.supported_extensions
+
+    def availability_label(self, detected_tools: DetectedTools) -> str | None:
+        values = [detected_tools.path(command) for command in self.required_commands]
+        if not all(values):
+            return None
+        if self.name == "imagemagick":
+            return "convert + identify"
+        return ", ".join(value for value in values if value)
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    src: Path
+    base: Path
+
+
+def warn(message: str) -> None:
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def die(message: str) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run_command(command: list[str]) -> None:
+    completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or "command failed"
+        raise RuntimeError(message)
+
+
+def clean_with_mat2(tmp: Path, detected_tools: DetectedTools) -> None:
+    run_command([detected_tools.path("mat2") or "mat2", "--inplace", str(tmp)])
+
+
+def clean_with_exiftool(tmp: Path, detected_tools: DetectedTools) -> None:
+    run_command([detected_tools.path("exiftool") or "exiftool", "-all=", "-overwrite_original", str(tmp)])
+
+
+def clean_with_imagemagick(_tmp: Path, _detected_tools: DetectedTools) -> None:
+    return
+
+
+def clean_with_jhead(tmp: Path, detected_tools: DetectedTools) -> None:
+    run_command([detected_tools.path("jhead") or "jhead", "-purejpg", str(tmp)])
+
+
+TOOL_ADAPTERS = (
+    ToolAdapter(
+        name="mat2",
+        priority=10,
+        install_hint="sudo apt install mat2",
+        required_commands=("mat2",),
+        supported_extensions=IMAGE_EXTENSIONS,
+        clean=clean_with_mat2,
+    ),
+    ToolAdapter(
+        name="exiftool",
+        priority=20,
+        install_hint="sudo apt install libimage-exiftool-perl",
+        required_commands=("exiftool",),
+        supported_extensions=IMAGE_EXTENSIONS,
+        clean=clean_with_exiftool,
+    ),
+    ToolAdapter(
+        name="imagemagick",
+        priority=30,
+        install_hint="sudo apt install imagemagick",
+        required_commands=("convert", "identify"),
+        supported_extensions=IMAGE_EXTENSIONS,
+        clean=clean_with_imagemagick,
+    ),
+    ToolAdapter(
+        name="jhead",
+        priority=40,
+        install_hint="sudo apt install jhead",
+        required_commands=("jhead",),
+        supported_extensions=frozenset(JPEG_EXTENSIONS),
+        clean=clean_with_jhead,
+    ),
+)
+TOOL_ADAPTERS_BY_NAME = {adapter.name: adapter for adapter in TOOL_ADAPTERS}
+TOOL_CHOICES = ("auto", *(adapter.name for adapter in TOOL_ADAPTERS))
+
+
+def detect_tools() -> DetectedTools:
+    commands = {
+        command
+        for adapter in TOOL_ADAPTERS
+        for command in adapter.required_commands
+    }
+    return DetectedTools({command: shutil.which(command) for command in sorted(commands)})
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Remove EXIF/GPS/privacy metadata from image files.",
+        epilog=(
+            "Default behavior preserves originals and writes sanitized copies next "
+            "to each input. In auto mode, tool priority is: mat2, exiftool, "
+            "ImageMagick, then jhead for JPEG files."
+        ),
+    )
+    parser.add_argument("paths", nargs="*", help="Image files or directories to process")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        help="Write sanitized copies under this directory, preserving directory structure",
+    )
+    parser.add_argument(
+        "--suffix",
+        default=DEFAULT_SUFFIX,
+        help=f"Suffix for side-by-side outputs (default: {DEFAULT_SUFFIX})",
+    )
+    parser.add_argument(
+        "--tool",
+        choices=TOOL_CHOICES,
+        default="auto",
+        help="Metadata removal tool to use (default: auto)",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Replace original files after successful cleaning",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing output files",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned operations without writing files",
+    )
+    parser.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="Print detected tool availability and exit",
+    )
+
+    args = parser.parse_args()
+    if args.in_place and args.output_dir:
+        die("--in-place cannot be used with --output-dir")
+    if not args.list_tools and not args.paths:
+        parser.print_usage(sys.stderr)
+        die("at least one file or directory is required")
+    return args
+
+
+def print_tools(detected_tools: DetectedTools) -> None:
+    for adapter in TOOL_ADAPTERS:
+        value = adapter.availability_label(detected_tools)
+        if value:
+            print(f"{adapter.name}: available ({value})")
+        else:
+            print(f"{adapter.name}: missing; install with: {adapter.install_hint}")
+
+
+def is_supported_image(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def collect_inputs(paths: list[str]) -> tuple[list[WorkItem], int]:
+    items: list[WorkItem] = []
+    failures = 0
+
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_dir():
+            for file in sorted(path.rglob("*")):
+                if file.is_file() and is_supported_image(file):
+                    items.append(WorkItem(file, path))
+        elif path.is_file():
+            if is_supported_image(path):
+                items.append(WorkItem(path, path.parent))
+            else:
+                warn(f"skipping unsupported file extension: {path}")
+        else:
+            warn(f"not found: {path}")
+            failures += 1
+
+    return items, failures
+
+
+def destination_for(src: Path, base: Path, args: argparse.Namespace) -> Path:
+    if args.in_place:
+        return src
+
+    if args.output_dir:
+        try:
+            relative = src.relative_to(base)
+        except ValueError:
+            relative = Path(src.name)
+        rel_parent = relative.parent
+        dest_dir = Path(args.output_dir) if str(rel_parent) == "." else Path(args.output_dir) / rel_parent
+    else:
+        dest_dir = src.parent
+
+    return dest_dir / f"{src.stem}{args.suffix}{src.suffix}"
+
+
+def select_tool(path: Path, requested: str, detected_tools: DetectedTools) -> ToolAdapter:
+    if requested != "auto":
+        adapter = TOOL_ADAPTERS_BY_NAME[requested]
+        if not adapter.supports(path):
+            extensions = ", ".join(sorted(adapter.supported_extensions))
+            raise RuntimeError(f"{adapter.name} only supports: {extensions}")
+        if not adapter.is_available(detected_tools):
+            raise RuntimeError(f"{adapter.name} is not installed. Install it with: {adapter.install_hint}")
+        return adapter
+
+    for adapter in sorted(TOOL_ADAPTERS, key=lambda item: item.priority):
+        if adapter.supports(path) and adapter.is_available(detected_tools):
+            return adapter
+
+    raise RuntimeError(
+        "No supported metadata removal tool is installed. Install one of: "
+        + ", ".join(f"{adapter.name} ({adapter.install_hint})" for adapter in TOOL_ADAPTERS)
+        + "."
+    )
+
+
+def make_temp_path(directory: Path, suffix: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=".image-remove-private-data.",
+        suffix=suffix,
+        dir=str(directory),
+    )
+    os.close(fd)
+    return Path(name)
+
+
+def prepare_working_copy(src: Path, tmp: Path, adapter: ToolAdapter, detected_tools: DetectedTools) -> None:
+    if adapter.name == "imagemagick":
+        run_command([detected_tools.path("convert") or "convert", str(src), "-auto-orient", "-strip", str(tmp)])
+        return
+
+    if detected_tools.imagemagick:
+        run_command([detected_tools.path("convert") or "convert", str(src), "-auto-orient", str(tmp)])
+    else:
+        warn(
+            f"ImageMagick is not installed; {src} will be cleaned without pixel auto-orientation. "
+            "Photos that rely on EXIF orientation may display rotated after metadata removal."
+        )
+        shutil.copy2(src, tmp)
+
+
+def clean_one(item: WorkItem, args: argparse.Namespace, detected_tools: DetectedTools) -> bool:
+    src = item.src
+    try:
+        adapter = select_tool(src, args.tool, detected_tools)
+        dest = destination_for(src, item.base, args)
+
+        if not args.in_place and src == dest:
+            raise RuntimeError(f"refusing to overwrite input without --in-place: {src}")
+
+        if args.dry_run:
+            action = "in place" if args.in_place else f"-> {dest}"
+            print(f"Would clean with {adapter.name}: {src} {action}")
+            return True
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        if not args.in_place and dest.exists() and not args.force:
+            raise RuntimeError(f"output exists, use --force to overwrite: {dest}")
+
+        tmp = make_temp_path(dest.parent, src.suffix)
+        try:
+            prepare_working_copy(src, tmp, adapter, detected_tools)
+            adapter.clean(tmp, detected_tools)
+
+            if not args.in_place and dest.exists() and not args.force:
+                raise RuntimeError(f"output was created by another process, use --force to overwrite: {dest}")
+
+            shutil.move(str(tmp), str(dest))
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        if args.in_place:
+            print(f"Cleaned with {adapter.name} in place: {src}")
+        else:
+            print(f"Cleaned with {adapter.name}: {src} -> {dest}")
+        return True
+    except Exception as error:
+        warn(f"failed: {src}: {error}")
+        return False
+
+
+def main() -> int:
+    args = parse_args()
+    detected_tools = detect_tools()
+
+    if args.list_tools:
+        print_tools(detected_tools)
+        return 0
+
+    items, failures = collect_inputs(args.paths)
+    if not items:
+        warn("no supported image files found")
+
+    total = 0
+    for item in items:
+        if clean_one(item, args, detected_tools):
+            total += 1
+        else:
+            failures += 1
+
+    if failures:
+        print(f"Done with {failures} failure(s). Processed {total} file(s).", file=sys.stderr)
+        return 1
+
+    print(f"Done. Processed {total} file(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

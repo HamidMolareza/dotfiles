@@ -134,18 +134,22 @@ Current default includes:
 - `/home/home/Desktop`
 - `/home/home/my-files`
 - `/home/home/Private`
-- `/home/home/.codex2`
 - `/home/home/.dotfiles`
 - `/home/home/.gapcode`
-- `/home/home/.gapcodex`
 - `/home/home/.secure-exports`
+- `/home/home/.copilot`
+- `/home/home/.config/WirePanelClient`
+- `/home/home/backups/joplin`
+- `/home/home/backups/server`
 - `/media/home/09190305819/Medical`
 
 Current default excludes:
 
 - `/home/home/Desktop/temp`
 - `/home/home/.dotfiles/docker-services/adguard/data/adguard/workdir/data`
-- `/home/home/.dotfiles/docker-services/joplin/data/joplin-db`
+- `/home/home/my-files/learning-daily`
+- global dev/build folders: `node_modules`, `bin`, `obj`, `dist`, `build`,
+  `.next`, `.nuxt`, `.cache`, and `coverage`
 
 ## Examples
 
@@ -203,6 +207,82 @@ Apply the restore for real:
   --restore-to /tmp/restore-dotfiles \
   --yes
 ```
+
+## Restore Joplin Backups
+
+The default rules include `/home/home/backups/joplin`, which should contain
+Joplin PostgreSQL dumps, `.sha256` files, and optional `.gpg` copies created by
+the VPS migration helper.
+
+Restore the backup folder from a snapshot into a staging directory first:
+
+```bash
+./backup-home --dest /media/home/backup-drive \
+  restore 2026-04-07_12-00-00 \
+  --path /home/home/backups/joplin \
+  --restore-to /tmp/restore-joplin
+```
+
+Apply the folder restore only after reviewing the dry-run:
+
+```bash
+./backup-home --dest /media/home/backup-drive \
+  restore 2026-04-07_12-00-00 \
+  --path /home/home/backups/joplin \
+  --restore-to /tmp/restore-joplin \
+  --yes
+```
+
+Verify the dump before using it:
+
+```bash
+cd /tmp/restore-joplin/home/home/backups/joplin
+sha256sum -c joplin-YYYYMMDDTHHMMSSZ.dump.sha256
+```
+
+To restore Joplin on the VPS, stop the app, restore the selected dump into the
+PostgreSQL container, then start and verify the app:
+
+```bash
+ssh arvan 'sudo docker stop arvan-joplin-app'
+cat /tmp/restore-joplin/home/home/backups/joplin/joplin-YYYYMMDDTHHMMSSZ.dump \
+  | ssh arvan 'sudo docker exec -i arvan-joplin-db sh -lc '"'"'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --no-privileges --exit-on-error'"'"''
+ssh arvan 'sudo docker start arvan-joplin-app'
+/home/home/my-files/temp/arvan-vps/scripts/joplin-vps status arvan
+```
+
+Use the local rollback database only when intentionally rolling back to the old
+local Joplin stack. Do not run the local and VPS Joplin apps against
+independently changing databases.
+
+## Restore Server Artifact Backups
+
+The default rules include `/home/home/backups/server`. This folder is for local
+artifacts pulled from servers, not the live server itself.
+
+Restore it into a staging directory first:
+
+```bash
+./backup-home --dest /media/home/backup-drive \
+  restore 2026-04-07_12-00-00 \
+  --path /home/home/backups/server \
+  --restore-to /tmp/restore-server
+```
+
+Apply after reviewing the dry-run:
+
+```bash
+./backup-home --dest /media/home/backup-drive \
+  restore 2026-04-07_12-00-00 \
+  --path /home/home/backups/server \
+  --restore-to /tmp/restore-server \
+  --yes
+```
+
+After restore, inspect any checksum, manifest, or service-specific README files
+inside `/tmp/restore-server/home/home/backups/server`. Restore artifacts back to
+a live server only through that service's own documented procedure; do not
+blindly overwrite live server paths.
 
 Walk the manual checklist interactively:
 

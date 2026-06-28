@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MyStretchly
+Comment=Quiet break reminder for focused work
+Exec=/home/home/my-files/projects/my-stretchly/src/MyStretchly.App/bin/Debug/net10.0/MyStretchly.App
+Icon=/home/home/my-files/projects/my-stretchly/src/MyStretchly.App/Assets/my-stretchly.png
+Terminal=false
+Categories=Utility;
+StartupNotify=false

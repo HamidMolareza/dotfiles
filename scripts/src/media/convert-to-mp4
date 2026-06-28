@@ -1,12 +1,16 @@
 #!/bin/bash
 
 # Source common shell functions
-if [ -f $LIBS_DIR/common_functions.sh ]; then
-    . $LIBS_DIR/common_functions.sh
+if [ -n "${LIBS_DIR:-}" ] && [ -f "$LIBS_DIR/common_functions.sh" ]; then
+    . "$LIBS_DIR/common_functions.sh"
 else
-    echo "Error: common_functions.sh not found in '$LIBS_DIR'" >&2
+    echo "Error: common_functions.sh not found in '${LIBS_DIR:-}'" >&2
     exit 1
 fi
+
+usage() {
+    echo_error "Usage: $(basename "$0") <input_video>"
+}
 
 if ! command-exists ffmpeg; then
     echo_error "ffmpeg is not installed. Please install it before running this script."
@@ -14,15 +18,50 @@ if ! command-exists ffmpeg; then
 fi
 
 # Check if input file is provided
-if [ -z "$1" ]; then
-    echo_error "Usage: $(basename $0) <input_video>"
+if [ "$#" -lt 1 ]; then
+    usage
     exit 1
 fi
 
-input_video="$1"
+if [ "$#" -eq 1 ]; then
+    input_video="$1"
+else
+    input_video="$*"
+fi
+
+if [ ! -f "$input_video" ]; then
+    echo_error "Input file not found: $input_video"
+    echo_error "If the path contains spaces, quote it or run the command from the file's directory."
+    exit 1
+fi
+
 output_video="${input_video%.*}.mp4"
+tmp_output="${output_video%.mp4}.tmp.$$.mp4"
+
+cleanup() {
+    rm -f "$tmp_output"
+}
+trap cleanup EXIT
+
+if [ "$input_video" = "$output_video" ]; then
+    echo_error "Input file is already an MP4: $input_video"
+    exit 1
+fi
+
+if [ -e "$output_video" ] && [ -s "$output_video" ]; then
+    echo_error "Output file already exists: $output_video"
+    exit 1
+fi
+
+rm -f "$output_video"
 
 # Convert the video to MP4
-ffmpeg -i "$input_video" -c:v h264 -c:a aac -strict experimental "$output_video"
+if ! ffmpeg -i "$input_video" -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p" -fps_mode vfr -c:v libx264 -c:a aac -movflags +faststart "$tmp_output"; then
+    echo_error "Conversion failed."
+    exit 1
+fi
+
+mv "$tmp_output" "$output_video"
+trap - EXIT
 
 echo_info "Conversion complete. Output: $output_video"

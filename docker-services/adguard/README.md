@@ -14,14 +14,28 @@ This directory runs `AdGuard Home` with Docker Compose and stores its persistent
 ## Start
 
 ```bash
-docker compose up -d
+./enable-adguard.sh
+```
+
+This starts the `adguardhome` service and creates its container if needed.
+After the container is running, the script configures Ubuntu to use AdGuard at
+`127.0.0.1` as its local DNS resolver. It may prompt for `sudo`.
+
+To use another local AdGuard address:
+
+```bash
+ADGUARD_DNS=127.0.0.1 ./enable-adguard.sh
 ```
 
 ## Stop
 
 ```bash
-docker compose down
+./disable-adguard.sh
 ```
+
+This stops AdGuard Home without removing its container or persistent data.
+Before stopping the container, the script restores the Ubuntu DNS settings saved
+by `Ubuntu/install-local-dns.sh`. If DNS restoration fails, AdGuard remains running.
 
 ## Restart
 

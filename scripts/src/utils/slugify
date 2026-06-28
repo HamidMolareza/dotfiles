@@ -1,39 +1,156 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/usr/bin/env python3
+import argparse
+import re
+import sys
+import unicodedata
 
-usage() {
-    cat <<'EOF'
-Usage: slugify <text>
-       echo <text> | slugify
 
-Convert text into a lowercase hyphen-separated slug.
-EOF
-}
+PERSIAN_NORMALIZATION_TABLE = str.maketrans(
+    {
+        "ك": "ک",
+        "ي": "ی",
+        "ى": "ی",
+        "ۀ": "ه",
+        "ة": "ه",
+        "ؤ": "و",
+        "أ": "ا",
+        "إ": "ا",
+        "ٱ": "ا",
+        "\u200c": " ",
+        "\u200d": " ",
+        "\u200e": " ",
+        "\u200f": " ",
+    }
+)
 
-if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
-    usage
-    exit 0
-fi
+DIGIT_TABLE = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
 
-if ! command -v iconv >/dev/null 2>&1; then
-    echo "Error: iconv is required but not installed." >&2
-    exit 1
-fi
+LATIN_TABLE = str.maketrans(
+    {
+        "ا": "a",
+        "آ": "a",
+        "ب": "b",
+        "پ": "p",
+        "ت": "t",
+        "ث": "s",
+        "ج": "j",
+        "چ": "ch",
+        "ح": "h",
+        "خ": "kh",
+        "د": "d",
+        "ذ": "z",
+        "ر": "r",
+        "ز": "z",
+        "ژ": "zh",
+        "س": "s",
+        "ش": "sh",
+        "ص": "s",
+        "ض": "z",
+        "ط": "t",
+        "ظ": "z",
+        "ع": "a",
+        "غ": "gh",
+        "ف": "f",
+        "ق": "gh",
+        "ک": "k",
+        "گ": "g",
+        "ل": "l",
+        "م": "m",
+        "ن": "n",
+        "و": "v",
+        "ه": "h",
+        "ی": "i",
+        "ء": "",
+        "ئ": "i",
+    }
+)
 
-if [ "$#" -gt 0 ]; then
-    input="$*"
-elif [ ! -t 0 ]; then
-    input="$(cat)"
-else
-    usage >&2
-    exit 1
-fi
 
-slug="$(
-    printf '%s' "$input" |
-        iconv -t ASCII//TRANSLIT 2>/dev/null |
-        sed -E 's/[^[:alnum:]]+/-/g; s/^-+//; s/-+$//' |
-        tr '[:upper:]' '[:lower:]'
-)"
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="slugify",
+        description="Convert text into a lowercase hyphen-separated slug.",
+    )
+    parser.add_argument(
+        "--latin",
+        "--ascii",
+        action="store_true",
+        dest="latin",
+        help="approximate Persian/Arabic text as ASCII Latin before slugifying",
+    )
+    parser.add_argument("text", nargs="*", help="text to slugify; stdin is used when omitted")
+    return parser
 
-printf '%s\n' "$slug"
+
+def read_input(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
+    if args.text:
+        return " ".join(args.text)
+
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+
+    parser.print_usage(sys.stderr)
+    raise SystemExit(1)
+
+
+def remove_marks(text: str) -> str:
+    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("M"))
+
+
+def strip_latin_accents(text: str) -> str:
+    chars = []
+    for ch in text:
+        if "LATIN" not in unicodedata.name(ch, ""):
+            chars.append(ch)
+            continue
+
+        chars.append(remove_marks(unicodedata.normalize("NFKD", ch)))
+
+    return "".join(chars)
+
+
+def normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = normalized.translate(PERSIAN_NORMALIZATION_TABLE)
+    normalized = normalized.translate(DIGIT_TABLE)
+    normalized = remove_marks(normalized)
+    normalized = strip_latin_accents(normalized)
+    return unicodedata.normalize("NFKC", normalized)
+
+
+def transliterate_to_latin(text: str) -> str:
+    return text.translate(LATIN_TABLE)
+
+
+def slugify(text: str, *, latin: bool) -> str:
+    normalized = normalize_text(text)
+    if latin:
+        normalized = transliterate_to_latin(normalized)
+
+    parts = []
+    needs_separator = False
+    for ch in normalized:
+        if ch.isalnum() and (not latin or ch.isascii()):
+            if needs_separator and parts:
+                parts.append("-")
+            parts.append(ch.lower())
+            needs_separator = False
+        elif ch.isspace() or not ch.isalnum():
+            needs_separator = bool(parts)
+
+    return re.sub("-+", "-", "".join(parts)).strip("-")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    input_text = read_input(args, parser)
+    print(slugify(input_text, latin=args.latin))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

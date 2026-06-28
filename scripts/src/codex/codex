@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_REALPATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+
+resolve_real_codex() {
+  local path_entry candidate candidate_realpath
+  local old_ifs="$IFS"
+  IFS=':'
+
+  for path_entry in $PATH; do
+    [[ -n "$path_entry" ]] || path_entry="."
+    candidate="$path_entry/codex"
+
+    if [[ ! -x "$candidate" || -d "$candidate" ]]; then
+      continue
+    fi
+
+    candidate_realpath="$(readlink -f -- "$candidate" 2>/dev/null || true)"
+    if [[ -z "$candidate_realpath" || "$candidate_realpath" == "$SCRIPT_REALPATH" ]]; then
+      continue
+    fi
+
+    IFS="$old_ifs"
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  IFS="$old_ifs"
+  return 1
+}
+
+main() {
+  local real_codex notice
+
+  if ! real_codex="$(resolve_real_codex)"; then
+    printf 'codex guard: refusing to run codex; could not find the real codex executable after the wrapper in PATH.\n' >&2
+    exit 1
+  fi
+
+  if [[ "${1:-}" == "completion" ]]; then
+    exec "$real_codex" "$@"
+  fi
+
+  if [[ "${CODEX_GUARD_CHECK_ONLY:-}" == "1" ]]; then
+    exec network-guard check
+  fi
+
+  notice="codex guard: running codex through custom preflight script: $SCRIPT_REALPATH"
+  exec network-guard exec --notice "$notice" -- "$real_codex" "$@"
+}
+
+main "$@"

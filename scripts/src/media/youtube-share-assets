@@ -95,18 +95,13 @@ def run_command(
 
 
 def ytdlp_auth_args(args: argparse.Namespace) -> list[str]:
-    result: list[str] = []
-
     if args.cookies:
         cookies_path = Path(args.cookies).expanduser()
         if not cookies_path.is_file():
             die(f"cookies file not found: {cookies_path}")
-        result.extend(["--cookies", str(cookies_path)])
+        return ["--cookies", str(cookies_path)]
 
-    if args.cookies_from_browser:
-        result.extend(["--cookies-from-browser", args.cookies_from_browser])
-
-    return result
+    return ["--cookies-from-browser", args.cookies_from_browser]
 
 
 def ytdlp_js_args(args: argparse.Namespace) -> list[str]:
@@ -469,7 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
     auth_group.add_argument("--cookies", help="Netscape cookies.txt file for yt-dlp.")
     auth_group.add_argument(
         "--cookies-from-browser",
-        help="Browser name for yt-dlp cookie extraction, for example: firefox or chrome.",
+        default="firefox",
+        help="Browser name for yt-dlp cookie extraction. Default: firefox.",
     )
     parser.add_argument(
         "--list-subs",

@@ -1,0 +1,1317 @@
+#!/usr/bin/env python3
+"""
+source-copy
+
+Features:
+- Discover .sln and .csproj under an input directory
+- Optional presentation-only filter (best-effort heuristics)
+- Interactive multi-select (TUI if prompt_toolkit is installed)
+- Expand .sln => its .csproj entries
+- Build dependency closure via <ProjectReference Include="...">
+- Copy selected projects + dependencies to output, honoring root .gitignore (best-effort)
+- Generate build_release.ps1 to build/publish/pack in Release
+
+Notes:
+- .gitignore parsing is best-effort and reads ONLY the root .gitignore (input/.gitignore).
+  It also ALWAYS ignores common build folders (bin, obj, .git, .vs, etc.)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+try:
+    from prompt_toolkit.shortcuts import checkboxlist_dialog
+    _HAS_PROMPT_TOOLKIT = True
+except Exception:
+    _HAS_PROMPT_TOOLKIT = False
+
+
+# ----------------------------
+# Discovery
+# ----------------------------
+
+@dataclass(frozen=True)
+class Item:
+    kind: str  # "sln" or "csproj"
+    path: Path
+    latest_change_time: float = 0.0
+
+
+def is_relative_to_path(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+SOURCE_MTIME_EXTENSIONS = {
+    # .NET / project files
+    ".cs", ".vb", ".fs",
+    ".csproj", ".vbproj", ".fsproj",
+    ".props", ".targets", ".sln",
+    # UI / templates
+    ".razor", ".cshtml", ".vbhtml", ".xaml", ".resx",
+    # Config / infra
+    ".json", ".xml", ".config", ".yml", ".yaml",
+    # Frontend source
+    ".js", ".jsx", ".ts", ".tsx", ".vue",
+    ".css", ".scss", ".sass", ".less", ".html", ".htm",
+    # Data / scripts
+    ".sql", ".ps1", ".sh",
+}
+
+SOURCE_MTIME_FILENAMES = {
+    ".editorconfig",
+    ".gitignore",
+    ".gitattributes",
+    "dockerfile",
+    "global.json",
+    "nuget.config",
+    "directory.build.props",
+    "directory.build.targets",
+    "directory.packages.props",
+}
+
+
+def is_source_file_for_mtime(file_name: str) -> bool:
+    low = file_name.lower()
+    if low in SOURCE_MTIME_FILENAMES:
+        return True
+    return Path(low).suffix in SOURCE_MTIME_EXTENSIONS
+
+
+def _safe_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def format_change_time(timestamp: float) -> str:
+    if timestamp <= 0.0:
+        return "unknown"
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+
+
+def find_enclosing_git_root(path: Path, cache: Dict[Path, Optional[Path]]) -> Optional[Path]:
+    """
+    Return the nearest parent directory that looks like a Git work tree root.
+    Supports both normal repositories (.git directory) and worktrees/submodules
+    where .git can be a file.
+    """
+    resolved = path.resolve()
+    current = resolved if resolved.is_dir() else resolved.parent
+    visited: List[Path] = []
+
+    while True:
+        if current in cache:
+            git_root = cache[current]
+            break
+
+        visited.append(current)
+        if (current / ".git").exists():
+            git_root = current
+            break
+
+        if current.parent == current:
+            git_root = None
+            break
+
+        current = current.parent
+
+    for candidate in visited:
+        cache[candidate] = git_root
+
+    return git_root
+
+
+def git_latest_change_time(
+    path: Path,
+    git_root_cache: Dict[Path, Optional[Path]],
+    change_cache: Dict[Tuple[Path, str], float],
+) -> float:
+    """
+    Return the latest committed Git change time for a file or directory.
+    If the path is not inside a Git repository, or no history is found, return 0.
+    """
+    git_root = find_enclosing_git_root(path, git_root_cache)
+    if git_root is None:
+        return 0.0
+
+    target = path.resolve()
+    try:
+        rel = target.relative_to(git_root.resolve()).as_posix()
+    except ValueError:
+        return 0.0
+
+    if not rel:
+        rel = "."
+
+    key = (git_root.resolve(), rel)
+    if key in change_cache:
+        return change_cache[key]
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(git_root), "log", "-1", "--format=%ct", "--", rel],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        change_cache[key] = 0.0
+        return 0.0
+
+    if proc.returncode != 0:
+        change_cache[key] = 0.0
+        return 0.0
+
+    output = proc.stdout.strip()
+    if not output:
+        change_cache[key] = 0.0
+        return 0.0
+
+    try:
+        value = float(output)
+    except ValueError:
+        value = 0.0
+
+    change_cache[key] = value
+    return value
+
+
+def git_has_worktree_changes(
+    path: Path,
+    git_root_cache: Dict[Path, Optional[Path]],
+    status_cache: Dict[Tuple[Path, str], bool],
+) -> bool:
+    """
+    Return whether a file or directory has uncommitted Git changes.
+    Includes untracked files, so local edits sort as recent even before commit.
+    """
+    git_root = find_enclosing_git_root(path, git_root_cache)
+    if git_root is None:
+        return False
+
+    target = path.resolve()
+    try:
+        rel = target.relative_to(git_root.resolve()).as_posix()
+    except ValueError:
+        return False
+
+    if not rel:
+        rel = "."
+
+    key = (git_root.resolve(), rel)
+    if key in status_cache:
+        return status_cache[key]
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(git_root), "status", "--porcelain", "-z", "--", rel],
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        status_cache[key] = False
+        return False
+
+    changed = proc.returncode == 0 and bool(proc.stdout)
+    status_cache[key] = changed
+    return changed
+
+
+def project_scope_key(input_root: Path, project_path: Path) -> Tuple[str, ...]:
+    """
+    Return a best-effort deployment scope for a project path.
+
+    The key is used only for sorting. It keeps service-local layer changes
+    ahead of unrelated consumers when a shared dependency changed in the same
+    commit.
+    """
+    try:
+        parts = project_path.resolve().relative_to(input_root.resolve()).parts
+    except ValueError:
+        return tuple(project_path.resolve().parts[:1])
+
+    if not parts:
+        return tuple()
+
+    if parts[0] == "Source" and len(parts) > 1:
+        second = parts[1]
+        second_low = second.lower()
+        if "microservice" in second_low or "micro_service" in second_low:
+            return ("Source", second)
+        if second == "Applications" and len(parts) > 2:
+            return ("Source", "Applications", parts[2])
+        if second in {"Bpc_Gateway", "PublicModule"}:
+            return ("Source", second)
+        return ("Source", second)
+
+    first = parts[0]
+    if "." in first:
+        return (first.split(".", 1)[0],)
+    return (first,)
+
+
+def discover_items(
+    root: Path,
+    presentation_only: bool = False,
+    presentation_regex: Optional[re.Pattern] = None,
+    exclude_roots: Optional[Set[Path]] = None,
+) -> List[Item]:
+    items: List[Item] = []
+    excluded = {p.resolve() for p in (exclude_roots or set())}
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Speed: don't walk into obvious junk
+        base = Path(dirpath)
+        junk_dirs = {".git", ".vs", ".idea", ".vscode", "node_modules"}
+        kept_dirs = []
+        for d in dirnames:
+            if d.lower() in junk_dirs or d.lower().startswith(".git"):
+                continue
+            child = (base / d).resolve()
+            if any(is_relative_to_path(child, excluded_root) for excluded_root in excluded):
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+        for fn in filenames:
+            p = base / fn
+            low = fn.lower()
+            if low.endswith(".sln"):
+                if not presentation_only:
+                    items.append(Item("sln", p))
+            elif low.endswith(".csproj"):
+                if presentation_only:
+                    rel = p.resolve().relative_to(root).as_posix()
+                    if not is_presentation_csproj(p, rel_posix=rel, path_regex=presentation_regex):
+                        continue
+                items.append(Item("csproj", p))
+
+    # Sort newest first by effective project change time. Prefer Git history when
+    # available; otherwise fall back to source/build file mtimes. Referenced layers
+    # are included so higher-level projects bubble up when their dependencies changed.
+    root_resolved = root.resolve()
+    rules = load_root_gitignore(root_resolved)
+    git_root_cache: Dict[Path, Optional[Path]] = {}
+    git_change_cache: Dict[Tuple[Path, str], float] = {}
+    git_status_cache: Dict[Tuple[Path, str], bool] = {}
+    dir_latest_cache: Dict[Path, float] = {}
+    csproj_dir_change_cache: Dict[Path, float] = {}
+    csproj_refs_cache: Dict[Path, List[Path]] = {}
+    csproj_scope_change_cache: Dict[Path, float] = {}
+    csproj_effective_change_cache: Dict[Path, float] = {}
+    sln_effective_change_cache: Dict[Path, float] = {}
+
+    def inside_root(p: Path) -> bool:
+        try:
+            p.resolve().relative_to(root_resolved)
+            return True
+        except ValueError:
+            return False
+
+    def csproj_dir_change_time(csproj_path: Path) -> float:
+        p = csproj_path.resolve()
+        if p in csproj_dir_change_cache:
+            return csproj_dir_change_cache[p]
+        if not p.exists() or not inside_root(p):
+            m = _safe_mtime(p)
+            csproj_dir_change_cache[p] = m
+            return m
+        m = git_latest_change_time(
+            p.parent.resolve(),
+            git_root_cache=git_root_cache,
+            change_cache=git_change_cache,
+        )
+        if git_has_worktree_changes(
+            p.parent.resolve(),
+            git_root_cache=git_root_cache,
+            status_cache=git_status_cache,
+        ):
+            local_m = latest_mtime_under_dir(
+                input_root=root_resolved,
+                dir_path=p.parent.resolve(),
+                rules=rules,
+                cache=dir_latest_cache,
+            )
+            m = max(m, local_m or time.time())
+        elif m == 0.0:
+            m = latest_mtime_under_dir(
+                input_root=root_resolved,
+                dir_path=p.parent.resolve(),
+                rules=rules,
+                cache=dir_latest_cache,
+            )
+        if m == 0.0:
+            m = _safe_mtime(p)
+        csproj_dir_change_cache[p] = m
+        return m
+
+    def csproj_refs(csproj_path: Path) -> List[Path]:
+        p = csproj_path.resolve()
+        if p in csproj_refs_cache:
+            return csproj_refs_cache[p]
+        if not p.exists() or not inside_root(p):
+            csproj_refs_cache[p] = []
+            return []
+        refs = [r.resolve() for r in csproj_references(p, warn=False)]
+        refs = [r for r in refs if inside_root(r)]
+        csproj_refs_cache[p] = refs
+        return refs
+
+    def scope_csproj_change_time(csproj_path: Path, visiting: Optional[Set[Path]] = None) -> float:
+        p = csproj_path.resolve()
+        if p in csproj_scope_change_cache:
+            return csproj_scope_change_cache[p]
+        if visiting is None:
+            visiting = set()
+        if p in visiting:
+            return csproj_dir_change_time(p)
+
+        visiting.add(p)
+        scope_key = project_scope_key(root_resolved, p)
+        m = csproj_dir_change_time(p)
+        for ref in csproj_refs(p):
+            if project_scope_key(root_resolved, ref) == scope_key:
+                m = max(m, scope_csproj_change_time(ref, visiting))
+        visiting.remove(p)
+        csproj_scope_change_cache[p] = m
+        return m
+
+    def effective_csproj_change_time(csproj_path: Path, visiting: Optional[Set[Path]] = None) -> float:
+        p = csproj_path.resolve()
+        if p in csproj_effective_change_cache:
+            return csproj_effective_change_cache[p]
+        if visiting is None:
+            visiting = set()
+        if p in visiting:
+            return csproj_dir_change_time(p)
+        visiting.add(p)
+        m = csproj_dir_change_time(p)
+        for ref in csproj_refs(p):
+            m = max(m, effective_csproj_change_time(ref, visiting))
+        visiting.remove(p)
+        csproj_effective_change_cache[p] = m
+        return m
+
+    def effective_sln_change_time(sln_path: Path) -> float:
+        p = sln_path.resolve()
+        if p in sln_effective_change_cache:
+            return sln_effective_change_cache[p]
+        m = git_latest_change_time(
+            p,
+            git_root_cache=git_root_cache,
+            change_cache=git_change_cache,
+        )
+        for cp in sln_to_csprojs(p):
+            if not inside_root(cp):
+                continue
+            m = max(m, effective_csproj_change_time(cp))
+        if m == 0.0:
+            m = _safe_mtime(p)
+        sln_effective_change_cache[p] = m
+        return m
+
+    def item_scope_change_time(it: Item) -> float:
+        if it.kind == "csproj":
+            return scope_csproj_change_time(it.path)
+
+        m = git_latest_change_time(
+            it.path.resolve(),
+            git_root_cache=git_root_cache,
+            change_cache=git_change_cache,
+        )
+        for cp in sln_to_csprojs(it.path.resolve()):
+            if inside_root(cp):
+                m = max(m, scope_csproj_change_time(cp))
+        return m
+
+    def item_direct_change_time(it: Item) -> float:
+        if it.kind == "csproj":
+            return csproj_dir_change_time(it.path)
+        return git_latest_change_time(
+            it.path.resolve(),
+            git_root_cache=git_root_cache,
+            change_cache=git_change_cache,
+        )
+
+    def item_effective_change_time(it: Item) -> float:
+        if it.kind == "csproj":
+            return effective_csproj_change_time(it.path)
+        return effective_sln_change_time(it.path)
+
+    items = [
+        Item(
+            kind=it.kind,
+            path=it.path,
+            latest_change_time=item_effective_change_time(it),
+        )
+        for it in items
+    ]
+
+    items.sort(
+        key=lambda it: (
+            -it.latest_change_time,
+            -item_scope_change_time(it),
+            -item_direct_change_time(it),
+            0 if it.kind == "sln" else 1,
+            str(it.path).lower(),
+        )
+    )
+    return items
+
+
+# ----------------------------
+# Presentation layer heuristics
+# ----------------------------
+
+_PRESENTATION_PATH_RE = re.compile(
+    r"(^|/)(webapi|web|api|presentation|ui|frontend|client|mvc|razor|blazor|spa)(/|$)",
+    re.IGNORECASE,
+)
+_PRESENTATION_SDK_HINTS = {"Microsoft.NET.Sdk.Web"}
+_PRESENTATION_FRAMEWORK_REFS = {"Microsoft.AspNetCore.App"}
+_PRESENTATION_PACKAGE_PREFIXES = ("Microsoft.AspNetCore.",)
+_PRESENTATION_PROP_KEYS = {"UseWPF", "UseWindowsForms", "UseMaui", "UseWinUI", "UseAvalonia"}
+
+
+def _path_has_presentation_hint(rel_posix: str) -> bool:
+    return bool(_PRESENTATION_PATH_RE.search(rel_posix.replace("\\", "/")))
+
+
+def is_presentation_csproj(csproj_path: Path, rel_posix: str, path_regex: Optional[re.Pattern]) -> bool:
+    """
+    Best-effort detection for presentation/UI projects:
+    - Path/name hints
+    - SDK hint (Microsoft.NET.Sdk.Web)
+    - FrameworkReference to Microsoft.AspNetCore.App
+    - PackageReference starting with Microsoft.AspNetCore.*
+    - UI properties: UseWPF/UseWindowsForms/UseMaui/UseWinUI/UseAvalonia
+    """
+    if path_regex and path_regex.search(rel_posix):
+        return True
+
+    if _path_has_presentation_hint(rel_posix):
+        return True
+
+    # Try XML parse for stronger signals; fall back to text search
+    text: Optional[str] = None
+    try:
+        tree = ET.parse(csproj_path)
+        root = tree.getroot()
+    except Exception:
+        root = None
+
+    if root is not None:
+        sdk_attr = root.attrib.get("Sdk", "")
+        if any(h in sdk_attr for h in _PRESENTATION_SDK_HINTS):
+            return True
+
+        for sdk in root.findall(".//{*}Sdk"):
+            name = sdk.attrib.get("Name") or ""
+            if any(h in name for h in _PRESENTATION_SDK_HINTS):
+                return True
+
+        for fr in root.findall(".//{*}FrameworkReference"):
+            inc = fr.attrib.get("Include") or ""
+            if inc in _PRESENTATION_FRAMEWORK_REFS:
+                return True
+
+        for pr in root.findall(".//{*}PackageReference"):
+            inc = pr.attrib.get("Include") or ""
+            if any(inc.startswith(pfx) for pfx in _PRESENTATION_PACKAGE_PREFIXES):
+                return True
+
+        for key in _PRESENTATION_PROP_KEYS:
+            if root.find(f".//{{*}}{key}") is not None:
+                return True
+    else:
+        try:
+            text = csproj_path.read_text(encoding="utf-8", errors="ignore").lower()
+        except Exception:
+            text = csproj_path.read_text(encoding="latin-1", errors="ignore").lower()
+        if "microsoft.net.sdk.web" in text:
+            return True
+        if "microsoft.aspnetcore." in text:
+            return True
+        if any(f"<{k.lower()}>" in text for k in _PRESENTATION_PROP_KEYS):
+            return True
+
+    return False
+
+
+# ----------------------------
+# Selection parsing
+# ----------------------------
+
+def parse_index_selection(selection: str, max_index: int) -> Set[int]:
+    """
+    Parse "1,3,5-7" (1-based indices) into a set of ints.
+    Accepts "all".
+    """
+    selection = selection.strip().lower()
+    if selection in {"all", "*"}:
+        return set(range(1, max_index + 1))
+
+    out: Set[int] = set()
+    parts = [p.strip() for p in selection.split(",") if p.strip()]
+    for part in parts:
+        if "-" in part:
+            a_s, b_s = [x.strip() for x in part.split("-", 1)]
+            if not a_s.isdigit() or not b_s.isdigit():
+                raise ValueError(f"Bad range: {part}")
+            a = int(a_s)
+            b = int(b_s)
+            if a > b:
+                a, b = b, a
+            for i in range(a, b + 1):
+                if 1 <= i <= max_index:
+                    out.add(i)
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Bad index: {part}")
+            i = int(part)
+            if 1 <= i <= max_index:
+                out.add(i)
+    return out
+
+
+def tui_select_indices(items: List[Item], input_root: Path) -> Optional[Set[int]]:
+    """
+    Return selected 1-based indices using a TUI checkbox list.
+    Returns None if TUI isn't available or can't run.
+    """
+    if not _HAS_PROMPT_TOOLKIT or not sys.stdin.isatty():
+        return None
+
+    values = []
+    for idx, it in enumerate(items, start=1):
+        rel = it.path.resolve().relative_to(input_root).as_posix()
+        label = f"{format_change_time(it.latest_change_time):16}  [{it.kind}] {rel}"
+        values.append((idx, label))
+
+    try:
+        result = checkboxlist_dialog(
+            title="Select projects",
+            text="Space=toggle, Enter=accept, Esc=cancel",
+            values=values,
+        ).run()
+    except Exception:
+        return None
+
+    if result is None:
+        return None
+    return set(result)
+
+
+# ----------------------------
+# .sln parsing (best-effort)
+# ----------------------------
+
+_SLN_PROJ_RE = re.compile(r'Project\(".*?"\)\s*=\s*".*?",\s*"(.*?)",\s*".*?"', re.IGNORECASE)
+
+def sln_to_csprojs(sln_path: Path) -> List[Path]:
+    """
+    Parse .sln and extract referenced .csproj paths (best-effort).
+    """
+    csprojs: List[Path] = []
+    try:
+        text = sln_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        text = sln_path.read_text(encoding="latin-1", errors="ignore")
+
+    for line in text.splitlines():
+        m = _SLN_PROJ_RE.search(line)
+        if not m:
+            continue
+        rel = m.group(1).strip().strip('"')
+        if rel.lower().endswith(".csproj"):
+            p = (sln_path.parent / rel).resolve()
+            csprojs.append(p)
+    # Dedup, keep order
+    seen: Set[Path] = set()
+    out: List[Path] = []
+    for p in csprojs:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+# ----------------------------
+# csproj parsing (ProjectReference)
+# ----------------------------
+
+def csproj_references(csproj_path: Path, warn: bool = True) -> List[Path]:
+    """
+    Return absolute paths of referenced .csproj via <ProjectReference Include="...">
+    Handles XML namespaces by using wildcard tags.
+    """
+    refs: List[Path] = []
+    try:
+        tree = ET.parse(csproj_path)
+        root = tree.getroot()
+    except Exception as e:
+        if warn:
+            print(f"[WARN] Failed to parse XML: {csproj_path} ({e})")
+        return refs
+
+    for pr in root.findall(".//{*}ProjectReference"):
+        inc = pr.attrib.get("Include")
+        if not inc:
+            continue
+        # Normalize Windows-style paths so resolution works on non-Windows hosts
+        inc_norm = inc.replace("\\", "/")
+        ref = (csproj_path.parent / inc_norm).resolve()
+        if ref.suffix.lower() == ".csproj":
+            refs.append(ref)
+
+    # Dedup preserve order
+    seen: Set[Path] = set()
+    out: List[Path] = []
+    for p in refs:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def dependency_closure(
+    roots: Iterable[Path],
+    input_root: Path,
+) -> Tuple[Set[Path], List[str]]:
+    """
+    BFS over ProjectReferences starting from root csprojs.
+    Returns (all_csprojs, warnings)
+    Skips references that resolve outside input_root (warn).
+    """
+    warnings: List[str] = []
+    all_csprojs: Set[Path] = set()
+    queue: List[Path] = []
+
+    def inside_root(p: Path) -> bool:
+        try:
+            p.relative_to(input_root)
+            return True
+        except ValueError:
+            return False
+
+    for r in roots:
+        rr = r.resolve()
+        if rr.exists():
+            if inside_root(rr):
+                all_csprojs.add(rr)
+                queue.append(rr)
+            else:
+                warnings.append(f"Reference outside input root (skipped): {rr}")
+        else:
+            warnings.append(f"Missing root csproj: {rr}")
+
+    cache: Dict[Path, List[Path]] = {}
+
+    while queue:
+        cur = queue.pop(0)
+        if cur not in cache:
+            cache[cur] = csproj_references(cur)
+        for ref in cache[cur]:
+            if not ref.exists():
+                warnings.append(f"Missing referenced csproj: {ref} (from {cur})")
+                continue
+            if not inside_root(ref):
+                warnings.append(f"Reference outside input root (skipped): {ref} (from {cur})")
+                continue
+            if ref not in all_csprojs:
+                all_csprojs.add(ref)
+                queue.append(ref)
+
+    return all_csprojs, warnings
+
+
+# ----------------------------
+# .gitignore (best-effort)
+# ----------------------------
+
+@dataclass(frozen=True)
+class IgnoreRule:
+    pattern: str          # glob-like pattern (posix)
+    negated: bool         # starts with !
+    directory_only: bool  # ends with /
+    anchored: bool        # starts with / in .gitignore
+
+
+def load_root_gitignore(input_root: Path) -> List[IgnoreRule]:
+    rules: List[IgnoreRule] = []
+    gi = input_root / ".gitignore"
+    if not gi.exists():
+        return rules
+
+    try:
+        lines = gi.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        lines = gi.read_text(encoding="latin-1", errors="ignore").splitlines()
+
+    for raw in lines:
+        line = raw.rstrip("\n\r")
+        if not line.strip():
+            continue
+        # Comments (#) unless escaped \#
+        if line.lstrip().startswith("#") and not line.lstrip().startswith(r"\#"):
+            continue
+
+        # Unescape \# and \!
+        line = line.replace(r"\#", "#").replace(r"\!", "!")
+
+        negated = False
+        if line.startswith("!"):
+            negated = True
+            line = line[1:]
+
+        line = line.strip()
+        if not line:
+            continue
+
+        anchored = line.startswith("/")
+        if anchored:
+            line = line[1:]
+
+        directory_only = line.endswith("/")
+        if directory_only:
+            line = line[:-1]
+
+        # Convert to a reasonable glob:
+        # - If no slash in pattern, it matches in any directory => **/pattern
+        # - If directory-only, match everything under it => pattern/** and also **/pattern/** if unanchored & no slash
+        pat = line.replace("\\", "/")
+
+        if "/" not in pat:
+            pat = f"**/{pat}"
+            if directory_only:
+                pat = f"{pat}/**"
+        else:
+            # has slash: interpret relative to root (since we only read root .gitignore)
+            if directory_only:
+                pat = f"{pat}/**"
+
+        rules.append(IgnoreRule(pattern=pat, negated=negated, directory_only=directory_only, anchored=anchored))
+
+    return rules
+
+
+def should_ignore(rel_posix: str, is_dir: bool, rules: List[IgnoreRule]) -> bool:
+    """
+    Decide ignore based on:
+    - hard-coded always-ignore dirs
+    - root .gitignore rules (best-effort)
+    Last matching rule wins; negated rule un-ignores.
+    """
+    # Normalize
+    rel_posix = rel_posix.lstrip("./")
+    rel_posix = rel_posix.replace("\\", "/")
+
+    # Always ignore these folders anywhere
+    always_ignore_dir_names = {
+        ".git", ".vs", ".idea", ".vscode",
+        "bin", "obj", "testresults", "node_modules", "packages"
+    }
+
+    parts = [p for p in rel_posix.split("/") if p]
+    if parts:
+        # If any path segment is an always-ignore dir, ignore everything under it
+        if any(seg.lower() in always_ignore_dir_names for seg in parts):
+            return True
+
+    # Evaluate .gitignore-like rules
+    path_obj = PurePosixPath(rel_posix)
+
+    ignored = False
+    for r in rules:
+        # PurePosixPath.match matches from beginning; patterns using ** help.
+        # Anchoring: since rel_posix is from root, anchored/unanchored are effectively handled by pattern choice above.
+        try:
+            matched = path_obj.match(r.pattern)
+        except Exception:
+            matched = False
+
+        if not matched and not r.pattern.startswith("**/"):
+            # Some rules might want to match anywhere; try **/prefix fallback (best-effort)
+            try:
+                matched = path_obj.match(f"**/{r.pattern}")
+            except Exception:
+                matched = False
+
+        if matched:
+            if r.negated:
+                ignored = False
+            else:
+                ignored = True
+
+    return ignored
+
+
+def latest_mtime_under_dir(
+    input_root: Path,
+    dir_path: Path,
+    rules: List[IgnoreRule],
+    cache: Dict[Path, float],
+) -> float:
+    """
+    Return latest filesystem mtime for source/build files under dir_path,
+    honoring ignore rules. Used as a fallback when Git history is unavailable.
+    """
+    d = dir_path.resolve()
+    if d in cache:
+        return cache[d]
+
+    try:
+        d.relative_to(input_root.resolve())
+    except ValueError:
+        m = _safe_mtime(d)
+        cache[d] = m
+        return m
+
+    latest = 0.0
+    for dirpath, dirnames, filenames in os.walk(d):
+        cur = Path(dirpath)
+        rel_cur = cur.resolve().relative_to(input_root.resolve())
+        rel_cur_posix = rel_cur.as_posix()
+
+        kept_dirs = []
+        for name in dirnames:
+            d_rel = (Path(rel_cur_posix) / name).as_posix()
+            if should_ignore(d_rel, is_dir=True, rules=rules):
+                continue
+            kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+
+        for name in filenames:
+            rel_file = (Path(rel_cur_posix) / name).as_posix()
+            if should_ignore(rel_file, is_dir=False, rules=rules):
+                continue
+            if not is_source_file_for_mtime(name):
+                continue
+            try:
+                m = (cur / name).stat().st_mtime
+            except Exception:
+                continue
+            if m > latest:
+                latest = m
+
+    cache[d] = latest
+    return latest
+
+
+# ----------------------------
+# Copying (merge copy)
+# ----------------------------
+
+COMMON_ROOT_FILES = [
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "Directory.Packages.props",
+    "global.json",
+    "NuGet.config",
+    ".editorconfig",
+    ".gitattributes",
+    ".gitignore",
+]
+
+def copy_tree_merge(
+    input_root: Path,
+    src_dir: Path,
+    output_root: Path,
+    rules: List[IgnoreRule],
+    dry_run: bool = False,
+) -> None:
+    """
+    Copy src_dir into output_root preserving relative path from input_root.
+    Merges overlapping trees.
+    """
+    for dirpath, dirnames, filenames in os.walk(src_dir):
+        cur = Path(dirpath)
+        rel_cur = cur.resolve().relative_to(input_root.resolve())
+        rel_cur_posix = rel_cur.as_posix()
+
+        # Filter directories in-place
+        kept_dirs = []
+        for d in dirnames:
+            child_dir = (cur / d).resolve()
+            if is_relative_to_path(output_root, child_dir):
+                continue
+            d_rel = (Path(rel_cur_posix) / d).as_posix()
+            if should_ignore(d_rel, is_dir=True, rules=rules):
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+
+        # Ensure destination directory exists
+        dst_cur = output_root / rel_cur
+        if not dry_run:
+            dst_cur.mkdir(parents=True, exist_ok=True)
+
+        for f in filenames:
+            src_file = cur / f
+            rel_file = (rel_cur / f).as_posix()
+            if should_ignore(rel_file, is_dir=False, rules=rules):
+                continue
+            dst_file = output_root / rel_cur / f
+            if dry_run:
+                print(f"[DRY] copy {src_file} -> {dst_file}")
+            else:
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+
+
+# ----------------------------
+# PowerShell build script generation
+# ----------------------------
+
+def generate_powershell(
+    output_root: Path,
+    selected_root_projects: List[Path],
+    input_root: Path,
+) -> Path:
+    """
+    Write build_release.ps1 into output_root.
+    Projects are referenced by their copied relative paths within output_root.
+    """
+    # Convert paths to relative paths inside output_root
+    rel_paths: List[str] = []
+    for p in selected_root_projects:
+        rel = p.resolve().relative_to(input_root.resolve()).as_posix()
+        rel_paths.append(rel)
+
+    # De-dup preserve order
+    seen = set()
+    rel_paths = [x for x in rel_paths if not (x in seen or seen.add(x))]
+
+    ps1 = output_root / "build_release.ps1"
+    content = textwrap.dedent(f"""\
+    [CmdletBinding()]
+    param(
+      [switch]$Publish,
+      [switch]$Pack
+    )
+
+    $ErrorActionPreference = "Stop"
+    $root = (Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Path)).Path
+    Set-Location $root
+
+    # Publish by default so each selected project gets a Release output folder.
+    if (-not $PSBoundParameters.ContainsKey("Publish")) {{
+      $Publish = $true
+    }}
+
+    # Projects selected for release build (relative to output folder):
+    $projects = @(
+    {os.linesep.join([f'  "{rp}"' for rp in rel_paths])}
+    )
+
+    # Publish outputs always go to ./output beside this script.
+    $outputRoot = Join-Path $root "output"
+    New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+
+    Write-Host "Building (Release)..." -ForegroundColor Cyan
+    foreach ($p in $projects) {{
+      Write-Host "dotnet build $p -c Release"
+      dotnet build $p -c Release
+      if ($LASTEXITCODE -ne 0) {{
+        throw "dotnet build failed for $p (exit code $LASTEXITCODE)."
+      }}
+    }}
+
+    if ($Publish) {{
+      Write-Host "Publishing (Release)..." -ForegroundColor Cyan
+      foreach ($p in $projects) {{
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($p)
+        $outDir = Join-Path $outputRoot $name
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+        Write-Host "dotnet publish $p -c Release -o $outDir"
+        dotnet publish $p -c Release -o $outDir
+        if ($LASTEXITCODE -ne 0) {{
+          throw "dotnet publish failed for $p (exit code $LASTEXITCODE)."
+        }}
+        if (-not (Get-ChildItem -Path $outDir -Force | Select-Object -First 1)) {{
+          throw "Publish output is empty for $p. Check project publish settings."
+        }}
+      }}
+    }}
+
+    if ($Pack) {{
+      $nupkgDir = Join-Path $outputRoot "nuget"
+      New-Item -ItemType Directory -Force -Path $nupkgDir | Out-Null
+
+      Write-Host "Packing (Release)..." -ForegroundColor Cyan
+      foreach ($p in $projects) {{
+        Write-Host "dotnet pack $p -c Release -o $nupkgDir"
+        dotnet pack $p -c Release -o $nupkgDir
+        if ($LASTEXITCODE -ne 0) {{
+          throw "dotnet pack failed for $p (exit code $LASTEXITCODE)."
+        }}
+      }}
+    }}
+
+    Write-Host "Done." -ForegroundColor Green
+    """)
+    ps1.write_text(content, encoding="utf-8")
+    return ps1
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="source-copy",
+        description="Select C#/.NET projects and copy them with referenced projects to an output folder.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=textwrap.dedent("""\
+        Examples:
+          source-copy --output /tmp/release-source
+          source-copy LMS_Backend --output /tmp/lms-source
+          source-copy . --output /tmp/source-copy --select all
+          source-copy . --output /tmp/source-copy --select 1,3,5-7
+          source-copy . --output /tmp/source-copy --select 're:WebApi|Gateway'
+          source-copy . --output /tmp/source-copy --list
+          source-copy . --output /tmp/source-copy --all-projects --list
+          source-copy . --output /tmp/source-copy --select 1 --dry-run
+        """),
+    )
+    ap.add_argument("input", nargs="?", default=None, help="Input directory/repo root (default: current directory)")
+    ap.add_argument("--input", "-i", dest="input_option", help="Input directory/repo root (kept for compatibility)")
+    ap.add_argument("--output", "-o", required=True, help="Destination directory (required)")
+    ap.add_argument("--select", help="Selection: all, indexes/ranges like 1,3,5-7, or re:<regex>. If omitted in a TTY, you'll be prompted.")
+    ap.add_argument("--list", action="store_true", help="List discovered projects and exit without copying")
+    ap.add_argument("--dry-run", action="store_true", help="Show what would be copied, without copying")
+    ap.add_argument("--no-common-root-files", action="store_true", help="Do not copy common root build files")
+    ap.add_argument("--all-projects", action="store_true", help="Show all .sln/.csproj entries instead of only presentation/API/UI projects")
+    ap.add_argument("--presentation-only", action="store_true", help="Only list csproj likely to be presentation layer (default; kept for compatibility)")
+    ap.add_argument("--presentation-regex", help="Regex on relative csproj path; if it matches, treat as presentation.")
+    args = ap.parse_args()
+
+    if args.all_projects and args.presentation_only:
+        print("[ERROR] Use either --all-projects or --presentation-only, not both.")
+        return 2
+
+    if args.input and args.input_option:
+        print("[ERROR] Use either positional INPUT or --input, not both.")
+        return 2
+
+    input_arg = args.input_option or args.input or "."
+    input_root = Path(input_arg).expanduser().resolve()
+    output_root = Path(args.output).expanduser().resolve()
+
+    if not input_root.exists() or not input_root.is_dir():
+        print(f"[ERROR] Input root not found or not a directory: {input_root}")
+        return 2
+    if output_root == input_root:
+        print("[ERROR] Output must not be the same directory as input.")
+        return 2
+
+    presentation_rx: Optional[re.Pattern] = None
+    if args.presentation_regex:
+        try:
+            presentation_rx = re.compile(args.presentation_regex, re.IGNORECASE)
+        except re.error as e:
+            print(f"[ERROR] Invalid --presentation-regex: {e}")
+            return 2
+
+    presentation_only = not args.all_projects
+
+    items = discover_items(
+        input_root,
+        presentation_only=presentation_only,
+        presentation_regex=presentation_rx,
+        exclude_roots={output_root} if is_relative_to_path(output_root, input_root) else None,
+    )
+    if not items:
+        if presentation_only:
+            print("[INFO] No presentation/API/UI .csproj files found. Use --all-projects to show every .sln/.csproj entry.")
+        else:
+            print("[INFO] No .sln or .csproj files found.")
+        return 0
+
+    print(f"\nInput:  {input_root}")
+    print(f"Output: {output_root}")
+    if presentation_only:
+        print("\nFound presentation/API/UI projects:")
+    else:
+        print("\nFound all .sln/.csproj entries:")
+    for idx, it in enumerate(items, start=1):
+        rel = it.path.resolve().relative_to(input_root).as_posix()
+        print(f"{idx:3d}) {format_change_time(it.latest_change_time):16}  [{it.kind}] {rel}")
+
+    if args.list:
+        print(f"\nFound {len(items)} selectable item(s).")
+        return 0
+
+    # Determine selection
+    selected_indices: Set[int] = set()
+
+    if args.select:
+        sel = args.select.strip()
+        if sel.lower().startswith("re:"):
+            try:
+                rx = re.compile(sel[3:], re.IGNORECASE)
+            except re.error as e:
+                print(f"[ERROR] Invalid --select regex: {e}")
+                return 2
+            for idx, it in enumerate(items, start=1):
+                rel = it.path.resolve().relative_to(input_root).as_posix()
+                if rx.search(rel):
+                    selected_indices.add(idx)
+        else:
+            try:
+                selected_indices = parse_index_selection(sel, max_index=len(items))
+            except ValueError as e:
+                print(f"[ERROR] {e}")
+                return 2
+    else:
+        tui_selected = tui_select_indices(items, input_root)
+        if tui_selected:
+            selected_indices = tui_selected
+        else:
+            if not sys.stdin.isatty():
+                print("[ERROR] No interactive terminal is available. Pass --select, or use --list to inspect choices.")
+                return 2
+            if tui_selected == set():
+                print("[INFO] No selections in menu. Falling back to text selection.")
+            elif not _HAS_PROMPT_TOOLKIT:
+                print("[INFO] For a better menu, install prompt_toolkit (pip install prompt_toolkit).")
+            while True:
+                sel = input("\nSelect items (e.g. 1,3,5-7 or 'all'): ").strip()
+                try:
+                    selected_indices = parse_index_selection(sel, max_index=len(items))
+                    if not selected_indices:
+                        print("No valid selections. Try again.")
+                        continue
+                    break
+                except ValueError as e:
+                    print(f"Invalid selection: {e}")
+
+    if not selected_indices:
+        print("[ERROR] Selection matched no projects.")
+        return 2
+
+    selected_items = [items[i - 1] for i in sorted(selected_indices)]
+    print("\nSelected:")
+    for it in selected_items:
+        rel = it.path.resolve().relative_to(input_root).as_posix()
+        print(f" - [{it.kind}] {rel}")
+
+    # Expand selection to root csproj list
+    selected_root_csprojs: List[Path] = []
+    for it in selected_items:
+        if it.kind == "csproj":
+            selected_root_csprojs.append(it.path.resolve())
+        else:
+            # sln
+            csps = sln_to_csprojs(it.path.resolve())
+            if not csps:
+                print(f"[WARN] No .csproj parsed from solution: {it.path}")
+            selected_root_csprojs.extend(csps)
+
+    # De-dup preserve order
+    seen = set()
+    selected_root_csprojs = [p for p in selected_root_csprojs if not (p in seen or seen.add(p))]
+
+    if not selected_root_csprojs:
+        print("[ERROR] Selection produced no .csproj projects.")
+        return 2
+
+    # Dependency closure
+    all_csprojs, warnings = dependency_closure(selected_root_csprojs, input_root=input_root)
+
+    # Collect project directories to copy
+    project_dirs: Set[Path] = set()
+    for cp in all_csprojs:
+        project_dirs.add(cp.parent.resolve())
+
+    # Show plan
+    print("\nProjects to include (root selections):")
+    for p in selected_root_csprojs:
+        try:
+            rel = p.relative_to(input_root).as_posix()
+        except ValueError:
+            rel = str(p)
+        print(f" - {rel}")
+
+    print("\nAll projects to copy (including referenced):")
+    for p in sorted(all_csprojs, key=lambda x: x.as_posix().lower()):
+        rel = p.relative_to(input_root).as_posix()
+        print(f" - {rel}")
+
+    if warnings:
+        print("\nWarnings:")
+        for w in warnings:
+            print(f" - {w}")
+
+    # Prepare output directory
+    if not args.dry_run:
+        output_root.mkdir(parents=True, exist_ok=True)
+
+    # Load ignore rules
+    rules = load_root_gitignore(input_root)
+
+    # Copy common root files
+    if not args.no_common_root_files:
+        for fn in COMMON_ROOT_FILES:
+            src = input_root / fn
+            if src.exists() and src.is_file():
+                dst = output_root / fn
+                if args.dry_run:
+                    print(f"[DRY] copy {src} -> {dst}")
+                else:
+                    shutil.copy2(src, dst)
+
+    # Copy each project directory (merge)
+    print("\nCopying project directories...")
+    for d in sorted(project_dirs, key=lambda x: x.as_posix().lower()):
+        rel = d.relative_to(input_root).as_posix()
+        print(f" - {rel}")
+        copy_tree_merge(
+            input_root=input_root,
+            src_dir=d,
+            output_root=output_root,
+            rules=rules,
+            dry_run=args.dry_run,
+        )
+
+    # Generate PowerShell build script (based on root selections)
+    if not args.dry_run:
+        ps1 = generate_powershell(
+            output_root=output_root,
+            selected_root_projects=selected_root_csprojs,
+            input_root=input_root,
+        )
+        print("\nGenerated:")
+        print(f" - {ps1}")
+
+        cmd = f'powershell -ExecutionPolicy Bypass -File "{ps1}"'
+        print("\nRun this to build and publish Release for each selected project:")
+        print(cmd)
+        print("\nOptional flags:")
+        print(f'powershell -ExecutionPolicy Bypass -File "{ps1}" -Publish:$false')
+        print(f'powershell -ExecutionPolicy Bypass -File "{ps1}" -Pack')
+        print(f'powershell -ExecutionPolicy Bypass -File "{ps1}" -Publish -Pack')
+
+    print("\nDone.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

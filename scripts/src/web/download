@@ -1,172 +1,411 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-trap 'exit 7' EXIT SIGINT SIGTERM
+trap 'exit 130' INT TERM
 
-# =============== Default values ===============
-max_retries=5
-retry_delay=4
+max_retries=0
+retry_delay=10
+connections=8
+low_speed_limit=1024
+low_speed_time=30
+backend="auto"
 output_dir=""
+cookies_path=""
+aria2_missing_notice_shown=0
 
-# ==================== Functions ====================
-# Function to download a file with retries
-download_with_retry() {
-    local url="$1"
-    local output_dir="${2:-.}"
-    local max_retries="${3:-5}"   # Default to 5 retries
-    local retry_delay="${4:-4}"   # Default to 4 seconds delay
-    local cookies_path="$5"
-    local attempt=1
-    local is_youtube=false; [[ "$url" =~ youtube.com ]] && is_youtube=true
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options] <url-or-file>
 
-    while (( attempt <= max_retries )); do
-        echo "Attempt $attempt to download $url to $output_dir"
-        
-        if [[ "$is_youtube" = true ]]; then
-          if [ ! -f "$cookies_path" ]; then
-            echo "Error! Cookie file for downloading youtube is required."
-            return 1
-          fi
-          yt-dlp --format 'bv+ba/b' \
-                 --output "$output_dir/%(title)s.%(ext)s" \
-                 --cookies "$cookies_path" \
-                 --no-abort-on-error \
-                 --retries "$max_retries" \
-                 --progress \
-                 "$url"
-          if [ "$?" -eq 0 ]; then
-            return 0
-          fi
-        else
-          if aria2c --log-level error --console-log-level error "$url" -d "$output_dir"; then
-              return 0
-          else
-            case $? in
-            # 1) Failed to connect
-            # 7)  exit 7;; # Ctrl + C
-            3)  return 3;; # 404-NotFound
-            24) return 24;; # 401-UnAuthorize
-            esac
-          fi
-        fi
+Download a single URL or every URL in a text file.
 
-        echo "Download failed. Retrying in $retry_delay seconds..."
-        ((attempt++))
-        sleep "$retry_delay"
-    done
+Options:
+  -m, --max-retry <num>     Maximum retries. Use 0 for infinite retries. Default: 0.
+  -d, --retry-delay <sec>   Delay between retries. Default: 10.
+  -x, --connections <num>   Connections per file for aria2c. Default: 8.
+      --backend <name>      Downloader backend: auto, aria2, curl, or wget. Default: auto.
+      --low-speed-limit <B> Abort curl/wget retries below this bytes/sec. Default: 1024.
+      --low-speed-time <sec>
+                             Seconds below low-speed-limit before aborting. Default: 30.
+  -o, --output-dir <path>   Directory to save downloads.
+  -c, --cookie <path>       Cookies file for YouTube/yt-dlp downloads.
+  -h, --help                Show this help.
 
-    return 1
+Batch file format:
+  <URL> [custom_folder_name]
+
+Blank lines and lines starting with # are ignored.
+
+Proxy handling:
+  aria2c, curl, wget, and yt-dlp use the current process proxy environment by default.
+EOF
 }
 
-# Function to display help message
-show_help() {
-    echo "Usage: $(basename "$0") [options] <filename>"
-    echo
-    echo "Options:"
-    echo "  -m, --max-retry <num>    Specify the maximum number of retries for failed downloads."
-    echo "  -d, --retry-delay <sec>  Specify the delay in seconds between retries."
-    echo "  -o, --output-dir <path>  Specify the directory to save files."
-    echo "  -c, --cookie <path>      Specify cookies file path"
-    echo "  -h                       Display this help message."
-    echo
-    echo "Arguments:"
-    echo "  filename                 A file containing URLs (one per line), optionally followed by a custom folder name."
-    echo
-    echo "Each line of the file can be in the following format:"
-    echo "  <URL> [custom_folder_name]"
-    echo
-    exit 0
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
 }
 
-# ==================== Main ====================
-if ! command-exists aria2c; then
-    echo "Error: aria2c is not installed. Please install it before running this script."
-    exit 1
-fi
-if ! command-exists yt-dlp; then
-    echo "Error: yt-dlp is not installed. Please install it before running this script."
-    exit 1
-fi
-if ! command-exists ffmpeg; then
-    echo "Error: ffmpeg is not installed. Please install it before running this script."
-    exit 1
-fi
+command_available() {
+  if command -v command-exists >/dev/null 2>&1; then
+    command-exists "$1"
+  else
+    command -v "$1" >/dev/null 2>&1
+  fi
+}
 
-while [[ "$#" -gt 1 ]]; do
-    case "$1" in
-        -m | --max-retry) max_retries="$2"; shift 2;;
-        -d | --retry-delay) retry_delay="$2"; shift 2;;
-        -o | --output-dir) output_dir="$2"; shift 2;;
-        -c | --cookie) cookies_path="$2"; shift 2;;
-        -h) show_help;;
-    esac
-done
+require_command() {
+  local name="$1"
+  command_available "$name" || fail "$name is not installed."
+}
 
-# Check if filename is provided
-if [ "$#" -ne 1 ]; then
-    show_help
-    exit 1
-fi
+show_aria2_missing_notice() {
+  [[ "$aria2_missing_notice_shown" -eq 0 ]] || return
+  aria2_missing_notice_shown=1
 
-# Get the filename from the command-line argument
-filename="$1"
-file_without_extension="${filename%.*}"
-error_file="$file_without_extension-errors.txt"
-processed_file="$file_without_extension-processed.txt"
+  cat >&2 <<EOF
+Notice: aria2c is not installed; falling back to curl/wget.
+aria2c is recommended for large unstable downloads because it can resume and use parallel connections.
+Install on Ubuntu/Debian with:
+  sudo apt update
+  sudo apt install aria2
+EOF
+}
 
-# Check if file exists
-if [ ! -f "$filename" ]; then
-    echo "File not valid: $filename"
-    exit 1
-fi
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
 
+is_video_url() {
+  local url="$1"
+  [[ "$url" =~ (^|//)(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/ ]]
+}
 
-if [ -z "$output_dir" ]; then
-  output_dir="$file_without_extension-output-$(date "+%m%Y")"
-fi
-mkdir -p "$output_dir"
+yt_dlp_retry_value() {
+  local retries="$1"
+  if [[ "$retries" == "0" ]]; then
+    printf 'infinite'
+  else
+    printf '%s' "$retries"
+  fi
+}
 
-# Loop until the file is empty
-while [ -s "$filename" ]; do
-  # Read the first line
-  read -r line < "$filename"
-  
-    # Skip empty lines
-    if [ -z "$line" ]; then
-        continue
-    fi
+download_with_ytdlp() {
+  local url="$1"
+  local target_dir="$2"
+  local retries
 
-    # Split the line into URL and custom file name
-    trimmed_line=$(echo "$line" | awk '{$1=$1; print}')
-    url=$(echo "$trimmed_line" | awk '{print $1}')
-    custom_name=$(echo "$trimmed_line" | awk '{$1=""; print substr($0, 2)}')
+  retries="$(yt_dlp_retry_value "$max_retries")"
 
-    # Check if URL is present
-    if [ -z "$url" ]; then
-        echo "Invalid line (missing URL): $line"
-        continue
-    fi
+  require_command yt-dlp
+  require_command ffmpeg
 
-    # Download the URL with the custom file name if provided
-    if [ -z "$custom_name" ]; then
-        download_with_retry "$url" "$output_dir" "$max_retries" "$retry_delay" "$cookies_path"
-    else
-        download_with_retry "$url" "$output_dir/$custom_name" "$max_retries" "$retry_delay" "$cookies_path"
-    fi
+  mkdir -p "$target_dir"
+
+  local args=(
+    --format 'bv+ba/b'
+    --output "$target_dir/%(title)s.%(ext)s"
+    --continue
+    --part
+    --retries "$retries"
+    --fragment-retries "$retries"
+    --file-access-retries "$retries"
+    --retry-sleep "$retry_delay"
+    --retry-sleep "fragment:$retry_delay"
+    --no-abort-on-error
+    --progress
+  )
+
+  if [[ -n "$cookies_path" ]]; then
+    [[ -f "$cookies_path" ]] || fail "cookie file not found: $cookies_path"
+    args+=(--cookies "$cookies_path")
+  fi
+
+  yt-dlp "${args[@]}" "$url"
+}
+
+download_with_aria2() {
+  local url="$1"
+  local target_dir="$2"
+
+  require_command aria2c
+  mkdir -p "$target_dir"
+
+  aria2c \
+    --continue=true \
+    --max-tries="$max_retries" \
+    --retry-wait="$retry_delay" \
+    --max-connection-per-server="$connections" \
+    --split="$connections" \
+    --min-split-size=1M \
+    --auto-file-renaming=false \
+    --summary-interval=10 \
+    --log-level=error \
+    --console-log-level=warn \
+    --dir="$target_dir" \
+    "$url"
+}
+
+download_with_curl() {
+  local url="$1"
+  local target_dir="$2"
+  local attempt=1
+  local exit_code
+
+  require_command curl
+  mkdir -p "$target_dir"
+
+  while true; do
+    set +e
+    curl \
+      --fail \
+      --location \
+      --continue-at - \
+      --speed-limit "$low_speed_limit" \
+      --speed-time "$low_speed_time" \
+      --remote-name \
+      --output-dir "$target_dir" \
+      "$url"
     exit_code="$?"
-    
-    current_date_time=$(date "+%Y%m%d%H%M%S")
-    if [[ "$exit_code" -eq 0 ]]; then
-      echo "$current_date_time | $url" >> "$processed_file"
+    set -e
+
+    [[ "$exit_code" -eq 0 ]] && return 0
+    [[ "$max_retries" != "0" && "$attempt" -ge "$max_retries" ]] && return "$exit_code"
+
+    printf 'Download failed with curl exit code %s. Retrying in %s seconds...\n' "$exit_code" "$retry_delay" >&2
+    attempt=$((attempt + 1))
+    sleep "$retry_delay"
+  done
+}
+
+download_with_wget() {
+  local url="$1"
+  local target_dir="$2"
+  local tries="$max_retries"
+
+  require_command wget
+  mkdir -p "$target_dir"
+
+  wget \
+    --continue \
+    --tries="$tries" \
+    --waitretry="$retry_delay" \
+    --read-timeout="$low_speed_time" \
+    --dns-timeout="$low_speed_time" \
+    --connect-timeout="$low_speed_time" \
+    --directory-prefix="$target_dir" \
+    "$url"
+}
+
+download_with_http_client() {
+  local url="$1"
+  local target_dir="$2"
+  local exit_code
+
+  case "$backend" in
+    aria2)
+      download_with_aria2 "$url" "$target_dir"
+      return
+      ;;
+    curl)
+      download_with_curl "$url" "$target_dir"
+      return
+      ;;
+    wget)
+      download_with_wget "$url" "$target_dir"
+      return
+      ;;
+  esac
+
+  if command_available aria2c; then
+    set +e
+    download_with_aria2 "$url" "$target_dir"
+    exit_code="$?"
+    set -e
+    [[ "$exit_code" -eq 0 ]] && return 0
+
+    if command_available curl || command_available wget; then
+      printf 'Notice: aria2c failed with exit code %s; trying curl/wget fallback.\n' "$exit_code" >&2
     else
-      message="$current_date_time | $url | $exit_code |"
-      case $exit_code in
-      3)  message="$message 404-NotFound";;
-      24) message="$message 401-UnAuthorize";;
-      *) message="$message Other";;
-      esac
-      echo "$message" >> "$error_file"
+      return "$exit_code"
     fi
-    
-    # Remove the first line from the file
-    sed -i '1d' "$filename"
+  else
+    show_aria2_missing_notice
+  fi
+
+  if command_available curl; then
+    download_with_curl "$url" "$target_dir"
+  elif command_available wget; then
+    download_with_wget "$url" "$target_dir"
+  else
+    fail "aria2c, curl, or wget is required for non-video downloads."
+  fi
+}
+
+download_url() {
+  local url="$1"
+  local target_dir="$2"
+
+  if is_video_url "$url"; then
+    download_with_ytdlp "$url" "$target_dir"
+  else
+    download_with_http_client "$url" "$target_dir"
+  fi
+}
+
+record_result() {
+  local url="$1"
+  local exit_code="$2"
+  local processed_file="$3"
+  local error_file="$4"
+  local current_date_time
+  local message
+
+  current_date_time="$(date '+%Y%m%d%H%M%S')"
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    printf '%s | %s\n' "$current_date_time" "$url" >> "$processed_file"
+    return
+  fi
+
+  message="$current_date_time | $url | $exit_code |"
+  case "$exit_code" in
+    3) message="$message 404-NotFound" ;;
+    24) message="$message 401-Unauthorized" ;;
+    130) message="$message Interrupted" ;;
+    *) message="$message Other" ;;
+  esac
+  printf '%s\n' "$message" >> "$error_file"
+}
+
+process_batch_file() {
+  local input_file="$1"
+  local base_output_dir="$2"
+  local file_without_extension="${input_file%.*}"
+  local error_file="$file_without_extension-errors.txt"
+  local processed_file="$file_without_extension-processed.txt"
+
+  while [[ -s "$input_file" ]]; do
+    local line trimmed_line url custom_name target_dir exit_code
+
+    read -r line < "$input_file"
+    trimmed_line="$(trim "$line")"
+
+    if [[ -z "$trimmed_line" || "$trimmed_line" == \#* ]]; then
+      sed -i '1d' "$input_file"
+      continue
+    fi
+
+    url="${trimmed_line%%[[:space:]]*}"
+    custom_name="$(trim "${trimmed_line#"$url"}")"
+
+    if [[ -z "$url" ]]; then
+      sed -i '1d' "$input_file"
+      continue
+    fi
+
+    if [[ -n "$custom_name" ]]; then
+      target_dir="$base_output_dir/$custom_name"
+    else
+      target_dir="$base_output_dir"
+    fi
+
+    printf 'Downloading %s\n' "$url"
+    set +e
+    download_url "$url" "$target_dir"
+    exit_code="$?"
+    set -e
+
+    record_result "$url" "$exit_code" "$processed_file" "$error_file"
+    sed -i '1d' "$input_file"
+  done
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -m | --max-retry)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      max_retries="$2"
+      shift 2
+      ;;
+    -d | --retry-delay)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      retry_delay="$2"
+      shift 2
+      ;;
+    -x | --connections)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      connections="$2"
+      shift 2
+      ;;
+    --backend)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      backend="$2"
+      shift 2
+      ;;
+    --low-speed-limit)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      low_speed_limit="$2"
+      shift 2
+      ;;
+    --low-speed-time)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      low_speed_time="$2"
+      shift 2
+      ;;
+    -o | --output-dir)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      output_dir="$2"
+      shift 2
+      ;;
+    -c | --cookie)
+      [[ "$#" -ge 2 ]] || fail "$1 requires a value."
+      cookies_path="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      fail "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
 done
+
+[[ "$#" -eq 1 ]] || {
+  usage
+  exit 1
+}
+
+input="$1"
+
+[[ "$max_retries" =~ ^[0-9]+$ ]] || fail "--max-retry must be a non-negative integer."
+[[ "$retry_delay" =~ ^[0-9]+$ ]] || fail "--retry-delay must be a non-negative integer."
+[[ "$connections" =~ ^[0-9]+$ && "$connections" -gt 0 ]] || fail "--connections must be a positive integer."
+[[ "$low_speed_limit" =~ ^[0-9]+$ && "$low_speed_limit" -gt 0 ]] || fail "--low-speed-limit must be a positive integer."
+[[ "$low_speed_time" =~ ^[0-9]+$ && "$low_speed_time" -gt 0 ]] || fail "--low-speed-time must be a positive integer."
+[[ "$backend" =~ ^(auto|aria2|curl|wget)$ ]] || fail "--backend must be one of: auto, aria2, curl, wget."
+
+if [[ -f "$input" ]]; then
+  if [[ -z "$output_dir" ]]; then
+    output_dir="${input%.*}-output-$(date '+%Y%m')"
+  fi
+  mkdir -p "$output_dir"
+  process_batch_file "$input" "$output_dir"
+else
+  if [[ -z "$output_dir" ]]; then
+    output_dir="."
+  fi
+  download_url "$input" "$output_dir"
+fi

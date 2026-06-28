@@ -31,6 +31,10 @@ alias ....='cd ../..'
 
 alias c="clear"
 
+title() {
+    printf '\033]0;%s\007' "$*"
+}
+
 # Path
 alias p='path'
 alias pc='path | clipboard'
@@ -45,6 +49,7 @@ alias dedu='dotnet ef database update'
 alias dap='dotnet add package'
 alias dotnet-outdated='dotnet outdated'
 alias bale='BALE_NET_ACCOUNT_DATABASE_PATH=/home/home/.local/share/Bale.Net/AccountExplorer/bale-accounts.db dotnet run --project /home/home/my-files/projects/bale-client-library/samples/Bale.Net.Samples.AccountExplorer/Bale.Net.Samples.AccountExplorer.csproj --'
+alias taaghche='dotnet run --project /home/home/my-files/projects/apk-files/Taaghche/src/Taaghche.Client/Taaghche.Client.csproj --'
 
 alias restart-wifi='sudo systemctl restart NetworkManager; nmcli radio wifi off; nmcli radio wifi on'
 
@@ -76,7 +81,176 @@ alias acc-intractive='agent-commit --interactive | clipboard'
 
 alias vpn-usage='(cd /home/home/my-files/projects/vpn-usage-tracker && watch -n 5 ./report.py)'
 
-alias sp-ssh='retry-until-success 10 "gh codespace ssh -c fictional-train-9qjxrpppqrr3p477"'
-alias sp-proxy='retry-until-success 10 "gh codespace ports forward 8899:8901 -c fictional-train-9qjxrpppqrr3p477"'
-alias sp-usage='retry-until-success 10 "gh codespace ports forward 8898:8898 -c fictional-train-9qjxrpppqrr3p477"'
-alias sp-stop='retry-until-success 10 "gh codespace stop -c fictional-train-9qjxrpppqrr3p477"'
+alias projects-status='git-sync-status /home/home/my-files/projects --max-depth -1 --only-needs-action'
+
+alias sp-ssh='retry-until-success 10 "gh codespace ssh"'
+alias sp-usage='retry-until-success 10 "gh codespace ports forward 8898:8898"'
+alias sp-stop='retry-until-success 10 "gh codespace stop"'
+alias sp-proxy3='retry-until-success 1 "gh codespace ports forward 8899:8901 --codespace gh-proxy-jrvq6x5pg452r5x"'
+
+sp-proxy2() {
+  local codespace="gh-proxy-jrvq6x5pg452r5x"
+  local ssh_host="cs.gh-proxy-779qx5gp7xvgfxrr7.main"
+  local local_port="8901"
+  local remote_port="8899"
+
+  while true; do
+    echo "Checking remote proxy on 127.0.0.1:${remote_port}..."
+    gh codespace ssh -c "$codespace" "timeout 3 bash -lc '</dev/tcp/127.0.0.1/${remote_port}'" >/dev/null 2>&1
+    if [ "$?" -ne 0 ]; then
+      echo "Remote proxy is not listening on ${remote_port}. Retry in 10s..."
+      sleep 10
+      continue
+    fi
+
+    echo "Starting SSH tunnel: local ${local_port} -> codespace ${remote_port}"
+    ssh \
+      -N \
+      -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=10 \
+      -o ServerAliveCountMax=3 \
+      -o TCPKeepAlive=yes \
+      "$ssh_host"
+
+    echo "Tunnel exited. Restarting in 5s..."
+    sleep 5
+  done
+}
+
+unalias sp-proxy2 2>/dev/null
+
+_sp_proxy_warm_dns() {
+  local host
+
+  for host in api.github.com github.com use.rel.tunnels.api.visualstudio.com; do
+    if command -v resolvectl >/dev/null 2>&1; then
+      timeout 15 resolvectl query "$host" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+_sp_proxy_gh() {
+  local attempt
+  local status
+
+  for attempt in 1 2 3; do
+    gh "$@"
+    status="$?"
+
+    if [ "$status" -eq 0 ]; then
+      return 0
+    fi
+
+    if [ "$attempt" -lt 3 ]; then
+      echo "GitHub CLI command failed; warming DNS and retrying (${attempt}/3)..." >&2
+      _sp_proxy_warm_dns
+      sleep 2
+    fi
+  done
+
+  return "$status"
+}
+
+_sp_proxy_codespace_list() {
+  local repo="${1:-}"
+  shift
+
+  if [ -n "$repo" ]; then
+    _sp_proxy_gh codespace list -R "$repo" "$@" && return 0
+    echo "Repo-scoped Codespace lookup failed for ${repo}; trying all Codespaces..." >&2
+  fi
+
+  _sp_proxy_gh codespace list "$@"
+}
+
+sp-proxy() {
+  local repo="${SP_CODESPACE_REPO:-fazeli45pa-ui/proxy2}"
+  local local_port="${SP_LOCAL_PORT:-8901}"
+  local remote_port="${SP_REMOTE_PORT:-8899}"
+  local codespace="${SP_CODESPACE_NAME:-gh-proxy-779qx5gp7xvgfxrr7}"
+  local codespace_state
+  local ssh_host
+
+  if [ -z "$codespace" ]; then
+    echo "Warming DNS for GitHub Codespaces..."
+    _sp_proxy_warm_dns
+    if ! codespace="$(_sp_proxy_codespace_list "$repo" --json name,state --jq 'map(select(.state == "Available"))[0].name // .[0].name // ""')"; then
+      echo "Failed to list Codespaces."
+      return 1
+    fi
+  fi
+
+  if [ -z "$codespace" ]; then
+    echo "No Codespace found for repo ${repo}."
+    echo "Set SP_CODESPACE_NAME manually if needed."
+    return 1
+  fi
+
+  if ! codespace_state="$(_sp_proxy_codespace_list "$repo" --json name,state --jq ".[] | select(.name == \"${codespace}\") | .state")"; then
+    echo "Failed to read state for Codespace ${codespace}."
+    return 1
+  fi
+  if [ "$codespace_state" != "Available" ]; then
+    echo "Codespace ${codespace} is ${codespace_state:-unknown}; resuming..."
+    if ! _sp_proxy_gh codespace ssh -c "$codespace" "true" >/dev/null; then
+      echo "Failed to resume Codespace ${codespace}."
+      return 1
+    fi
+  fi
+
+  ssh_host="cs.${codespace}.main"
+
+  echo "Using Codespace: ${codespace}"
+  echo "Refreshing ~/.ssh/codespaces..."
+  _sp_proxy_warm_dns
+  if ! _sp_proxy_gh codespace ssh --config > "${HOME}/.ssh/codespaces.tmp"; then
+    rm -f "${HOME}/.ssh/codespaces.tmp"
+    echo "Failed to refresh Codespaces SSH config."
+    return 1
+  fi
+  mv "${HOME}/.ssh/codespaces.tmp" "${HOME}/.ssh/codespaces"
+
+  echo "Checking remote proxy on 127.0.0.1:${remote_port}..."
+  _sp_proxy_gh codespace ssh -c "$codespace" "timeout 3 bash -lc '</dev/tcp/127.0.0.1/${remote_port}'" >/dev/null 2>&1
+  if [ "$?" -ne 0 ]; then
+    echo "Remote proxy is not listening on ${remote_port}."
+    return 1
+  fi
+
+  echo "Starting autossh tunnel: local ${local_port} -> codespace ${remote_port}"
+  AUTOSSH_GATETIME=0 autossh -M 0 -N \
+    -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=10 \
+    -o ServerAliveCountMax=3 \
+    -o TCPKeepAlive=yes \
+    "$ssh_host" &
+
+  local autossh_pid="$!"
+  trap 'kill "$autossh_pid" 2>/dev/null' INT TERM
+
+  local i
+  for i in {1..90}; do
+    if nc -z 127.0.0.1 "$local_port" >/dev/null 2>&1; then
+      echo "Tunnel is ready on 127.0.0.1:${local_port}."
+      wait "$autossh_pid"
+      local status="$?"
+      trap - INT TERM
+      return "$status"
+    fi
+
+    if ! kill -0 "$autossh_pid" 2>/dev/null; then
+      wait "$autossh_pid"
+      local status="$?"
+      trap - INT TERM
+      echo "autossh exited before local ${local_port} started listening."
+      return "$status"
+    fi
+
+    sleep 1
+  done
+
+  echo "Timed out waiting for local ${local_port} to start listening."
+  wait "$autossh_pid"
+}

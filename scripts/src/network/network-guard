@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+DEFAULT_EXPECTED_COUNTRY_CODE="US"
+DEFAULT_LOCATION_TIMEOUT_SECONDS="10"
+WIREPANEL_SETTINGS_PATH="${NETWORK_GUARD_WIREPANEL_SETTINGS_PATH:-${CODEX_GUARD_WIREPANEL_SETTINGS_PATH:-$HOME/.config/WirePanelClient/settings.json}}"
+MY_LOCATION_PATH="${NETWORK_GUARD_MY_LOCATION_PATH:-${CODEX_GUARD_MY_LOCATION_PATH:-$HOME/scripts/src/network/my-location}}"
+EXPECTED_COUNTRY_CODE="${NETWORK_GUARD_EXPECTED_COUNTRY_CODE:-${CODEX_GUARD_EXPECTED_COUNTRY_CODE:-$DEFAULT_EXPECTED_COUNTRY_CODE}}"
+LOCATION_TIMEOUT_SECONDS="${NETWORK_GUARD_LOCATION_TIMEOUT_SECONDS:-${CODEX_GUARD_LOCATION_TIMEOUT_SECONDS:-$DEFAULT_LOCATION_TIMEOUT_SECONDS}}"
+VERBOSE="${NETWORK_GUARD_VERBOSE:-${CODEX_GUARD_VERBOSE:-}}"
+
+declare -a FAILURE_REASONS=()
+declare -a CHILD_ENV=()
+PASS_REASON=""
+WIREPANEL_PROXY_PORT=""
+EXISTING_PROXY_ENV_NAME=""
+WIREPANEL_PROXY_MODE_SEEN=""
+
+show_help() {
+  cat <<'EOF'
+Usage:
+  network-guard check
+  network-guard env
+  network-guard exec [--notice MESSAGE] -- COMMAND [ARGS...]
+
+Run a reusable network preflight before sensitive commands.
+
+Pass conditions:
+  - WirePanel strict or lan mode is connected, protected, and kill-switch active.
+  - WirePanel proxy mode is connected, region is expected, and either the
+    current proxy environment is preserved or the local proxy listener is used.
+  - Current proxy environment contains a proxy URI with an explicit port and
+    my-location reports the expected country code through it.
+  - my-location reports the expected country code, default US.
+
+Options:
+  --notice MESSAGE  Print MESSAGE to stderr after preflight passes and before exec.
+  -h, --help        Show this help text.
+
+Environment:
+  NETWORK_GUARD_EXPECTED_COUNTRY_CODE  Expected fallback country code. Default: US.
+  NETWORK_GUARD_VERBOSE=1              Print diagnostic details.
+
+Legacy CODEX_GUARD_* names are also honored as fallbacks.
+EOF
+}
+
+verbose() {
+  if [[ "$VERBOSE" == "1" ]]; then
+    printf 'network-guard: %s\n' "$*" >&2
+  fi
+}
+
+record_failure() {
+  FAILURE_REASONS+=("$*")
+  verbose "$*"
+}
+
+json_get() {
+  local key_path="$1"
+  local json="$2"
+
+  python3 -c '
+import json
+import sys
+
+key_path = sys.argv[1]
+
+try:
+    value = json.loads(sys.stdin.read())
+    for part in key_path.split("."):
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            value = None
+            break
+except Exception:
+    value = None
+
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is None:
+    print("")
+else:
+    print(value)
+' "$key_path" <<<"$json"
+}
+
+lower() {
+  tr '[:upper:]' '[:lower:]'
+}
+
+proxy_value_has_port() {
+  local value="$1"
+
+  [[ -n "$value" ]] || return 1
+  [[ "$value" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*://[^[:space:]/]+:[0-9]+([/?#].*)?$ ]]
+}
+
+find_existing_proxy_env() {
+  local name value
+  local proxy_names=(
+    ALL_PROXY
+    all_proxy
+    HTTPS_PROXY
+    https_proxy
+    HTTP_PROXY
+    http_proxy
+  )
+
+  for name in "${proxy_names[@]}"; do
+    value="${!name:-}"
+    if proxy_value_has_port "$value"; then
+      EXISTING_PROXY_ENV_NAME="$name"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+check_existing_proxy_env() {
+  local location_pass_reason
+
+  if ! find_existing_proxy_env; then
+    record_failure "no proxy environment variable has a proxy URI with an explicit port"
+    return 1
+  fi
+
+  if check_location; then
+    location_pass_reason="$PASS_REASON"
+    PASS_REASON="proxy environment $EXISTING_PROXY_ENV_NAME is set with an explicit port; $location_pass_reason"
+    return 0
+  fi
+
+  return 1
+}
+
+read_wirepanel_proxy_port() {
+  local settings_json proxy_port
+
+  if [[ ! -r "$WIREPANEL_SETTINGS_PATH" ]]; then
+    record_failure "WirePanel settings are not readable at $WIREPANEL_SETTINGS_PATH"
+    return 1
+  fi
+
+  settings_json="$(<"$WIREPANEL_SETTINGS_PATH")"
+  proxy_port="$(json_get "proxyPort" "$settings_json")"
+
+  if [[ ! "$proxy_port" =~ ^[0-9]+$ ]]; then
+    record_failure "WirePanel proxyPort is missing or invalid in $WIREPANEL_SETTINGS_PATH"
+    return 1
+  fi
+
+  WIREPANEL_PROXY_PORT="$proxy_port"
+}
+
+local_port_accepts_connections() {
+  local host="$1"
+  local port="$2"
+
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 2 "$host" "$port" >/dev/null 2>&1
+    return $?
+  fi
+
+  timeout 2 bash -c ":</dev/tcp/$host/$port" >/dev/null 2>&1
+}
+
+set_wirepanel_proxy_child_env() {
+  local port="$1"
+
+  CHILD_ENV=(
+    "ALL_PROXY=socks5h://127.0.0.1:$port"
+    "all_proxy=socks5h://127.0.0.1:$port"
+    "http_proxy=http://127.0.0.1:$port"
+    "https_proxy=http://127.0.0.1:$port"
+    "HTTP_PROXY=http://127.0.0.1:$port"
+    "HTTPS_PROXY=http://127.0.0.1:$port"
+    "no_proxy=localhost,127.0.0.1,::1"
+    "NO_PROXY=localhost,127.0.0.1,::1"
+  )
+}
+
+check_wirepanel() {
+  local status_json active_mode connection_state protection_status kill_switch local_proxy_state proxy_port location_pass_reason
+
+  if ! command -v wirepanel-mode >/dev/null 2>&1; then
+    record_failure "wirepanel-mode is not available"
+    return 1
+  fi
+
+  if ! status_json="$(wirepanel-mode status 2>&1)"; then
+    record_failure "wirepanel-mode status failed: $status_json"
+    return 1
+  fi
+
+  active_mode="$(json_get "activeMode" "$status_json" | lower)"
+  connection_state="$(json_get "connectionState" "$status_json" | lower)"
+  protection_status="$(json_get "protectionStatus" "$status_json" | lower)"
+  kill_switch="$(json_get "killSwitchActive" "$status_json" | lower)"
+  local_proxy_state="$(json_get "localProxyState" "$status_json" | lower)"
+
+  if [[ "$active_mode" =~ ^(strict|lan)$ &&
+        "$connection_state" == "connected" &&
+        "$protection_status" == "protected" &&
+        "$kill_switch" == "true" ]]; then
+    PASS_REASON="WirePanel $active_mode mode is connected and protected"
+    return 0
+  fi
+
+  if [[ "$active_mode" == "proxy" &&
+        "$connection_state" == "connected" ]]; then
+    WIREPANEL_PROXY_MODE_SEEN="1"
+
+    if find_existing_proxy_env; then
+      if check_location; then
+        location_pass_reason="$PASS_REASON"
+        PASS_REASON="WirePanel proxy mode is connected; preserving existing proxy environment $EXISTING_PROXY_ENV_NAME; $location_pass_reason"
+        return 0
+      fi
+
+      return 1
+    fi
+
+    if [[ "$local_proxy_state" != "listening" ]]; then
+      record_failure "WirePanel proxy mode is active but local proxy state is ${local_proxy_state:-unknown}"
+      return 1
+    fi
+
+    if ! read_wirepanel_proxy_port; then
+      return 1
+    fi
+    proxy_port="$WIREPANEL_PROXY_PORT"
+
+    if ! local_port_accepts_connections "127.0.0.1" "$proxy_port"; then
+      record_failure "WirePanel proxy mode is active but 127.0.0.1:$proxy_port does not accept connections"
+      return 1
+    fi
+
+    set_wirepanel_proxy_child_env "$proxy_port"
+    if check_location; then
+      location_pass_reason="$PASS_REASON"
+      PASS_REASON="WirePanel proxy mode is connected; proxy env will be injected; $location_pass_reason"
+      return 0
+    fi
+
+    return 1
+  fi
+
+  record_failure "WirePanel status is not an accepted guarded state: mode=${active_mode:-unknown}, connection=${connection_state:-unknown}, protection=${protection_status:-unknown}, proxy=${local_proxy_state:-unknown}, killSwitch=${kill_switch:-unknown}"
+  return 1
+}
+
+check_location() {
+  local location_json actual_country expected_country
+
+  if [[ -z "$EXPECTED_COUNTRY_CODE" ]]; then
+    record_failure "expected country code is empty"
+    return 1
+  fi
+
+  if [[ ! -x "$MY_LOCATION_PATH" ]]; then
+    record_failure "my-location is not executable at $MY_LOCATION_PATH"
+    return 1
+  fi
+
+  if ((${#CHILD_ENV[@]} > 0)); then
+    if ! location_json="$(env "${CHILD_ENV[@]}" "$MY_LOCATION_PATH" --json --timeout "$LOCATION_TIMEOUT_SECONDS" 2>&1)"; then
+      record_failure "my-location failed: $location_json"
+      return 1
+    fi
+  elif ! location_json="$("$MY_LOCATION_PATH" --json --timeout "$LOCATION_TIMEOUT_SECONDS" 2>&1)"; then
+    record_failure "my-location failed: $location_json"
+    return 1
+  fi
+
+  actual_country="$(json_get "country_code" "$location_json" | lower)"
+  expected_country="$(printf '%s' "$EXPECTED_COUNTRY_CODE" | lower)"
+
+  if [[ "$actual_country" == "$expected_country" ]]; then
+    PASS_REASON="current public egress country is ${EXPECTED_COUNTRY_CODE^^}"
+    return 0
+  fi
+
+  record_failure "current public egress country is ${actual_country:-unknown}, expected ${EXPECTED_COUNTRY_CODE^^}"
+  return 1
+}
+
+run_checks() {
+  if check_wirepanel; then
+    return 0
+  fi
+
+  if [[ "$WIREPANEL_PROXY_MODE_SEEN" == "1" ]]; then
+    return 1
+  fi
+
+  check_existing_proxy_env || check_location
+}
+
+print_failures() {
+  local reason
+
+  printf 'network-guard: refusing to continue; no network safety condition passed.\n' >&2
+  for reason in "${FAILURE_REASONS[@]}"; do
+    printf 'network-guard: - %s\n' "$reason" >&2
+  done
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+print_env_exports() {
+  local assignment name value
+
+  for assignment in "${CHILD_ENV[@]}"; do
+    name="${assignment%%=*}"
+    value="${assignment#*=}"
+    printf 'export %s=' "$name"
+    shell_quote "$value"
+    printf '\n'
+  done
+}
+
+parse_exec_args() {
+  NOTICE=""
+
+  while (($# > 0)); do
+    case "$1" in
+      --notice)
+        shift
+        if (($# == 0)); then
+          printf 'network-guard: --notice requires a message.\n' >&2
+          exit 2
+        fi
+        NOTICE="$1"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help)
+        show_help
+        exit 0
+        ;;
+      *)
+        printf 'network-guard: unknown exec option: %s\n' "$1" >&2
+        printf 'Run network-guard --help for usage.\n' >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if (($# == 0)); then
+    printf 'network-guard: exec requires a command after --.\n' >&2
+    exit 2
+  fi
+
+  EXEC_COMMAND=("$@")
+}
+
+main() {
+  local command="${1:-}"
+  NOTICE=""
+  EXEC_COMMAND=()
+
+  case "$command" in
+    -h|--help|"")
+      show_help
+      exit 0
+      ;;
+    check)
+      shift
+      if (($# > 0)); then
+        printf 'network-guard: check does not accept arguments.\n' >&2
+        exit 2
+      fi
+      if run_checks; then
+        printf 'network-guard: pass: %s\n' "$PASS_REASON"
+        if ((${#CHILD_ENV[@]} > 0)); then
+          printf 'network-guard: child proxy env will be injected.\n'
+        fi
+        exit 0
+      fi
+      print_failures
+      exit 1
+      ;;
+    env)
+      shift
+      if (($# > 0)); then
+        printf 'network-guard: env does not accept arguments.\n' >&2
+        exit 2
+      fi
+      if run_checks; then
+        print_env_exports
+        exit 0
+      fi
+      print_failures
+      exit 1
+      ;;
+    exec)
+      shift
+      parse_exec_args "$@"
+      if run_checks; then
+        verbose "pass: $PASS_REASON"
+        if [[ -n "$NOTICE" ]]; then
+          printf '%s\n' "$NOTICE" >&2
+        fi
+        exec env NETWORK_GUARD_ACTIVE=1 "${CHILD_ENV[@]}" "${EXEC_COMMAND[@]}"
+      fi
+      print_failures
+      exit 1
+      ;;
+    *)
+      printf 'network-guard: unknown command: %s\n' "$command" >&2
+      printf 'Run network-guard --help for usage.\n' >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

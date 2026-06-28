@@ -2,14 +2,19 @@
 set -euo pipefail
 
 # -------------------------------------------------------------------
-# Usage: script <input_file> <compression_level: h|m|l> [output_file]
+# Usage:
+#   script <input_file> <compression_level: h|m|l> [output_file]
+#   script <input_file> --max-size <size> [output_file]
 # Levels:
 #   l = low compression  (best quality, modest size drop)
 #   m = medium           (good balance; slight downscale)
 #   h = high             (smaller file; noticeable downscale)
 #
+# Size examples:
+#   19MB, 19M, 19MiB, 19000000
+#
 # Notes:
-# - Requires: ffmpeg (and ffprobe optional).
+# - Requires: ffmpeg (and ffprobe for --max-size).
 # - Adds +faststart for better web playback.
 # - Ensures even dimensions and yuv420p for compatibility.
 # - Won't overwrite existing files; auto-increments name if needed.
@@ -20,6 +25,16 @@ set -euo pipefail
 die() { echo "Error: $*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not found."; }
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") <input_file> <compression_level (h/m/l)> [output_file]
+  $(basename "$0") <input_file> --max-size <size> [output_file]
+
+Size examples: 19MB, 19M, 19MiB, 19000000
+EOF
+}
 
 unique_path() {
   # yields a non-clobbering output path if the proposed one exists
@@ -37,16 +52,166 @@ unique_path() {
   printf '%s/%s.%s' "$dir" "$base" "$ext"
 }
 
+parse_size_bytes() {
+  local raw="$1"
+  local normalized number unit
+
+  normalized=$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')
+
+  if [[ "$normalized" =~ ^([0-9]+([.][0-9]+)?)(B|K|KB|KIB|M|MB|MIB|G|GB|GIB)?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[3]:-B}"
+  else
+    die "Invalid size '$raw'. Use values like 19MB, 19M, 19MiB, or 19000000."
+  fi
+
+  case "$unit" in
+    B)   awk -v n="$number" 'BEGIN { printf "%.0f", n }' ;;
+    K|KB) awk -v n="$number" 'BEGIN { printf "%.0f", n * 1000 }' ;;
+    KIB) awk -v n="$number" 'BEGIN { printf "%.0f", n * 1024 }' ;;
+    M|MB) awk -v n="$number" 'BEGIN { printf "%.0f", n * 1000 * 1000 }' ;;
+    MIB) awk -v n="$number" 'BEGIN { printf "%.0f", n * 1024 * 1024 }' ;;
+    G|GB) awk -v n="$number" 'BEGIN { printf "%.0f", n * 1000 * 1000 * 1000 }' ;;
+    GIB) awk -v n="$number" 'BEGIN { printf "%.0f", n * 1024 * 1024 * 1024 }' ;;
+    *) die "Invalid size unit '$unit'." ;;
+  esac
+}
+
+probe_duration_seconds() {
+  local input="$1"
+  ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input"
+}
+
+has_audio_stream() {
+  local input="$1"
+  [[ -n "$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$input")" ]]
+}
+
+choose_audio_options() {
+  local total_kbps="$1"
+
+  if (( total_kbps >= 220 )); then
+    audio_bitrate_kbps=96
+    audio_channels=2
+  elif (( total_kbps >= 160 )); then
+    audio_bitrate_kbps=48
+    audio_channels=1
+  elif (( total_kbps >= 100 )); then
+    audio_bitrate_kbps=32
+    audio_channels=1
+  else
+    audio_bitrate_kbps=24
+    audio_channels=1
+  fi
+}
+
+run_target_size_encode() {
+  local input="$1"
+  local output="$2"
+  local max_bytes="$3"
+  local duration source_bytes outdir tmpdir tmp_output passlog
+  local total_kbps audio_bitrate_kbps audio_channels video_bitrate_kbps attempt final_bytes audio_args
+
+  need ffprobe
+
+  duration=$(probe_duration_seconds "$input")
+  [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Could not read video duration with ffprobe."
+
+  source_bytes=$(stat -c '%s' "$input")
+  if (( source_bytes <= max_bytes )); then
+    cp -- "$input" "$output"
+    echo "Input is already under the target size; copied to: $output"
+    return
+  fi
+
+  outdir=$(dirname -- "$output")
+  tmpdir=$(mktemp -d --tmpdir="$outdir" ".video-reduce-size.XXXXXX")
+  tmp_output="$tmpdir/output.mp4"
+  passlog="$tmpdir/ffmpeg-pass"
+
+  cleanup() {
+    rm -rf -- "$tmpdir"
+  }
+  trap cleanup RETURN
+
+  # Leave muxing overhead headroom so the verified file stays below upload limits.
+  total_kbps=$(awk -v bytes="$max_bytes" -v seconds="$duration" 'BEGIN { printf "%d", (bytes * 8 * 0.92) / seconds / 1000 }')
+  (( total_kbps >= 48 )) || die "Target size is too small for this duration."
+
+  if has_audio_stream "$input"; then
+    choose_audio_options "$total_kbps"
+    audio_args=(-map 0:a:0 -c:a aac -b:a "${audio_bitrate_kbps}k" -ac "$audio_channels")
+  else
+    audio_bitrate_kbps=0
+    audio_channels=0
+    audio_args=(-an)
+  fi
+
+  video_bitrate_kbps=$((total_kbps - audio_bitrate_kbps))
+  (( video_bitrate_kbps >= 24 )) || die "Target size leaves too little video bitrate after audio."
+
+  echo "Target size: $max_bytes bytes"
+  echo "Duration: ${duration}s"
+
+  for attempt in 1 2 3; do
+    rm -f -- "$tmp_output" "$passlog"-*.log "$passlog"-*.log.mbtree
+    echo "Attempt $attempt: video ${video_bitrate_kbps}k, audio ${audio_bitrate_kbps}k"
+
+    ffmpeg -hide_banner -v warning -stats -y -i "$input" \
+      -map 0:v:0 \
+      -c:v libx264 -b:v "${video_bitrate_kbps}k" -pass 1 -passlogfile "$passlog" \
+      -preset slow -pix_fmt yuv420p -an -f null /dev/null
+
+    ffmpeg -hide_banner -v warning -stats -y -i "$input" \
+      -map 0:v:0 "${audio_args[@]}" \
+      -c:v libx264 -b:v "${video_bitrate_kbps}k" -pass 2 -passlogfile "$passlog" \
+      -preset slow -pix_fmt yuv420p \
+      -movflags +faststart \
+      "$tmp_output"
+
+    final_bytes=$(stat -c '%s' "$tmp_output")
+    if (( final_bytes <= max_bytes )); then
+      mv -- "$tmp_output" "$output"
+      echo "Done: $output ($final_bytes bytes)"
+      return
+    fi
+
+    echo "Output was $final_bytes bytes, above target; retrying lower."
+    video_bitrate_kbps=$((video_bitrate_kbps * 88 / 100))
+    (( video_bitrate_kbps >= 24 )) || break
+  done
+
+  die "Could not reduce video below $max_bytes bytes without going below the minimum bitrate."
+}
+
 # ---- args ----------------------------------------------------------
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $(basename "$0") <input_file> <compression_level (h/m/l)> [output_file]"
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+  usage
   exit 1
 fi
 
 input_file=$1
-compression_level=$2
-output_file=${3-}
+mode=${2-}
+compression_level=""
+max_size=""
+output_file=""
+
+case "$mode" in
+  --max-size)
+    [[ $# -ge 3 && $# -le 4 ]] || { usage; exit 1; }
+    max_size=$3
+    output_file=${4-}
+    ;;
+  h|m|l)
+    [[ $# -le 3 ]] || { usage; exit 1; }
+    compression_level=$mode
+    output_file=${3-}
+    ;;
+  *)
+    die "Invalid mode: use h, m, l, or --max-size <size>"
+    ;;
+esac
 
 # ---- preflight -----------------------------------------------------
 
@@ -66,6 +231,13 @@ fi
 
 # ensure we don't overwrite
 output_file=$(unique_path "$output_file")
+
+if [[ -n "$max_size" ]]; then
+  max_bytes=$(parse_size_bytes "$max_size")
+  (( max_bytes > 0 )) || die "Maximum size must be greater than zero."
+  run_target_size_encode "$input_file" "$output_file" "$max_bytes"
+  exit 0
+fi
 
 # ---- presets -------------------------------------------------------
 # All modes:
