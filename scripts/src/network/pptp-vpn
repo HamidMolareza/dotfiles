@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly PPTP_SERVICE_TYPE="org.freedesktop.NetworkManager.pptp"
+readonly SAFE_TEMPLATE_KEYS=(
+  lcp-echo-failure
+  lcp-echo-interval
+  no-vj-comp
+  nobsdcomp
+  nodeflate
+  refuse-chap
+  refuse-eap
+  refuse-mschap
+  refuse-pap
+  require-mppe-128
+)
+
+show_help() {
+  cat <<'EOF'
+Usage:
+  pptp-vpn show NAME
+  pptp-vpn rename OLD_NAME NEW_NAME
+  pptp-vpn apply-template TARGET_NAME --template TEMPLATE_NAME
+  pptp-vpn create NAME --gateway HOST --user USER [--template TEMPLATE_NAME]
+  pptp-vpn up NAME
+
+Manage Ubuntu NetworkManager PPTP profiles without handling VPN secrets.
+
+Commands:
+  show            Print non-secret PPTP settings.
+  rename          Rename a NetworkManager VPN profile.
+  apply-template  Copy safe advanced PPTP/PPP options from a working profile.
+  create          Create a PPTP profile and optionally apply a template.
+  up              Bring a profile up using NetworkManager's secret agent.
+
+Notes:
+  - Passwords are never read, printed, or written by this script.
+  - The target profile keeps its own gateway, user, and password-flags.
+  - Template keys are limited to known PPTP/PPP advanced options.
+EOF
+}
+
+die() {
+  printf 'pptp-vpn: %s\n' "$*" >&2
+  exit 1
+}
+
+require_nmcli() {
+  command -v nmcli >/dev/null 2>&1 || die "nmcli is required"
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+connection_uuid() {
+  local name="$1"
+  local uuid
+
+  uuid="$(nmcli -g connection.uuid connection show "$name" 2>/dev/null || true)"
+  [[ -n "$uuid" ]] || die "connection not found: $name"
+  printf '%s' "$uuid"
+}
+
+assert_pptp_connection() {
+  local id="$1"
+  local connection_type service_type
+
+  connection_type="$(nmcli -g connection.type connection show "$id" 2>/dev/null || true)"
+  [[ "$connection_type" == "vpn" ]] || die "$id is not a VPN connection"
+
+  service_type="$(nmcli -g vpn.service-type connection show "$id" 2>/dev/null || true)"
+  [[ "$service_type" == "$PPTP_SERVICE_TYPE" ]] || die "$id is not a PPTP VPN profile"
+}
+
+declare -A VPN_DATA=()
+
+parse_vpn_data() {
+  local raw="$1"
+  local pair key value
+
+  VPN_DATA=()
+  IFS=',' read -ra pairs <<<"$raw"
+  for pair in "${pairs[@]}"; do
+    [[ "$pair" == *"="* ]] || continue
+    key="$(trim "${pair%%=*}")"
+    value="$(trim "${pair#*=}")"
+    [[ -n "$key" ]] || continue
+    VPN_DATA["$key"]="$value"
+  done
+}
+
+load_vpn_data() {
+  local id="$1"
+  local raw
+
+  raw="$(nmcli -g vpn.data connection show "$id" 2>/dev/null || true)"
+  parse_vpn_data "$raw"
+}
+
+vpn_data_has_key() {
+  local key="$1"
+  [[ -v "VPN_DATA[$key]" ]]
+}
+
+build_vpn_data() {
+  local -a keys=()
+  local key seen
+  local -A emitted=()
+
+  for key in gateway user password-flags; do
+    if vpn_data_has_key "$key"; then
+      keys+=("$key")
+      emitted["$key"]=1
+    fi
+  done
+
+  for key in "${SAFE_TEMPLATE_KEYS[@]}"; do
+    if vpn_data_has_key "$key" && [[ ! -v "emitted[$key]" ]]; then
+      keys+=("$key")
+      emitted["$key"]=1
+    fi
+  done
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    [[ -v "emitted[$key]" ]] && continue
+    [[ "$key" == *password* && "$key" != "password-flags" ]] && continue
+    keys+=("$key")
+    emitted["$key"]=1
+  done < <(printf '%s\n' "${!VPN_DATA[@]}" | LC_ALL=C sort)
+
+  local first=1
+  for key in "${keys[@]}"; do
+    if [[ "$first" == "1" ]]; then
+      first=0
+    else
+      printf ', '
+    fi
+    printf '%s = %s' "$key" "${VPN_DATA[$key]}"
+  done
+}
+
+print_vpn_data() {
+  local id="$1"
+
+  assert_pptp_connection "$id"
+  load_vpn_data "$id"
+  build_vpn_data
+  printf '\n'
+}
+
+copy_safe_template_keys() {
+  local template="$1"
+  local target="$2"
+  local template_uuid target_uuid key value
+  local -A template_data=()
+
+  template_uuid="$(connection_uuid "$template")"
+  target_uuid="$(connection_uuid "$target")"
+  assert_pptp_connection "$template_uuid"
+  assert_pptp_connection "$target_uuid"
+
+  load_vpn_data "$template_uuid"
+  for key in "${SAFE_TEMPLATE_KEYS[@]}"; do
+    if vpn_data_has_key "$key"; then
+      template_data["$key"]="${VPN_DATA[$key]}"
+    fi
+  done
+
+  load_vpn_data "$target_uuid"
+  for key in "${SAFE_TEMPLATE_KEYS[@]}"; do
+    if [[ -v "template_data[$key]" ]]; then
+      VPN_DATA["$key"]="${template_data[$key]}"
+    fi
+  done
+
+  local updated_data
+  updated_data="$(build_vpn_data)"
+  nmcli connection modify "$target_uuid" vpn.data "$updated_data" >/dev/null
+  printf 'Updated %s from template %s\n' "$target" "$template"
+}
+
+create_profile() {
+  local name="$1"
+  local gateway="$2"
+  local user="$3"
+  local template="${4:-}"
+
+  if nmcli connection show "$name" >/dev/null 2>&1; then
+    die "connection already exists: $name"
+  fi
+
+  nmcli connection add type vpn con-name "$name" ifname '*' vpn-type pptp >/dev/null
+  VPN_DATA=(
+    [gateway]="$gateway"
+    [user]="$user"
+    [password-flags]="1"
+  )
+
+  if [[ -n "$template" ]]; then
+    local template_uuid key
+    local -A template_data=()
+    template_uuid="$(connection_uuid "$template")"
+    assert_pptp_connection "$template_uuid"
+    load_vpn_data "$template_uuid"
+    for key in "${SAFE_TEMPLATE_KEYS[@]}"; do
+      if vpn_data_has_key "$key"; then
+        template_data["$key"]="${VPN_DATA[$key]}"
+      fi
+    done
+    VPN_DATA=(
+      [gateway]="$gateway"
+      [user]="$user"
+      [password-flags]="1"
+    )
+    for key in "${SAFE_TEMPLATE_KEYS[@]}"; do
+      if [[ -v "template_data[$key]" ]]; then
+        VPN_DATA["$key"]="${template_data[$key]}"
+      fi
+    done
+  fi
+
+  nmcli connection modify "$name" vpn.service-type "$PPTP_SERVICE_TYPE" vpn.data "$(build_vpn_data)" >/dev/null
+  printf 'Created %s\n' "$name"
+}
+
+cmd_show() {
+  [[ $# -eq 1 ]] || die "usage: pptp-vpn show NAME"
+  print_vpn_data "$1"
+}
+
+cmd_rename() {
+  [[ $# -eq 2 ]] || die "usage: pptp-vpn rename OLD_NAME NEW_NAME"
+  local old_name="$1"
+  local new_name="$2"
+  local uuid
+
+  if nmcli connection show "$new_name" >/dev/null 2>&1; then
+    die "target connection already exists: $new_name"
+  fi
+
+  uuid="$(connection_uuid "$old_name")"
+  assert_pptp_connection "$uuid"
+  nmcli connection modify "$uuid" connection.id "$new_name" >/dev/null
+  printf 'Renamed %s to %s\n' "$old_name" "$new_name"
+}
+
+cmd_apply_template() {
+  [[ $# -eq 3 ]] || die "usage: pptp-vpn apply-template TARGET_NAME --template TEMPLATE_NAME"
+  local target="$1"
+  [[ "$2" == "--template" ]] || die "usage: pptp-vpn apply-template TARGET_NAME --template TEMPLATE_NAME"
+  copy_safe_template_keys "$3" "$target"
+}
+
+cmd_create() {
+  local name="${1:-}"
+  local gateway=""
+  local user=""
+  local template=""
+
+  [[ -n "$name" ]] || die "usage: pptp-vpn create NAME --gateway HOST --user USER [--template TEMPLATE_NAME]"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --gateway)
+        [[ $# -ge 2 ]] || die "--gateway requires a value"
+        gateway="$2"
+        shift 2
+        ;;
+      --user)
+        [[ $# -ge 2 ]] || die "--user requires a value"
+        user="$2"
+        shift 2
+        ;;
+      --template)
+        [[ $# -ge 2 ]] || die "--template requires a value"
+        template="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown create option: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$gateway" ]] || die "--gateway is required"
+  [[ -n "$user" ]] || die "--user is required"
+  create_profile "$name" "$gateway" "$user" "$template"
+}
+
+cmd_up() {
+  [[ $# -eq 1 ]] || die "usage: pptp-vpn up NAME"
+  local uuid
+
+  uuid="$(connection_uuid "$1")"
+  assert_pptp_connection "$uuid"
+  nmcli connection up "$uuid" --ask
+}
+
+main() {
+  require_nmcli
+
+  case "${1:-}" in
+    -h|--help|"")
+      show_help
+      ;;
+    show)
+      shift
+      cmd_show "$@"
+      ;;
+    rename)
+      shift
+      cmd_rename "$@"
+      ;;
+    apply-template)
+      shift
+      cmd_apply_template "$@"
+      ;;
+    create)
+      shift
+      cmd_create "$@"
+      ;;
+    up)
+      shift
+      cmd_up "$@"
+      ;;
+    *)
+      die "unknown command: $1"
+      ;;
+  esac
+}
+
+main "$@"
