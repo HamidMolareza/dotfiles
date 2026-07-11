@@ -1,0 +1,1357 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROGRAM_NAME="jetbrains-recent-projects"
+MAX_BACKUPS=20
+
+APPLY=false
+STATE_DIR_OVERRIDE=""
+IDE_FILTERS=()
+CONFIG_ROOT_OVERRIDES=()
+INSTALL_ROOT_OVERRIDES=()
+MENU_PROFILE_PATHS=()
+
+CONFIG_ROOTS=()
+PROFILE_NAMES=()
+PROFILE_PRODUCTS=()
+PROFILE_VERSIONS=()
+PROFILE_PATHS=()
+
+INSTALL_NAMES=()
+INSTALL_VERSIONS=()
+INSTALL_CODES=()
+INSTALL_EXECUTABLES=()
+INSTALL_SOURCES=()
+
+MAN_ORIGINALS=()
+MAN_RELATIVES=()
+MAN_HASHES=()
+MAN_MODES=()
+MAN_PROFILES=()
+
+LAST_SNAPSHOT_ID=""
+CURRENT_TEMP_SNAPSHOT=""
+
+usage() {
+    cat <<'EOF'
+Usage:
+  jetbrains-recent-projects
+  jetbrains-recent-projects list [options]
+  jetbrains-recent-projects clear [options] [--apply]
+  jetbrains-recent-projects backups [options]
+  jetbrains-recent-projects restore BACKUP_ID [options] [--apply]
+
+Find JetBrains IDE installations and configuration profiles, clear their
+visible recent-project lists, and restore automatically-created backups.
+
+Commands:
+  list                 List installations and configuration profiles.
+  clear                Preview or clear recent-project history.
+  backups              List available history backups.
+  restore BACKUP_ID    Preview or restore a history backup.
+  menu                 Open the interactive menu (also the default with no args).
+
+Options:
+  --ide NAME           Limit to a product (Rider) or profile (Rider2026.1).
+                       May be repeated. The default is all profiles.
+  --config-root DIR    Use DIR as a JetBrains configuration root. When supplied,
+                       automatic config-root discovery is replaced. May repeat.
+  --install-root DIR   Search DIR for JetBrains installations. When supplied,
+                       automatic install-root discovery is replaced. May repeat.
+  --state-dir DIR      Override backup state storage.
+  --apply              Apply clear or restore; otherwise show a preview.
+  -h, --help           Show this help.
+
+Defaults:
+  Backups: ~/.local/state/jetbrains-recent-projects/backups (or XDG_STATE_HOME)
+  History: options/recentProjects.xml and options/recentSolutions.xml
+  Safety:  applied operations abort while a selected IDE profile is running
+
+Examples:
+  jetbrains-recent-projects list
+  jetbrains-recent-projects clear --ide Rider
+  jetbrains-recent-projects clear --ide Rider --apply
+  jetbrains-recent-projects backups
+  jetbrains-recent-projects restore 20260711T120000Z-12345 --apply
+EOF
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'Warning: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+operation_die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 3
+}
+
+safety_die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 2
+}
+
+cleanup_temp_snapshot() {
+    if [[ -n "$CURRENT_TEMP_SNAPSHOT" && -d "$CURRENT_TEMP_SNAPSHOT" ]]; then
+        rm -rf -- "$CURRENT_TEMP_SNAPSHOT"
+    fi
+}
+
+trap cleanup_temp_snapshot EXIT
+
+require_commands() {
+    local command_name
+
+    for command_name in "$@"; do
+        command -v -- "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
+    done
+}
+
+require_core_commands() {
+    require_commands bash find realpath cp cmp mv rm mkdir sha256sum stat date sort
+}
+
+require_inventory_commands() {
+    require_commands jq
+}
+
+state_dir() {
+    if [[ -n "$STATE_DIR_OVERRIDE" ]]; then
+        realpath -m -- "$STATE_DIR_OVERRIDE"
+    else
+        realpath -m -- "${XDG_STATE_HOME:-$HOME/.local/state}/jetbrains-recent-projects"
+    fi
+}
+
+backups_dir() {
+    printf '%s/backups\n' "$(state_dir)"
+}
+
+append_unique_path() {
+    local -n destination="$1"
+    local candidate="$2"
+    local existing
+
+    candidate="$(realpath -m -- "$candidate")"
+    for existing in "${destination[@]}"; do
+        [[ "$existing" == "$candidate" ]] && return 0
+    done
+    destination+=("$candidate")
+}
+
+collect_config_roots() {
+    local root
+    local candidates=()
+
+    CONFIG_ROOTS=()
+    if ((${#CONFIG_ROOT_OVERRIDES[@]} > 0)); then
+        candidates=("${CONFIG_ROOT_OVERRIDES[@]}")
+    else
+        candidates+=("${XDG_CONFIG_HOME:-$HOME/.config}/JetBrains")
+
+        shopt -s nullglob
+        candidates+=("$HOME"/snap/*/current/.config/JetBrains)
+        candidates+=("$HOME"/snap/*/common/.config/JetBrains)
+        candidates+=("$HOME"/.var/app/*/config/JetBrains)
+        shopt -u nullglob
+    fi
+
+    for root in "${candidates[@]}"; do
+        [[ -d "$root" ]] || continue
+        append_unique_path CONFIG_ROOTS "$root"
+    done
+}
+
+split_profile_name() {
+    local profile_name="$1"
+
+    SPLIT_PRODUCT="$profile_name"
+    SPLIT_VERSION=""
+    if [[ "$profile_name" =~ ^(.+)(20[0-9]{2}\.[0-9]+.*)$ ]]; then
+        SPLIT_PRODUCT="${BASH_REMATCH[1]}"
+        SPLIT_VERSION="${BASH_REMATCH[2]}"
+    fi
+}
+
+discover_profiles() {
+    local root
+    local profile_path
+    local profile_name
+
+    PROFILE_NAMES=()
+    PROFILE_PRODUCTS=()
+    PROFILE_VERSIONS=()
+    PROFILE_PATHS=()
+
+    collect_config_roots
+    shopt -s nullglob
+    for root in "${CONFIG_ROOTS[@]}"; do
+        for profile_path in "$root"/*; do
+            [[ -d "$profile_path/options" ]] || continue
+            profile_name="$(basename -- "$profile_path")"
+            [[ "$profile_name" == *-backup* ]] && continue
+
+            split_profile_name "$profile_name"
+            PROFILE_NAMES+=("$profile_name")
+            PROFILE_PRODUCTS+=("$SPLIT_PRODUCT")
+            PROFILE_VERSIONS+=("$SPLIT_VERSION")
+            PROFILE_PATHS+=("$(realpath -m -- "$profile_path")")
+        done
+    done
+    shopt -u nullglob
+}
+
+name_matches_filter() {
+    local profile_name="$1"
+    local product_name="$2"
+    local filter="$3"
+    local filter_lower="${filter,,}"
+
+    [[ "${profile_name,,}" == "$filter_lower" || "${product_name,,}" == "$filter_lower" ]]
+}
+
+path_is_menu_selected() {
+    local profile_path="$1"
+    local selected_path
+
+    ((${#MENU_PROFILE_PATHS[@]} == 0)) && return 0
+    for selected_path in "${MENU_PROFILE_PATHS[@]}"; do
+        [[ "$profile_path" == "$selected_path" ]] && return 0
+    done
+    return 1
+}
+
+profile_is_selected() {
+    local index="$1"
+    local filter
+
+    path_is_menu_selected "${PROFILE_PATHS[$index]}" || return 1
+    ((${#IDE_FILTERS[@]} == 0)) && return 0
+    for filter in "${IDE_FILTERS[@]}"; do
+        if name_matches_filter "${PROFILE_NAMES[$index]}" "${PROFILE_PRODUCTS[$index]}" "$filter"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+stored_profile_is_selected() {
+    local profile_name="$1"
+    local profile_path="$2"
+    local filter
+
+    path_is_menu_selected "$profile_path" || return 1
+    ((${#IDE_FILTERS[@]} == 0)) && return 0
+    split_profile_name "$profile_name"
+    for filter in "${IDE_FILTERS[@]}"; do
+        if name_matches_filter "$profile_name" "$SPLIT_PRODUCT" "$filter"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_profile_filters() {
+    local filter
+    local index
+    local matched
+
+    for filter in "${IDE_FILTERS[@]}"; do
+        matched=false
+        for index in "${!PROFILE_NAMES[@]}"; do
+            if name_matches_filter "${PROFILE_NAMES[$index]}" "${PROFILE_PRODUCTS[$index]}" "$filter"; then
+                matched=true
+                break
+            fi
+        done
+        "$matched" || die "No JetBrains configuration profile matches --ide '$filter'."
+    done
+}
+
+history_files_for_profile() {
+    local profile_path="$1"
+    local destination_name="$2"
+    # ShellCheck cannot infer that the caller supplies an array name here.
+    # shellcheck disable=SC2178
+    local -n destination="$destination_name"
+    local candidate
+
+    destination=()
+    for candidate in \
+        "$profile_path/options/recentProjects.xml" \
+        "$profile_path/options/recentSolutions.xml"; do
+        if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+            destination+=("$candidate")
+        fi
+    done
+    return 0
+}
+
+profile_active_pid() {
+    local profile_path="$1"
+    local lock_file="$profile_path/.lock"
+    local pid=""
+
+    ACTIVE_PID=""
+    [[ -e "$lock_file" ]] || return 1
+    [[ -r "$lock_file" ]] || {
+        ACTIVE_PID="unknown"
+        return 0
+    }
+
+    IFS= read -r pid < "$lock_file" || true
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$pid" 2>/dev/null; then
+            ACTIVE_PID="$pid"
+            return 0
+        fi
+        return 1
+    fi
+
+    ACTIVE_PID="unknown"
+    return 0
+}
+
+preflight_inactive_profiles() {
+    local -n profile_paths="$1"
+    local path
+    local seen=()
+    local existing
+    local blocked=false
+
+    for path in "${profile_paths[@]}"; do
+        for existing in "${seen[@]}"; do
+            [[ "$existing" == "$path" ]] && continue 2
+        done
+        seen+=("$path")
+
+        if profile_active_pid "$path"; then
+            printf 'Blocked: %s is active (PID: %s).\n' "$(basename -- "$path")" "$ACTIVE_PID" >&2
+            blocked=true
+        fi
+    done
+
+    if "$blocked"; then
+        safety_die "Close the listed IDE profiles and try again. No files were changed."
+    fi
+    return 0
+}
+
+normalize_product_name() {
+    local value="${1,,}"
+
+    value="${value//jetbrains/}"
+    value="${value//[^[:alnum:]]/}"
+    printf '%s\n' "$value"
+}
+
+major_minor_version() {
+    if [[ "$1" =~ ^([0-9]{4}\.[0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+}
+
+product_versions_match() {
+    local left
+    local right
+
+    left="$(major_minor_version "$1")"
+    right="$(major_minor_version "$2")"
+    [[ -z "$left" || -z "$right" || "$left" == "$right" ]]
+}
+
+products_match() {
+    local left
+    local right
+
+    left="$(normalize_product_name "$1")"
+    right="$(normalize_product_name "$2")"
+    [[ -n "$left" && -n "$right" ]] || return 1
+    [[ "$left" == *"$right"* || "$right" == *"$left"* ]]
+}
+
+installation_already_added() {
+    local executable="$1"
+    local existing
+
+    for existing in "${INSTALL_EXECUTABLES[@]}"; do
+        [[ "$existing" == "$executable" ]] && return 0
+    done
+    return 1
+}
+
+add_installation() {
+    local name="$1"
+    local version="$2"
+    local code="$3"
+    local executable="$4"
+    local source="$5"
+
+    if [[ "$executable" == /* && -e "$executable" ]]; then
+        executable="$(realpath -m -- "$executable")"
+    fi
+    installation_already_added "$executable" && return 0
+
+    INSTALL_NAMES+=("$name")
+    INSTALL_VERSIONS+=("${version:--}")
+    INSTALL_CODES+=("${code:--}")
+    INSTALL_EXECUTABLES+=("$executable")
+    INSTALL_SOURCES+=("$source")
+}
+
+collect_install_roots() {
+    local destination_name="$1"
+    # ShellCheck cannot infer that the caller supplies an array name here.
+    # shellcheck disable=SC2178
+    local -n destination="$destination_name"
+    local candidate
+    local candidates=()
+
+    destination=()
+    if ((${#INSTALL_ROOT_OVERRIDES[@]} > 0)); then
+        candidates=("${INSTALL_ROOT_OVERRIDES[@]}")
+    else
+        candidates+=(
+            "$HOME/.local/share/JetBrains/Toolbox/apps"
+            "$HOME/Programs"
+            "$HOME/.local/opt"
+            "/opt"
+            "/usr/local/opt"
+            "/snap"
+        )
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        [[ -d "$candidate" ]] || continue
+        append_unique_path "$destination_name" "$candidate"
+    done
+}
+
+discover_product_info_installations() {
+    local install_roots=()
+    local root
+    local product_info
+    local name
+    local version
+    local code
+    local launcher
+    local executable
+
+    collect_install_roots install_roots
+    for root in "${install_roots[@]}"; do
+        while IFS= read -r -d '' product_info; do
+            name="$(jq -r '.name // empty' "$product_info" 2>/dev/null)" || continue
+            version="$(jq -r '.version // empty' "$product_info" 2>/dev/null)" || continue
+            code="$(jq -r '.productCode // empty' "$product_info" 2>/dev/null)" || continue
+            launcher="$(jq -r '[.launch[]? | select(.os == "Linux") | .launcherPath][0] // empty' "$product_info" 2>/dev/null)" || continue
+            [[ -n "$name" && -n "$launcher" ]] || continue
+
+            executable="$(dirname -- "$product_info")/$launcher"
+            [[ -x "$executable" ]] || continue
+            add_installation "$name" "$version" "$code" "$executable" "product-info"
+        done < <(find "$root" -maxdepth 7 -type f -name product-info.json -print0 2>/dev/null)
+    done
+}
+
+display_name_for_launcher() {
+    case "$1" in
+        rider|rider.sh) printf '%s\n' "JetBrains Rider" ;;
+        webstorm|webstorm.sh) printf '%s\n' "WebStorm" ;;
+        idea|idea.sh|idea-ultimate) printf '%s\n' "IntelliJ IDEA" ;;
+        pycharm|pycharm.sh|pycharm-professional) printf '%s\n' "PyCharm" ;;
+        clion|clion.sh) printf '%s\n' "CLion" ;;
+        goland|goland.sh) printf '%s\n' "GoLand" ;;
+        datagrip|datagrip.sh) printf '%s\n' "DataGrip" ;;
+        phpstorm|phpstorm.sh) printf '%s\n' "PhpStorm" ;;
+        rubymine|rubymine.sh) printf '%s\n' "RubyMine" ;;
+        rustrover|rustrover.sh) printf '%s\n' "RustRover" ;;
+        aqua|aqua.sh) printf '%s\n' "Aqua" ;;
+        fleet|fleet.sh) printf '%s\n' "Fleet" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+discover_path_installations() {
+    local aliases=(
+        rider webstorm idea idea-ultimate pycharm pycharm-professional clion
+        goland datagrip phpstorm rubymine rustrover aqua fleet
+    )
+    local alias
+    local executable
+
+    for alias in "${aliases[@]}"; do
+        executable="$(command -v -- "$alias" 2>/dev/null || true)"
+        [[ -n "$executable" && -x "$executable" ]] || continue
+        add_installation "$(display_name_for_launcher "$alias")" "-" "-" "$executable" "PATH"
+    done
+}
+
+desktop_directories() {
+    local directory
+    local data_directories=()
+
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    IFS=':' read -r -a data_directories <<<"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    for directory in "${data_directories[@]}"; do
+        [[ -n "$directory" ]] && printf '%s/applications\n' "${directory%/}"
+    done
+}
+
+extract_desktop_executable() {
+    local desktop_file="$1"
+    local payload
+    local executable
+
+    payload="$(sed -n 's/^Exec=//p' "$desktop_file" | head -n 1)"
+    [[ -n "$payload" ]] || return 1
+    [[ "$payload" != env[[:space:]]* ]] || return 1
+
+    if [[ "$payload" == \"* ]]; then
+        payload="${payload#\"}"
+        executable="${payload%%\"*}"
+    else
+        executable="${payload%%[[:space:]]*}"
+        executable="${executable//\\ / }"
+    fi
+
+    if [[ "$executable" != */* ]]; then
+        executable="$(command -v -- "$executable" 2>/dev/null)" || return 1
+    fi
+    [[ -x "$executable" ]] || return 1
+    realpath -m -- "$executable"
+}
+
+discover_desktop_installations() {
+    local directory
+    local desktop_file
+    local name
+    local executable
+
+    shopt -s nullglob
+    while IFS= read -r directory; do
+        [[ -d "$directory" ]] || continue
+        for desktop_file in "$directory"/*.desktop; do
+            name="$(sed -n 's/^Name=//p' "$desktop_file" | head -n 1)"
+            [[ "$name" =~ (Rider|WebStorm|IntelliJ|PyCharm|CLion|GoLand|DataGrip|PhpStorm|RubyMine|RustRover|Aqua|Fleet) ]] || continue
+            executable="$(extract_desktop_executable "$desktop_file" 2>/dev/null || true)"
+            [[ -n "$executable" ]] || continue
+            add_installation "$name" "-" "-" "$executable" "desktop"
+        done
+    done < <(desktop_directories)
+    shopt -u nullglob
+}
+
+discover_flatpak_installations() {
+    local app_id
+    local name
+    local version
+
+    command -v flatpak >/dev/null 2>&1 || return 0
+    while IFS=$'\t' read -r app_id name version; do
+        [[ -n "$app_id" ]] || continue
+        if [[ "${app_id,,} ${name,,}" =~ (jetbrains|rider|webstorm|intellij|pycharm|clion|goland|datagrip|phpstorm|rubymine|rustrover) ]]; then
+            add_installation "$name" "${version:--}" "-" "flatpak:$app_id" "Flatpak"
+        fi
+    done < <(flatpak list --app --columns=application,name,version 2>/dev/null || true)
+}
+
+discover_installations() {
+    INSTALL_NAMES=()
+    INSTALL_VERSIONS=()
+    INSTALL_CODES=()
+    INSTALL_EXECUTABLES=()
+    INSTALL_SOURCES=()
+
+    discover_product_info_installations
+    discover_path_installations
+    discover_desktop_installations
+    discover_flatpak_installations
+}
+
+matching_profiles_for_installation() {
+    local install_index="$1"
+    local profile_index
+    local matches=()
+
+    for profile_index in "${!PROFILE_NAMES[@]}"; do
+        products_match "${INSTALL_NAMES[$install_index]}" "${PROFILE_PRODUCTS[$profile_index]}" || continue
+        product_versions_match "${INSTALL_VERSIONS[$install_index]}" "${PROFILE_VERSIONS[$profile_index]}" || continue
+        matches+=("${PROFILE_NAMES[$profile_index]}")
+    done
+
+    if ((${#matches[@]} == 0)); then
+        printf '%s\n' "none"
+    else
+        local IFS=', '
+        printf '%s\n' "${matches[*]}"
+    fi
+}
+
+profile_has_installation() {
+    local profile_index="$1"
+    local install_index
+
+    for install_index in "${!INSTALL_NAMES[@]}"; do
+        products_match "${INSTALL_NAMES[$install_index]}" "${PROFILE_PRODUCTS[$profile_index]}" || continue
+        product_versions_match "${INSTALL_VERSIONS[$install_index]}" "${PROFILE_VERSIONS[$profile_index]}" || continue
+        return 0
+    done
+    return 1
+}
+
+installation_matches_filters() {
+    local index="$1"
+    local filter
+    local normalized_name
+    local normalized_filter
+
+    ((${#IDE_FILTERS[@]} == 0)) && return 0
+    normalized_name="$(normalize_product_name "${INSTALL_NAMES[$index]}")"
+    for filter in "${IDE_FILTERS[@]}"; do
+        normalized_filter="$(normalize_product_name "$filter")"
+        [[ -n "$normalized_filter" && "$normalized_name" == *"$normalized_filter"* ]] && return 0
+    done
+    return 1
+}
+
+command_list() {
+    local index
+    local files=()
+    local status
+    local active_status
+    local shown_installations=0
+    local shown_profiles=0
+
+    require_inventory_commands
+    discover_profiles
+    discover_installations
+
+    info "JetBrains installations:"
+    for index in "${!INSTALL_NAMES[@]}"; do
+        installation_matches_filters "$index" || continue
+        ((shown_installations += 1))
+        printf -- '- %s %s [%s]\n' "${INSTALL_NAMES[$index]}" "${INSTALL_VERSIONS[$index]}" "${INSTALL_SOURCES[$index]}"
+        printf '  Launcher: %s\n' "${INSTALL_EXECUTABLES[$index]}"
+        printf '  Profiles: %s\n' "$(matching_profiles_for_installation "$index")"
+    done
+    ((shown_installations > 0)) || info "  None found."
+
+    info ""
+    info "JetBrains configuration profiles:"
+    for index in "${!PROFILE_NAMES[@]}"; do
+        profile_is_selected "$index" || continue
+        ((shown_profiles += 1))
+        history_files_for_profile "${PROFILE_PATHS[$index]}" files
+        if profile_has_installation "$index"; then
+            status="installed"
+        else
+            status="no matching installation"
+        fi
+        if profile_active_pid "${PROFILE_PATHS[$index]}"; then
+            active_status="active PID $ACTIVE_PID"
+        else
+            active_status="inactive"
+        fi
+        printf -- '- %s [%s; %s; history files: %d]\n' "${PROFILE_NAMES[$index]}" "$status" "$active_status" "${#files[@]}"
+        printf '  Config: %s\n' "${PROFILE_PATHS[$index]}"
+    done
+    ((shown_profiles > 0)) || info "  None found."
+}
+
+snapshot_id_is_valid() {
+    [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]
+}
+
+next_snapshot_id() {
+    local backup_root="$1"
+    local id
+    local suffix=0
+
+    id="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
+    while [[ -e "$backup_root/$id" || -e "$backup_root/.tmp-$id" ]]; do
+        ((suffix += 1))
+        id="$(date -u +'%Y%m%dT%H%M%SZ')-$(( $$ + suffix ))"
+    done
+    printf '%s\n' "$id"
+}
+
+create_snapshot() {
+    local kind="$1"
+    local source_snapshot="$2"
+    local -n source_files="$3"
+    local -n source_profiles="$4"
+    local backup_root
+    local id
+    local temp_dir
+    local final_dir
+    local manifest
+    local index
+    local source_file
+    local relative_file
+    local backup_file
+    local hash
+    local mode
+
+    LAST_SNAPSHOT_ID=""
+    ((${#source_files[@]} > 0)) || return 0
+
+    backup_root="$(backups_dir)"
+    umask 077
+    mkdir -p -- "$backup_root" || operation_die "Could not create backup directory: $backup_root"
+    chmod 700 -- "$(state_dir)" "$backup_root" 2>/dev/null || true
+
+    id="$(next_snapshot_id "$backup_root")"
+    temp_dir="$backup_root/.tmp-$id"
+    final_dir="$backup_root/$id"
+    CURRENT_TEMP_SNAPSHOT="$temp_dir"
+    mkdir -p -- "$temp_dir/files" || operation_die "Could not create temporary snapshot: $temp_dir"
+    manifest="$temp_dir/manifest.nul"
+    : > "$manifest"
+
+    printf 'format_version=1\nkind=%s\ncreated_at=%s\nsource_snapshot=%s\n' \
+        "$kind" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$source_snapshot" > "$temp_dir/metadata"
+
+    for index in "${!source_files[@]}"; do
+        source_file="${source_files[$index]}"
+        [[ -f "$source_file" && ! -L "$source_file" ]] || operation_die "Backup source is not a regular file: $source_file"
+
+        relative_file="files/$index/$(basename -- "${source_profiles[$index]}")/options/$(basename -- "$source_file")"
+        backup_file="$temp_dir/$relative_file"
+        mkdir -p -- "$(dirname -- "$backup_file")" || operation_die "Could not create snapshot directory."
+        cp -p -- "$source_file" "$backup_file" || operation_die "Could not back up: $source_file"
+        cmp -s -- "$source_file" "$backup_file" || operation_die "Backup verification failed: $source_file"
+
+        hash="$(sha256sum -- "$source_file")"
+        hash="${hash%% *}"
+        mode="$(stat -c '%a' -- "$source_file")"
+        printf '%s\0%s\0%s\0%s\0%s\0' \
+            "$source_file" "$relative_file" "$hash" "$mode" "$(basename -- "${source_profiles[$index]}")" >> "$manifest"
+    done
+
+    mv -- "$temp_dir" "$final_dir" || operation_die "Could not finalize backup snapshot."
+    CURRENT_TEMP_SNAPSHOT=""
+    LAST_SNAPSHOT_ID="$id"
+    info "Created backup: $id"
+}
+
+load_manifest() {
+    local snapshot_dir="$1"
+    local manifest="$snapshot_dir/manifest.nul"
+    local fd
+    local original
+    local relative
+    local hash
+    local mode
+    local profile
+
+    MAN_ORIGINALS=()
+    MAN_RELATIVES=()
+    MAN_HASHES=()
+    MAN_MODES=()
+    MAN_PROFILES=()
+
+    [[ -f "$manifest" ]] || return 1
+    exec {fd}< "$manifest" || return 1
+    while IFS= read -r -d '' original <&$fd; do
+        IFS= read -r -d '' relative <&$fd || { exec {fd}<&-; return 1; }
+        IFS= read -r -d '' hash <&$fd || { exec {fd}<&-; return 1; }
+        IFS= read -r -d '' mode <&$fd || { exec {fd}<&-; return 1; }
+        IFS= read -r -d '' profile <&$fd || { exec {fd}<&-; return 1; }
+        MAN_ORIGINALS+=("$original")
+        MAN_RELATIVES+=("$relative")
+        MAN_HASHES+=("$hash")
+        MAN_MODES+=("$mode")
+        MAN_PROFILES+=("$profile")
+    done
+    exec {fd}<&-
+
+    ((${#MAN_ORIGINALS[@]} > 0))
+}
+
+metadata_value() {
+    local snapshot_dir="$1"
+    local requested_key="$2"
+    local key
+    local value
+
+    [[ -f "$snapshot_dir/metadata" ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ "$key" == "$requested_key" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done < "$snapshot_dir/metadata"
+    return 1
+}
+
+list_snapshot_ids() {
+    local backup_root
+
+    backup_root="$(backups_dir)"
+    [[ -d "$backup_root" ]] || return 0
+    find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+        | sort -r \
+        | while IFS= read -r id; do
+            snapshot_id_is_valid "$id" && printf '%s\n' "$id"
+        done
+}
+
+snapshot_profiles_text() {
+    local snapshot_dir="$1"
+    local profile
+    local existing
+    local profiles=()
+
+    load_manifest "$snapshot_dir" || {
+        printf '%s\n' "invalid manifest"
+        return
+    }
+    for profile in "${MAN_PROFILES[@]}"; do
+        for existing in "${profiles[@]}"; do
+            [[ "$existing" == "$profile" ]] && continue 2
+        done
+        profiles+=("$profile")
+    done
+    local IFS=', '
+    printf '%s\n' "${profiles[*]}"
+}
+
+command_backups() {
+    local id
+    local snapshot_dir
+    local kind
+    local created_at
+    local found=false
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        found=true
+        snapshot_dir="$(backups_dir)/$id"
+        kind="$(metadata_value "$snapshot_dir" kind 2>/dev/null || printf '%s' unknown)"
+        created_at="$(metadata_value "$snapshot_dir" created_at 2>/dev/null || printf '%s' unknown)"
+        if load_manifest "$snapshot_dir"; then
+            printf '%s  %s  %-11s  %d file(s)  %s\n' \
+                "$id" "$created_at" "$kind" "${#MAN_ORIGINALS[@]}" "$(snapshot_profiles_text "$snapshot_dir")"
+        else
+            printf '%s  INVALID SNAPSHOT\n' "$id"
+        fi
+    done < <(list_snapshot_ids)
+
+    "$found" || info "No backups found."
+}
+
+prune_backups() {
+    local protected_id="${1:-}"
+    local backup_root
+    local ids=()
+    local id
+    local delete_count
+    local deleted=0
+
+    backup_root="$(backups_dir)"
+    [[ -n "$backup_root" && "$backup_root" != "/" ]] || operation_die "Invalid backup directory."
+    mapfile -t ids < <(list_snapshot_ids | sort)
+    ((${#ids[@]} > MAX_BACKUPS)) || return 0
+    delete_count=$((${#ids[@]} - MAX_BACKUPS))
+
+    for id in "${ids[@]}"; do
+        ((deleted >= delete_count)) && break
+        [[ -n "$protected_id" && "$id" == "$protected_id" ]] && continue
+        rm -rf -- "${backup_root:?}/$id" || operation_die "Could not prune backup: $id"
+        info "Pruned old backup: $id"
+        ((deleted += 1))
+    done
+}
+
+command_clear() {
+    local index
+    local profile_files=()
+    local target_files=()
+    local target_profiles=()
+    local selected_profiles=0
+    local failures=0
+    local file
+
+    discover_profiles
+    validate_profile_filters
+
+    if [[ "$APPLY" == true ]]; then
+        info "Applying recent-project cleanup:"
+    else
+        info "Recent-project cleanup preview:"
+    fi
+    for index in "${!PROFILE_NAMES[@]}"; do
+        profile_is_selected "$index" || continue
+        ((selected_profiles += 1))
+        history_files_for_profile "${PROFILE_PATHS[$index]}" profile_files
+        if ((${#profile_files[@]} == 0)); then
+            printf -- '- %s: already clear\n' "${PROFILE_NAMES[$index]}"
+            continue
+        fi
+
+        printf -- '- %s:\n' "${PROFILE_NAMES[$index]}"
+        for file in "${profile_files[@]}"; do
+            printf '  %s %s\n' "$([[ "$APPLY" == true ]] && printf 'remove' || printf 'would remove')" "$file"
+            target_files+=("$file")
+            target_profiles+=("${PROFILE_PATHS[$index]}")
+        done
+    done
+
+    ((selected_profiles > 0)) || die "No JetBrains configuration profiles were found for the selected target."
+    if ((${#target_files[@]} == 0)); then
+        info "No recent-project history files need clearing."
+        return 0
+    fi
+
+    if [[ "$APPLY" != true ]]; then
+        info "Preview only. Re-run with --apply to create a backup and clear these files."
+        return 0
+    fi
+
+    preflight_inactive_profiles target_profiles
+    create_snapshot "clear" "" target_files target_profiles
+
+    for file in "${target_files[@]}"; do
+        if rm -- "$file"; then
+            printf 'Removed: %s\n' "$file"
+        else
+            warn "Could not remove: $file"
+            ((failures += 1))
+        fi
+    done
+    ((failures == 0)) || operation_die "Cleanup was incomplete. Backup $LAST_SNAPSHOT_ID contains every selected history file."
+
+    prune_backups ""
+    info "Recent-project history cleared successfully."
+}
+
+path_is_in_config_roots() {
+    local profile_path="$1"
+    local root
+
+    for root in "${CONFIG_ROOTS[@]}"; do
+        [[ "$(dirname -- "$profile_path")" == "$root" ]] && return 0
+    done
+    return 1
+}
+
+validate_restore_entry() {
+    local snapshot_dir="$1"
+    local index="$2"
+    local original="${MAN_ORIGINALS[$index]}"
+    local relative="${MAN_RELATIVES[$index]}"
+    local expected_hash="${MAN_HASHES[$index]}"
+    local mode="${MAN_MODES[$index]}"
+    local profile="${MAN_PROFILES[$index]}"
+    local backup_file
+    local actual_hash
+    local profile_path
+
+    [[ "$relative" == files/* && "$relative" != *'/../'* && "$relative" != '../'* ]] || return 1
+    [[ "$original" == /* ]] || return 1
+    [[ "$(basename -- "$original")" == "recentProjects.xml" || "$(basename -- "$original")" == "recentSolutions.xml" ]] || return 1
+    [[ "$(basename -- "$(dirname -- "$original")")" == "options" ]] || return 1
+    [[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+
+    profile_path="$(dirname -- "$(dirname -- "$original")")"
+    [[ "$(basename -- "$profile_path")" == "$profile" ]] || return 1
+    path_is_in_config_roots "$profile_path" || return 1
+    [[ -d "$profile_path" && -d "$profile_path/options" ]] || return 1
+    [[ ! -L "$original" ]] || return 1
+    [[ ! -e "$original" || -f "$original" ]] || return 1
+
+    backup_file="$snapshot_dir/$relative"
+    [[ -f "$backup_file" && ! -L "$backup_file" ]] || return 1
+    [[ "$(realpath -m -- "$backup_file")" == "$(realpath -m -- "$snapshot_dir")"/* ]] || return 1
+    actual_hash="$(sha256sum -- "$backup_file")"
+    actual_hash="${actual_hash%% *}"
+    [[ "$actual_hash" == "$expected_hash" ]]
+}
+
+command_restore() {
+    local backup_id="$1"
+    local backup_root
+    local snapshot_dir
+    local index
+    local original
+    local relative
+    local profile_path
+    local backup_file
+    local temp_file
+    local actual_hash
+    local selected_count=0
+    local failures=0
+    local restore_indices=()
+    local restore_profiles=()
+    local current_files=()
+    local current_profiles=()
+
+    snapshot_id_is_valid "$backup_id" || die "Invalid backup ID: $backup_id"
+    backup_root="$(backups_dir)"
+    snapshot_dir="$backup_root/$backup_id"
+    [[ -d "$snapshot_dir" ]] || die "Backup not found: $backup_id"
+    [[ "$(metadata_value "$snapshot_dir" format_version 2>/dev/null || true)" == "1" ]] \
+        || operation_die "Unsupported or missing backup format version: $backup_id"
+    load_manifest "$snapshot_dir" || operation_die "Backup manifest is missing or invalid: $backup_id"
+    collect_config_roots
+
+    for index in "${!MAN_ORIGINALS[@]}"; do
+        original="${MAN_ORIGINALS[$index]}"
+        profile_path="$(dirname -- "$(dirname -- "$original")")"
+        stored_profile_is_selected "${MAN_PROFILES[$index]}" "$profile_path" || continue
+        ((selected_count += 1))
+
+        validate_restore_entry "$snapshot_dir" "$index" || operation_die "Backup integrity or destination validation failed for entry $index in $backup_id."
+        relative="${MAN_RELATIVES[$index]}"
+        backup_file="$snapshot_dir/$relative"
+        if [[ -f "$original" ]] && cmp -s -- "$backup_file" "$original"; then
+            printf -- '- %s: already matches backup\n' "$original"
+            continue
+        fi
+
+        if [[ -e "$original" ]]; then
+            printf -- '- %s %s (overwrite)\n' "$([[ "$APPLY" == true ]] && printf 'restore' || printf 'would restore')" "$original"
+            current_files+=("$original")
+            current_profiles+=("$profile_path")
+        else
+            printf -- '- %s %s\n' "$([[ "$APPLY" == true ]] && printf 'restore' || printf 'would restore')" "$original"
+        fi
+        restore_indices+=("$index")
+        restore_profiles+=("$profile_path")
+    done
+
+    ((selected_count > 0)) || die "The backup has no entries matching the selected IDE profiles."
+    if ((${#restore_indices[@]} == 0)); then
+        info "Every selected history file already matches this backup."
+        return 0
+    fi
+    if [[ "$APPLY" != true ]]; then
+        info "Preview only. Re-run with --apply to restore this backup."
+        return 0
+    fi
+
+    preflight_inactive_profiles restore_profiles
+    if ((${#current_files[@]} > 0)); then
+        create_snapshot "pre-restore" "$backup_id" current_files current_profiles
+    fi
+
+    for index in "${restore_indices[@]}"; do
+        original="${MAN_ORIGINALS[$index]}"
+        backup_file="$snapshot_dir/${MAN_RELATIVES[$index]}"
+        temp_file="$(dirname -- "$original")/.${PROGRAM_NAME}.$$.tmp"
+        rm -f -- "$temp_file"
+        if ! cp -p -- "$backup_file" "$temp_file"; then
+            warn "Could not stage restore for: $original"
+            ((failures += 1))
+            continue
+        fi
+        chmod "${MAN_MODES[$index]}" -- "$temp_file" || {
+            rm -f -- "$temp_file"
+            warn "Could not restore mode for: $original"
+            ((failures += 1))
+            continue
+        }
+        actual_hash="$(sha256sum -- "$temp_file")"
+        actual_hash="${actual_hash%% *}"
+        if [[ "$actual_hash" != "${MAN_HASHES[$index]}" ]]; then
+            rm -f -- "$temp_file"
+            warn "Staged restore failed checksum validation: $original"
+            ((failures += 1))
+            continue
+        fi
+        if mv -f -- "$temp_file" "$original"; then
+            printf 'Restored: %s\n' "$original"
+        else
+            rm -f -- "$temp_file"
+            warn "Could not restore: $original"
+            ((failures += 1))
+        fi
+    done
+
+    ((failures == 0)) || operation_die "Restore was incomplete. Use the pre-restore backup to recover overwritten entries."
+    prune_backups "$backup_id"
+    info "Backup restored successfully: $backup_id"
+}
+
+parse_options() {
+    while (($# > 0)); do
+        case "$1" in
+            --ide)
+                (($# >= 2)) || die "--ide requires a name."
+                IDE_FILTERS+=("$2")
+                shift 2
+                ;;
+            --config-root)
+                (($# >= 2)) || die "--config-root requires a directory."
+                CONFIG_ROOT_OVERRIDES+=("$(realpath -m -- "$2")")
+                shift 2
+                ;;
+            --install-root)
+                (($# >= 2)) || die "--install-root requires a directory."
+                INSTALL_ROOT_OVERRIDES+=("$(realpath -m -- "$2")")
+                shift 2
+                ;;
+            --state-dir)
+                (($# >= 2)) || die "--state-dir requires a directory."
+                STATE_DIR_OVERRIDE="$2"
+                shift 2
+                ;;
+            --apply)
+                APPLY=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+    done
+}
+
+fzf_select_records() {
+    local -n input_records="$1"
+    local -n output_records="$2"
+    local prompt="$3"
+    local multi="$4"
+    local options=(
+        --read0 --print0 --height=70% --layout=reverse --border
+        --delimiter=$'\t' --with-nth=2..
+        --prompt="$prompt"
+    )
+
+    [[ "$multi" == true ]] && options+=(--multi --header="Tab selects multiple items; Enter confirms")
+    output_records=()
+    mapfile -d '' -t output_records < <(printf '%s\0' "${input_records[@]}" | fzf "${options[@]}")
+    ((${#output_records[@]} > 0))
+}
+
+interactive_choose_current_profiles() {
+    local records=($'all\tAll detected profiles')
+    local selections=()
+    local index
+    local record
+    local selected_id
+
+    discover_profiles
+    ((${#PROFILE_NAMES[@]} > 0)) || {
+        warn "No JetBrains configuration profiles were found."
+        return 1
+    }
+    for index in "${!PROFILE_NAMES[@]}"; do
+        records+=("$index"$'\t'"${PROFILE_NAMES[$index]} — ${PROFILE_PATHS[$index]}")
+    done
+    fzf_select_records records selections "Profiles> " true || return 1
+
+    MENU_PROFILE_PATHS=()
+    for record in "${selections[@]}"; do
+        selected_id="${record%%$'\t'*}"
+        if [[ "$selected_id" == all ]]; then
+            MENU_PROFILE_PATHS=()
+            return 0
+        fi
+        MENU_PROFILE_PATHS+=("${PROFILE_PATHS[$selected_id]}")
+    done
+}
+
+interactive_choose_backup_profiles() {
+    local snapshot_dir="$1"
+    local records=($'all\tAll profiles in this backup')
+    local selections=()
+    local unique_paths=()
+    local unique_names=()
+    local index
+    local path
+    local existing
+    local record
+    local selected_id
+
+    load_manifest "$snapshot_dir" || return 1
+    for index in "${!MAN_ORIGINALS[@]}"; do
+        path="$(dirname -- "$(dirname -- "${MAN_ORIGINALS[$index]}")")"
+        for existing in "${unique_paths[@]}"; do
+            [[ "$existing" == "$path" ]] && continue 2
+        done
+        unique_paths+=("$path")
+        unique_names+=("${MAN_PROFILES[$index]}")
+    done
+    for index in "${!unique_paths[@]}"; do
+        records+=("$index"$'\t'"${unique_names[$index]} — ${unique_paths[$index]}")
+    done
+    fzf_select_records records selections "Restore profiles> " true || return 1
+
+    MENU_PROFILE_PATHS=()
+    for record in "${selections[@]}"; do
+        selected_id="${record%%$'\t'*}"
+        if [[ "$selected_id" == all ]]; then
+            MENU_PROFILE_PATHS=()
+            return 0
+        fi
+        MENU_PROFILE_PATHS+=("${unique_paths[$selected_id]}")
+    done
+}
+
+interactive_confirm_apply() {
+    local label="$1"
+    local records=($'cancel\tCancel' "apply"$'\t'"$label")
+    local selections=()
+
+    fzf_select_records records selections "Confirm> " false || return 1
+    [[ "${selections[0]%%$'\t'*}" == apply ]]
+}
+
+interactive_pause() {
+    printf '\nPress Enter to return to the menu...'
+    IFS= read -r _ || true
+}
+
+interactive_clear() {
+    interactive_choose_current_profiles || return 0
+    APPLY=false
+    command_clear || return $?
+    if interactive_confirm_apply "Apply cleanup and create a backup"; then
+        APPLY=true
+        command_clear
+    fi
+    APPLY=false
+    MENU_PROFILE_PATHS=()
+}
+
+interactive_restore() {
+    local records=()
+    local selections=()
+    local id
+    local snapshot_dir
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        snapshot_dir="$(backups_dir)/$id"
+        records+=("$id"$'\t'"$id — $(snapshot_profiles_text "$snapshot_dir")")
+    done < <(list_snapshot_ids)
+    ((${#records[@]} > 0)) || {
+        warn "No backups found."
+        return 0
+    }
+
+    fzf_select_records records selections "Backup> " false || return 0
+    id="${selections[0]%%$'\t'*}"
+    snapshot_dir="$(backups_dir)/$id"
+    interactive_choose_backup_profiles "$snapshot_dir" || return 0
+
+    APPLY=false
+    command_restore "$id" || return $?
+    if interactive_confirm_apply "Restore backup $id"; then
+        APPLY=true
+        command_restore "$id"
+    fi
+    APPLY=false
+    MENU_PROFILE_PATHS=()
+}
+
+interactive_menu() {
+    local records=(
+        $'clear\tClear recent-project history'
+        $'list\tList installations and profiles'
+        $'backups\tList backups'
+        $'restore\tRestore a backup'
+        $'exit\tExit'
+    )
+    local selections=()
+    local action
+
+    [[ -t 0 && -t 1 ]] || die "Interactive mode requires a terminal. Use a subcommand instead."
+    command -v fzf >/dev/null 2>&1 || die "Interactive mode requires fzf. Install it with: sudo apt install fzf"
+    require_inventory_commands
+
+    while true; do
+        fzf_select_records records selections "JetBrains> " false || return 0
+        action="${selections[0]%%$'\t'*}"
+        case "$action" in
+            clear)
+                interactive_clear || warn "Cleanup did not complete."
+                interactive_pause
+                ;;
+            list)
+                command_list || warn "Inventory did not complete."
+                interactive_pause
+                ;;
+            backups)
+                command_backups
+                interactive_pause
+                ;;
+            restore)
+                interactive_restore || warn "Restore did not complete."
+                interactive_pause
+                ;;
+            exit)
+                return 0
+                ;;
+        esac
+    done
+}
+
+main() {
+    local command_name
+    local backup_id
+
+    [[ "$(uname -s)" == "Linux" ]] || die "This command currently supports Linux only."
+    ((EUID != 0)) || die "Run this command as the desktop user, not with sudo or as root."
+    require_core_commands
+
+    if (($# == 0)); then
+        interactive_menu
+        return
+    fi
+
+    command_name="$1"
+    shift
+    case "$command_name" in
+        list)
+            parse_options "$@"
+            [[ "$APPLY" == false ]] || die "--apply is only valid with clear or restore."
+            command_list
+            ;;
+        clear)
+            parse_options "$@"
+            command_clear
+            ;;
+        backups)
+            parse_options "$@"
+            [[ "$APPLY" == false ]] || die "--apply is only valid with clear or restore."
+            ((${#IDE_FILTERS[@]} == 0 && ${#CONFIG_ROOT_OVERRIDES[@]} == 0 && ${#INSTALL_ROOT_OVERRIDES[@]} == 0)) \
+                || die "backups accepts only --state-dir."
+            command_backups
+            ;;
+        restore)
+            (($# > 0)) || die "restore requires a backup ID."
+            backup_id="$1"
+            shift
+            parse_options "$@"
+            command_restore "$backup_id"
+            ;;
+        menu)
+            parse_options "$@"
+            [[ "$APPLY" == false ]] || die "--apply is not accepted by menu mode."
+            interactive_menu
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            die "Unknown command: $command_name"
+            ;;
+    esac
+}
+
+main "$@"
