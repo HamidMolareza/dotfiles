@@ -1,0 +1,7 @@
+# Backup sources. Values must be absolute paths or glob patterns.
+include=/home/home/Downloads
+include=/home/home/Desktop
+
+# Exclude files may be relative to this profile.
+exclude_file=../excludes/common.exclude
+exclude_file=../excludes/local.exclude

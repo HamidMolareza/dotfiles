@@ -1,0 +1,10 @@
+# Common development and build output directories.
+node_modules
+bin
+obj
+dist
+build
+.next
+.nuxt
+.cache
+coverage

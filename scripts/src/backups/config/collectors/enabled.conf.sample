@@ -1,0 +1,3 @@
+# mode|required name|collector command
+# required|system-inventory|builtin:system-inventory
+# optional|repository-export|/absolute/path/to/repository-export-wrapper

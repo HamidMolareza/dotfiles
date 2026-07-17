@@ -4,197 +4,129 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_RULES_FILE="$SCRIPT_DIR/backup-home.rules"
-DEFAULT_MANUAL_FILE="$SCRIPT_DIR/backup-home.manual"
+DEFAULT_PROFILE_FILE="$SCRIPT_DIR/config/profiles/home.conf"
+DEFAULT_MANUAL_FILE="$SCRIPT_DIR/config/manual/home.manual"
+DEFAULT_COLLECTORS_FILE="$SCRIPT_DIR/config/collectors/enabled.conf"
+DEFAULT_RETENTION_FILE="$SCRIPT_DIR/config/retention/default.conf"
 
 COMMAND=""
 DEST_ROOT=""
 DEST_ROOT_REAL=""
-RULES_FILE="$DEFAULT_RULES_FILE"
+PROFILE_FILE="$DEFAULT_PROFILE_FILE"
 MANUAL_FILE="$DEFAULT_MANUAL_FILE"
+COLLECTORS_FILE="$DEFAULT_COLLECTORS_FILE"
+RETENTION_FILE="$DEFAULT_RETENTION_FILE"
 DRY_RUN=0
 VERBOSE=0
 ASSUME_YES=0
 IGNORE_ERRORS=0
+DEEP_VERIFY=0
 LOG_FILE=""
 ACTIVE_LOG_FILE=""
 SNAPSHOT_NAME=""
 RESTORE_PATH=""
 RESTORE_DEST=""
-MANUAL_STAGE_DIR=""
-MANUAL_STAGE_ADDED=0
+KEEP_LAST_OVERRIDE=""
 
+RUN_STAGE_DIR=""
+INCOMPLETE_SNAPSHOT_DIR=""
+RUN_ACTIVE=0
+RUN_FAILURE_REPORTED=0
+RUN_STARTED_AT=""
+RSYNC_EXIT_CODE=0
+LOCK_FD=""
+LOCK_MODE=""
+LOCK_PATH=""
+LOCK_OWNER_FILE=""
+
+CHECKSUM_SAMPLE_COUNT=16
+CHECKSUM_SAMPLE_MAX_BYTES=16777216
 
 declare -a POSITIONAL_ARGS=()
 declare -a TEMP_FILES=()
 declare -a INCLUDE_RULES=()
+declare -a INCLUDE_ANCHORS=()
+declare -a EXCLUDE_FILES=()
 declare -a EXCLUDE_RULES=()
 declare -a TRANSFER_PATHS=()
 declare -a EXPECTED_PATHS=()
-declare -a INCLUDE_ANCHORS=()
 declare -a SIZE_REPORT_ENTRIES=()
+declare -a RUN_WARNINGS=()
+declare -a COLLECTOR_MODES=()
+declare -a COLLECTOR_NAMES=()
+declare -a COLLECTOR_COMMANDS=()
+declare -a COLLECTOR_STATUSES=()
+declare -a COLLECTOR_EXIT_CODES=()
+declare -a COLLECTOR_STARTED_AT=()
+declare -a COLLECTOR_ENDED_AT=()
+
 SIZE_REPORT_TOTAL=0
 SIZE_REPORT_READY=0
-COLOR_ENABLED=0
-COLOR_RESET=$'\033[0m'
-COLOR_BOLD=$'\033[1m'
-COLOR_RED=$'\033[31m'
-COLOR_GREEN=$'\033[32m'
-COLOR_YELLOW=$'\033[33m'
-COLOR_BLUE=$'\033[34m'
-COLOR_MAGENTA=$'\033[35m'
-COLOR_CYAN=$'\033[36m'
-
-cleanup() {
-  local path
-
-  cleanup_manual_stage_dir
-
-  for path in "${TEMP_FILES[@]}"; do
-    [[ -n "$path" && -e "$path" ]] && rm -f -- "$path"
-  done
-  return 0
-}
-
-handle_interrupt() {
-  cleanup
-  exit 130
-}
-
-trap cleanup EXIT
-trap handle_interrupt INT TERM
-
-init_colors() {
-  if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
-    COLOR_ENABLED=1
-  fi
-}
-
-print_colored_line() {
-  local color="$1"
-  local message="$2"
-
-  if [[ "$COLOR_ENABLED" -eq 1 ]]; then
-    printf '%b%s%b\n' "$color" "$message" "$COLOR_RESET"
-  else
-    printf '%s\n' "$message"
-  fi
-}
-
-print_heading() {
-  print_colored_line "${COLOR_BOLD}${COLOR_BLUE}" "$1"
-}
-
-print_label_value() {
-  local label="$1"
-  local value="$2"
-
-  if [[ "$COLOR_ENABLED" -eq 1 ]]; then
-    printf '%b%s%b %s\n' "${COLOR_BOLD}${COLOR_CYAN}" "$label" "$COLOR_RESET" "$value"
-  else
-    printf '%s %s\n' "$label" "$value"
-  fi
-}
-
-print_status_line() {
-  local color="$1"
-  local message="$2"
-
-  print_colored_line "$color" "$message"
-}
-
-console_log_line() {
-  local message="$1"
-
-  case "$message" in
-    "Backup finished successfully"*)
-      print_status_line "$COLOR_GREEN" "$message"
-      ;;
-    "Backup finished with warnings"*)
-      print_status_line "$COLOR_YELLOW" "$message"
-      ;;
-    "Backup mode:"*|"Expected behavior:"*)
-      print_status_line "$COLOR_MAGENTA" "$message"
-      ;;
-    "Rules file:"*|"Destination:"*|"Snapshot:"*|"Estimated source size:"*|"Available destination space:"*|"Manual staging directory:"*|"Previous snapshot for link-dest:"*|"Log file:"*|"Mode:"*)
-      print_status_line "$COLOR_CYAN" "$message"
-      ;;
-    *)
-      printf '%s\n' "$message"
-      ;;
-  esac
-}
 
 usage() {
-  cat <<EOF2
+  cat <<EOF
 Usage:
   $SCRIPT_NAME [global-options] <command> [command-options]
 
 Commands:
-  plan       Show included rules, excluded rules, resolved backup paths, and manual tasks
-  manual     Show the manual pre-backup checklist
-  run        Create a new timestamped snapshot with rsync
-  list       Show available snapshots in the destination
-  verify     Validate a snapshot and report basic size and file counts
-  restore    Restore a full snapshot or one path to a chosen destination
+  plan       Show profile, excludes, resolved roots, collectors, and retention
+  manual     Walk through the manual pre-backup checklist
+  run        Create a timestamped rsync snapshot
+  list       List finalized snapshots and their status
+  verify     Validate a snapshot; add --deep for recorded checksums
+  restore    Restore a full snapshot or one absolute path
+  prune      Preview retention candidates; add --yes to delete
+  drill      Restore one path to a temporary directory and compare it
   help       Show this help text
 
 Global options:
-  --dest PATH         Backup destination root
-  --config-file PATH  Rules file path (default: $DEFAULT_RULES_FILE)
-  --manual-file PATH  Manual checklist path (default: $DEFAULT_MANUAL_FILE)
-  --dry-run           Preview write-capable actions without changing files
-  --verbose           Show detailed rsync output
-  --yes               Skip confirmation prompts where supported
-  --ignore-errors     Continue on rsync and validation errors where practical
-  --log-file PATH     Explicit log file path
-  -h, --help          Show help
+  --dest PATH             Backup destination root
+  --config-file PATH      Profile config (default: $DEFAULT_PROFILE_FILE)
+  --manual-file PATH      Manual checklist (default: $DEFAULT_MANUAL_FILE)
+  --collectors-file PATH  Collector config (default: $DEFAULT_COLLECTORS_FILE)
+  --retention-file PATH   Retention config (default: $DEFAULT_RETENTION_FILE)
+  --dry-run               Preview write-capable work
+  --verbose               Show detailed command output
+  --yes                   Confirm real run, restore, or prune operations
+  --ignore-errors         Finish diagnostics but preserve a failing exit code
+  --log-file PATH         Explicit run log path
+  -h, --help              Show help
 
 Command options:
-  verify [SNAPSHOT]
-  verify --snapshot SNAPSHOT
+  verify [SNAPSHOT] [--deep]
+  restore SNAPSHOT --restore-to PATH [--path ABSOLUTE_PATH] [--yes]
+  prune [--keep-last N] [--yes]
+  drill SNAPSHOT --path ABSOLUTE_PATH [--dry-run]
 
-  restore [SNAPSHOT]
-  restore --snapshot SNAPSHOT
-  restore --path /home/home/.dotfiles
-  restore --restore-to PATH
+Profile format:
+  include=/home/home/my-files
+  exclude_file=../excludes/common.exclude
 
-Rules file format:
-  # comment
-  /home/home/my-files               include path or pattern
-  /home/home/Downloads/*.txt        include only matching files
-  !/home/home/Desktop/temp          exclude path or pattern
-
-Examples:
-  $SCRIPT_NAME --dest /media/home/backup-drive plan
-  $SCRIPT_NAME --config-file ./backup-home.rules --dest /media/home/backup-drive run --dry-run
-  $SCRIPT_NAME --dest /media/home/backup-drive list
-  $SCRIPT_NAME --dest /media/home/backup-drive verify 2026-04-07_12-00-00
-  $SCRIPT_NAME --dest /media/home/backup-drive restore 2026-04-07_12-00-00 --path /home/home/.dotfiles --restore-to /tmp/restore-dotfiles
-  $SCRIPT_NAME manual
-EOF2
+Collector format:
+  required|system-inventory|builtin:system-inventory
+  optional|repository-export|/absolute/path/to/wrapper
+EOF
 }
 
 die() {
-  if [[ "$COLOR_ENABLED" -eq 1 && -t 2 ]]; then
-    printf '%bError:%b %s\n' "${COLOR_BOLD}${COLOR_RED}" "$COLOR_RESET" "$*" >&2
-  else
-    printf 'Error: %s\n' "$*" >&2
-  fi
+  printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
+die_with_code() {
+  local code="$1"
+  shift
+  printf 'Error: %s\n' "$*" >&2
+  exit "$code"
+}
+
 warn() {
-  if [[ "$COLOR_ENABLED" -eq 1 && -t 2 ]]; then
-    printf '%bWarning:%b %s\n' "${COLOR_BOLD}${COLOR_YELLOW}" "$COLOR_RESET" "$*" >&2
-  else
-    printf 'Warning: %s\n' "$*" >&2
-  fi
+  printf 'Warning: %s\n' "$*" >&2
 }
 
 log_line() {
   local message="$1"
-  console_log_line "$message"
+  printf '%s\n' "$message"
   if [[ -n "$ACTIVE_LOG_FILE" ]]; then
     printf '%s\n' "$message" >>"$ACTIVE_LOG_FILE"
   fi
@@ -208,11 +140,18 @@ warn_line() {
   fi
 }
 
-require_commands() {
-  local cmd
-  for cmd in rsync find du df date mkdir mktemp readlink sort wc awk sed dirname cat tr; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
-  done
+record_warning() {
+  local message="$1"
+  RUN_WARNINGS+=("$message")
+  warn_line "$message"
+}
+
+print_heading() {
+  printf '%s\n' "$1"
+}
+
+print_label_value() {
+  printf '%s %s\n' "$1" "$2"
 }
 
 trim_whitespace() {
@@ -222,7 +161,7 @@ trim_whitespace() {
   printf '%s' "$value"
 }
 
-normalize_rule_line() {
+normalize_config_line() {
   local line="$1"
   line="$(printf '%s\n' "$line" | sed -E 's/[[:space:]]+#.*$//')"
   line="$(trim_whitespace "$line")"
@@ -233,16 +172,221 @@ normalize_rule_line() {
   fi
 }
 
+reject_control_characters() {
+  local value="$1"
+  local label="$2"
+  [[ "$value" != *$'\t'* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "$label contains unsupported control characters"
+}
+
 timestamp_now() {
   date '+%Y-%m-%d_%H-%M-%S'
+}
+
+iso_now() {
+  date --iso-8601=seconds
 }
 
 canonicalize_path() {
   readlink -m -- "$1"
 }
 
-is_absolute_rule() {
-  [[ "$1" == /* ]]
+require_commands() {
+  local command_name
+  for command_name in "$@"; do
+    command -v "$command_name" >/dev/null 2>&1 || die "Missing required command: $command_name"
+  done
+}
+
+cleanup_temp_files() {
+  local path
+  for path in "${TEMP_FILES[@]}"; do
+    [[ -n "$path" && -f "$path" ]] && rm -f -- "$path"
+  done
+  TEMP_FILES=()
+}
+
+safe_remove_tree() {
+  local path="$1"
+  [[ -n "$path" && "$path" != "/" ]] || return 0
+
+  case "$path" in
+    "${TMPDIR:-/tmp}"/backup-home-stage.*)
+      rm -rf --one-file-system -- "$path"
+      ;;
+    */snapshots/.incomplete-*)
+      rm -rf --one-file-system -- "$path"
+      ;;
+    *)
+      warn "Refusing to clean unexpected temporary path: $path"
+      return 1
+      ;;
+  esac
+}
+
+cleanup_run_data() {
+  if [[ -n "$RUN_STAGE_DIR" && -e "$RUN_STAGE_DIR" ]]; then
+    safe_remove_tree "$RUN_STAGE_DIR" || true
+  fi
+  RUN_STAGE_DIR=""
+
+  if [[ -n "$INCOMPLETE_SNAPSHOT_DIR" && -e "$INCOMPLETE_SNAPSHOT_DIR" ]]; then
+    safe_remove_tree "$INCOMPLETE_SNAPSHOT_DIR" || true
+  fi
+  INCOMPLETE_SNAPSHOT_DIR=""
+}
+
+release_lock() {
+  if [[ -n "$LOCK_FD" ]]; then
+    if [[ "$LOCK_MODE" == "exclusive" && -n "$LOCK_OWNER_FILE" ]]; then
+      rm -f -- "$LOCK_OWNER_FILE" || true
+    fi
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    exec {LOCK_FD}>&-
+  fi
+  LOCK_FD=""
+  LOCK_MODE=""
+  LOCK_PATH=""
+  LOCK_OWNER_FILE=""
+}
+
+manifest_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//$'\t'/\\t}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  printf '%s' "$value"
+}
+
+write_failure_report() {
+  local message="$1"
+  local code="$2"
+  local base
+  local ended_at
+
+  [[ "$RUN_FAILURE_REPORTED" -eq 0 ]] || return 0
+  [[ -n "$DEST_ROOT_REAL" && -d "$DEST_ROOT_REAL/logs" ]] || return 0
+
+  base="$DEST_ROOT_REAL/logs/backup-home-${SNAPSHOT_NAME:-unknown}"
+  ended_at="$(iso_now)"
+  {
+    printf 'schema_version\t1\n'
+    printf 'snapshot\t%s\n' "$(manifest_escape "${SNAPSHOT_NAME:-unknown}")"
+    printf 'status\tfailed\n'
+    printf 'started_at\t%s\n' "$(manifest_escape "${RUN_STARTED_AT:-unknown}")"
+    printf 'ended_at\t%s\n' "$(manifest_escape "$ended_at")"
+    printf 'exit_code\t%s\n' "$code"
+    printf 'message\t%s\n' "$(manifest_escape "$message")"
+  } >"$base.failure.tsv"
+  {
+    printf 'Backup run failed\n\n'
+    printf 'Snapshot: %s\n' "${SNAPSHOT_NAME:-unknown}"
+    printf 'Started: %s\n' "${RUN_STARTED_AT:-unknown}"
+    printf 'Ended: %s\n' "$ended_at"
+    printf 'Exit code: %s\n' "$code"
+    printf 'Reason: %s\n' "$message"
+  } >"$base.failure.txt"
+  RUN_FAILURE_REPORTED=1
+}
+
+write_log_footer() {
+  local status="$1"
+  [[ -n "$ACTIVE_LOG_FILE" ]] || return 0
+  {
+    printf '\nend=%s\n' "$(iso_now)"
+    printf 'status=%s\n' "$status"
+  } >>"$ACTIVE_LOG_FILE"
+}
+
+cleanup() {
+  local code=$?
+  trap - EXIT
+  set +e
+  if [[ "$code" -ne 0 && "$RUN_ACTIVE" -eq 1 ]]; then
+    write_failure_report "Run aborted before completion" "$code"
+    write_log_footer "failed"
+  fi
+  cleanup_run_data
+  cleanup_temp_files
+  release_lock
+  exit "$code"
+}
+
+handle_interrupt() {
+  exit 130
+}
+
+trap cleanup EXIT
+trap handle_interrupt INT TERM
+
+parse_profile_file() {
+  local line
+  local key
+  local value
+  local profile_dir
+  local exclude_path
+
+  [[ -f "$PROFILE_FILE" ]] || die "Profile file not found: $PROFILE_FILE"
+  PROFILE_FILE="$(canonicalize_path "$PROFILE_FILE")"
+  profile_dir="$(dirname "$PROFILE_FILE")"
+  INCLUDE_RULES=()
+  INCLUDE_ANCHORS=()
+  EXCLUDE_FILES=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(normalize_config_line "$line")"
+    [[ -n "$line" ]] || continue
+    [[ "$line" == *=* ]] || die "Invalid profile entry: $line"
+    key="$(trim_whitespace "${line%%=*}")"
+    value="$(trim_whitespace "${line#*=}")"
+    [[ -n "$value" ]] || die "Profile value is empty for key: $key"
+    reject_control_characters "$value" "Profile value"
+
+    case "$key" in
+      include)
+        [[ "$value" == /* ]] || die "Include values must be absolute: $value"
+        [[ "$value" != "/" ]] || die "Include path / is not allowed"
+        INCLUDE_RULES+=("${value%/}")
+        ;;
+      exclude_file)
+        if [[ "$value" == /* ]]; then
+          exclude_path="$(canonicalize_path "$value")"
+        else
+          exclude_path="$(canonicalize_path "$profile_dir/$value")"
+        fi
+        EXCLUDE_FILES+=("$exclude_path")
+        ;;
+      *)
+        die "Unknown profile key: $key"
+        ;;
+    esac
+  done <"$PROFILE_FILE"
+
+  [[ "${#INCLUDE_RULES[@]}" -gt 0 ]] || die "Profile has no include entries: $PROFILE_FILE"
+  [[ "${#EXCLUDE_FILES[@]}" -gt 0 ]] || die "Profile has no exclude_file entries: $PROFILE_FILE"
+}
+
+parse_exclude_files() {
+  local exclude_file
+  local line
+
+  EXCLUDE_RULES=()
+  for exclude_file in "${EXCLUDE_FILES[@]}"; do
+    [[ -f "$exclude_file" ]] || die "Exclude file not found: $exclude_file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(normalize_config_line "$line")"
+      [[ -n "$line" ]] || continue
+      [[ "$line" != '!'* ]] || die "Exclude entries must not start with !: $line"
+      [[ "$line" != "/" ]] || die "Exclude path / is not allowed"
+      reject_control_characters "$line" "Exclude entry"
+      EXCLUDE_RULES+=("${line%/}")
+    done <"$exclude_file"
+  done
+
+  if [[ "${#EXCLUDE_RULES[@]}" -gt 0 ]]; then
+    mapfile -t EXCLUDE_RULES < <(printf '%s\n' "${EXCLUDE_RULES[@]}" | awk 'NF && !seen[$0]++')
+  fi
 }
 
 has_glob_pattern() {
@@ -262,7 +406,6 @@ rule_anchor() {
   prefix="$(printf '%s\n' "$rule" | sed -E 's/[*?\[].*$//')"
   prefix="${prefix%/}"
   [[ -n "$prefix" ]] || return 0
-
   if [[ -e "$prefix" ]]; then
     printf '%s\n' "$prefix"
   else
@@ -270,38 +413,18 @@ rule_anchor() {
   fi
 }
 
-ensure_rules_file() {
-  [[ -f "$RULES_FILE" ]] || die "Rules file not found: $RULES_FILE"
+populate_include_anchors() {
+  local rule
+  local anchor
+  INCLUDE_ANCHORS=()
+  for rule in "${INCLUDE_RULES[@]}"; do
+    anchor="$(rule_anchor "$rule")"
+    [[ -n "$anchor" ]] && INCLUDE_ANCHORS+=("$(canonicalize_path "$anchor")")
+  done
 }
 
-parse_rules_file() {
-  local line
-  local rule
-
-  INCLUDE_RULES=()
-  EXCLUDE_RULES=()
-  INCLUDE_ANCHORS=()
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="$(normalize_rule_line "$line")"
-    [[ -z "$line" ]] && continue
-
-    if [[ "$line" == '!'* ]]; then
-      rule="$(trim_whitespace "${line:1}")"
-      [[ -n "$rule" ]] || die "Exclude rule is empty"
-      [[ "$rule" != "/" ]] || die "Exclude rule / is not allowed"
-      EXCLUDE_RULES+=("${rule%/}")
-    else
-      rule="$(trim_whitespace "$line")"
-      [[ "$rule" == /* ]] || die "Include rules must be absolute paths or patterns: $rule"
-      [[ "$rule" != "/" ]] || die "Include rule / is not allowed"
-      INCLUDE_RULES+=("${rule%/}")
-      rule="$(rule_anchor "$rule")"
-      [[ -n "$rule" ]] && INCLUDE_ANCHORS+=("$(canonicalize_path "$rule")")
-    fi
-  done <"$RULES_FILE"
-
-  [[ "${#INCLUDE_RULES[@]}" -gt 0 ]] || die "Rules file has no include rules: $RULES_FILE"
+is_absolute_rule() {
+  [[ "$1" == /* ]]
 }
 
 matches_exclude_rule() {
@@ -312,6 +435,7 @@ matches_exclude_rule() {
 
   if is_absolute_rule "$rule"; then
     if has_glob_pattern "$rule"; then
+      # shellcheck disable=SC2053 # The configured rule is intentionally a glob.
       [[ "$path" == $rule ]]
     else
       [[ "$path" == "$rule" || "$path" == "$rule"/* ]]
@@ -320,10 +444,10 @@ matches_exclude_rule() {
   fi
 
   relative_path="${path#/}"
-
   if has_glob_pattern "$rule"; then
     suffix="$relative_path"
     while :; do
+      # shellcheck disable=SC2053 # The configured rule is intentionally a glob.
       if [[ "$suffix" == $rule || "$suffix" == $rule/* ]]; then
         return 0
       fi
@@ -333,58 +457,54 @@ matches_exclude_rule() {
     return 1
   fi
 
-  [[ "$relative_path" == "$rule" || "$relative_path" == "$rule"/* || "$relative_path" == */"$rule" || "$relative_path" == */"$rule"/* ]]
+  [[ "$relative_path" == "$rule" || "$relative_path" == "$rule"/* || \
+     "$relative_path" == */"$rule" || "$relative_path" == */"$rule"/* ]]
 }
 
 is_excluded_path() {
   local path="$1"
   local rule
-
   for rule in "${EXCLUDE_RULES[@]}"; do
-    if matches_exclude_rule "$path" "$rule"; then
-      return 0
-    fi
+    matches_exclude_rule "$path" "$rule" && return 0
   done
-
   return 1
 }
 
 expand_include_rule() {
   local rule="$1"
-  local old_settings
+  local nullglob_was_set=0
+  local dotglob_was_set=0
+  local globstar_was_set=0
   local match
 
   if ! has_glob_pattern "$rule"; then
     if [[ -e "$rule" ]]; then
       printf '%s\n' "$(canonicalize_path "$rule")"
-    else
-      warn "Skipping missing include path: $rule"
     fi
     return 0
   fi
 
-  old_settings="$(shopt -p nullglob dotglob globstar)"
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -q dotglob && dotglob_was_set=1
+  shopt -q globstar && globstar_was_set=1
   shopt -s nullglob dotglob globstar
-
   while IFS= read -r match; do
     [[ -n "$match" ]] && printf '%s\n' "$(canonicalize_path "$match")"
   done < <(compgen -G "$rule" || true)
-
-  eval "$old_settings"
+  [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
+  [[ "$dotglob_was_set" -eq 1 ]] || shopt -u dotglob
+  [[ "$globstar_was_set" -eq 1 ]] || shopt -u globstar
 }
 
 minimize_paths() {
   local path
   local kept
   local skip
-  local -a input=("$@")
   local -a ordered=()
   local -a minimal=()
+  local -a input=("$@")
 
-  if [[ "${#input[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
+  [[ "${#input[@]}" -gt 0 ]] || return 0
   mapfile -t ordered < <(
     printf '%s\n' "${input[@]}" \
       | awk 'NF && !seen[$0]++ { print }' \
@@ -403,44 +523,38 @@ minimize_paths() {
     done
     [[ "$skip" -eq 0 ]] && minimal+=("$path")
   done
-
   printf '%s\n' "${minimal[@]}"
 }
 
 resolve_transfer_paths() {
   local rule
   local candidate
+  local matched_count
   local -a raw_paths=()
   local -a raw_expected=()
-  local matched_count
 
+  RUN_WARNINGS=()
   for rule in "${INCLUDE_RULES[@]}"; do
     candidate="$(rule_anchor "$rule")"
     if [[ -n "$candidate" ]]; then
       candidate="$(canonicalize_path "$candidate")"
-      if [[ -e "$candidate" ]]; then
-        raw_expected+=("$candidate")
-      fi
+      [[ -e "$candidate" ]] && raw_expected+=("$candidate")
     fi
 
     matched_count=0
-
     while IFS= read -r candidate; do
       [[ -n "$candidate" ]] || continue
       matched_count=1
-      if is_excluded_path "$candidate"; then
-        continue
-      fi
+      is_excluded_path "$candidate" && continue
       raw_paths+=("$candidate")
     done < <(expand_include_rule "$rule")
 
     if [[ "$matched_count" -eq 0 ]]; then
-      warn_line "No existing path matched include rule: $rule"
+      record_warning "No existing path matched include entry: $rule"
     fi
   done
 
-  [[ "${#raw_paths[@]}" -gt 0 ]] || die "No paths matched the include rules in $RULES_FILE"
-
+  [[ "${#raw_paths[@]}" -gt 0 ]] || die "No paths matched profile includes: $PROFILE_FILE"
   mapfile -t TRANSFER_PATHS < <(minimize_paths "${raw_paths[@]}")
   mapfile -t EXPECTED_PATHS < <(minimize_paths "${raw_expected[@]}")
   SIZE_REPORT_ENTRIES=()
@@ -448,50 +562,49 @@ resolve_transfer_paths() {
   SIZE_REPORT_READY=0
 }
 
+load_backup_selection() {
+  parse_profile_file
+  parse_exclude_files
+  populate_include_anchors
+  resolve_transfer_paths
+}
+
 ensure_dest_required() {
   [[ -n "$DEST_ROOT" ]] || die "--dest is required for the $COMMAND command"
 }
 
 ensure_safe_destination() {
-  [[ -n "$DEST_ROOT" ]] || return 0
-
+  ensure_dest_required
   DEST_ROOT_REAL="$(canonicalize_path "$DEST_ROOT")"
-
   case "$DEST_ROOT_REAL" in
-    /)
-      die "Destination / is not allowed"
+    /|/home/home)
+      die "Dangerous backup destination is not allowed: $DEST_ROOT_REAL"
       ;;
   esac
 }
 
 ensure_dest_access() {
-  local create_mode="$1"
-  local parent_dir
-
-  ensure_dest_required
+  local mode="$1"
+  local parent
   ensure_safe_destination
 
   if [[ -d "$DEST_ROOT_REAL" ]]; then
     return 0
   fi
-
-  if [[ "$create_mode" == "create" && "$DRY_RUN" -eq 0 ]]; then
-    mkdir -p -- "$DEST_ROOT_REAL" || die "Could not create destination root: $DEST_ROOT_REAL"
-    return 0
+  parent="$(dirname "$DEST_ROOT_REAL")"
+  [[ -d "$parent" ]] || die "Destination parent does not exist: $parent"
+  [[ -w "$parent" ]] || die "Destination parent is not writable: $parent"
+  if [[ "$mode" == "create" ]]; then
+    mkdir -p -- "$DEST_ROOT_REAL"
   fi
-
-  parent_dir="$(dirname "$DEST_ROOT_REAL")"
-  [[ -d "$parent_dir" ]] || die "Destination parent does not exist: $parent_dir"
-  [[ -w "$parent_dir" ]] || die "Destination parent is not writable: $parent_dir"
 }
 
 ensure_dest_not_inside_sources() {
   local anchor
-
   for anchor in "${INCLUDE_ANCHORS[@]}"; do
     case "$DEST_ROOT_REAL" in
       "$anchor"|"$anchor"/*)
-        die "Destination must not be inside a configured source path: $anchor"
+        die "Destination must not be inside a configured source: $anchor"
         ;;
     esac
   done
@@ -505,15 +618,27 @@ logs_root_dir() {
   printf '%s\n' "$DEST_ROOT_REAL/logs"
 }
 
+state_root_dir() {
+  printf '%s\n' "$DEST_ROOT_REAL/.backup-home"
+}
+
 snapshot_path_for() {
   printf '%s\n' "$(snapshot_root_dir)/$1"
+}
+
+validate_snapshot_name() {
+  local name="$1"
+  [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] \
+    || die "Invalid snapshot name: $name"
 }
 
 list_snapshot_names() {
   local root
   root="$(snapshot_root_dir)"
   [[ -d "$root" ]] || return 0
-  find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+  find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+    | awk '/^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$/' \
+    | sort
 }
 
 latest_snapshot_name() {
@@ -522,108 +647,74 @@ latest_snapshot_name() {
 
 resolve_snapshot_name() {
   local resolved="$SNAPSHOT_NAME"
-  local latest=""
-  local snapshots_root
-
   if [[ -z "$resolved" ]]; then
-    latest="$(latest_snapshot_name || true)"
-    resolved="$latest"
+    resolved="$(latest_snapshot_name || true)"
   fi
-
-  if [[ -z "$resolved" ]]; then
-    snapshots_root="$(snapshot_root_dir)"
-    die "No snapshots found under $snapshots_root. Create a backup first or pass an existing snapshot name."
-  fi
-
+  [[ -n "$resolved" ]] || die "No finalized snapshots found under $(snapshot_root_dir)"
+  validate_snapshot_name "$resolved"
   printf '%s\n' "$resolved"
+}
+
+acquire_lock() {
+  local mode="$1"
+  local state_dir
+  local flock_mode
+  local owner=""
+
+  [[ -z "$LOCK_FD" ]] || return 0
+  state_dir="$(state_root_dir)"
+  if [[ "$mode" == "shared" && ! -d "$state_dir" ]]; then
+    return 0
+  fi
+  mkdir -p -- "$state_dir"
+  LOCK_PATH="$state_dir/run.lock"
+  LOCK_OWNER_FILE="$state_dir/lock-owner.tsv"
+  exec {LOCK_FD}<>"$LOCK_PATH"
+
+  flock_mode="-s"
+  [[ "$mode" == "exclusive" ]] && flock_mode="-x"
+  if ! flock -n -E 75 "$flock_mode" "$LOCK_FD"; then
+    [[ -f "$LOCK_OWNER_FILE" ]] && owner="$(tr '\n' ' ' <"$LOCK_OWNER_FILE")"
+    if [[ -n "$owner" ]]; then
+      die_with_code 75 "Destination lock is busy: $LOCK_PATH ($owner)"
+    fi
+    die_with_code 75 "Destination lock is busy: $LOCK_PATH"
+  fi
+
+  LOCK_MODE="$mode"
+  if [[ "$mode" == "exclusive" ]]; then
+    {
+      printf 'pid\t%s\n' "$$"
+      printf 'command\t%s\n' "$COMMAND"
+      printf 'hostname\t%s\n' "$(hostname)"
+      printf 'started_at\t%s\n' "$(iso_now)"
+      printf 'destination\t%s\n' "$DEST_ROOT_REAL"
+    } >"$LOCK_OWNER_FILE"
+  fi
 }
 
 build_size_report() {
   local path
   local size
   local rule
-  local -a du_cmd=()
-
+  local -a command_line=()
   [[ "$SIZE_REPORT_READY" -eq 0 ]] || return 0
 
   SIZE_REPORT_ENTRIES=()
   SIZE_REPORT_TOTAL=0
-
   for path in "${TRANSFER_PATHS[@]}"; do
     [[ -e "$path" ]] || continue
-
-    du_cmd=(du -sb)
+    command_line=(du -sb)
     for rule in "${EXCLUDE_RULES[@]}"; do
-      du_cmd+=(--exclude="$rule")
+      command_line+=(--exclude="$rule")
     done
-    du_cmd+=(-- "$path")
-
-    size="$("${du_cmd[@]}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    command_line+=(-- "$path")
+    size="$("${command_line[@]}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
     [[ -n "$size" ]] || size=0
     SIZE_REPORT_TOTAL=$((SIZE_REPORT_TOTAL + size))
     SIZE_REPORT_ENTRIES+=("$size|$path")
   done
-
   SIZE_REPORT_READY=1
-}
-
-estimate_source_bytes() {
-  build_size_report
-  printf '%s\n' "$SIZE_REPORT_TOTAL"
-}
-
-size_report_rows() {
-  build_size_report
-
-  if [[ "${#SIZE_REPORT_ENTRIES[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  printf '%s\n' "${SIZE_REPORT_ENTRIES[@]}" | sort -t'|' -k1,1nr -k2,2
-}
-
-show_transfer_size_report() {
-  local size
-  local path
-  local found=0
-
-  print_heading "Estimated size by backup root:"
-  while IFS='|' read -r size path; do
-    [[ -n "$path" ]] || continue
-    printf '  - %8s  %s\n' "$(format_bytes_human "$size")" "$path"
-    found=1
-  done < <(size_report_rows)
-
-  if [[ "$found" -eq 0 ]]; then
-    printf '  - none\n'
-  fi
-}
-
-log_transfer_size_report() {
-  local source
-  local size
-  local found=0
-
-  log_line "Estimated size by backup root:"
-  while IFS='|' read -r size source; do
-    [[ -n "$source" ]] || continue
-    log_line "  - $(format_bytes_human "$size")  $source"
-    found=1
-  done < <(size_report_rows)
-
-  if [[ "$found" -eq 0 ]]; then
-    log_line "  - none"
-  fi
-}
-
-available_dest_bytes() {
-  local target="$DEST_ROOT_REAL"
-
-  while [[ ! -e "$target" && "$target" != "/" ]]; do
-    target="$(dirname "$target")"
-  done
-
-  df -B1 --output=avail "$target" | awk 'NR==2 {print $1}'
 }
 
 format_bytes_human() {
@@ -632,25 +723,43 @@ format_bytes_human() {
     function human(x) {
       split("B KiB MiB GiB TiB PiB", units, " ")
       i = 1
-      while (x >= 1024 && i < 6) {
-        x /= 1024
-        i++
-      }
+      while (x >= 1024 && i < 6) { x /= 1024; i++ }
       return sprintf("%.2f %s", x, units[i])
     }
-    BEGIN {
-      print human(bytes + 0)
-    }
+    BEGIN { print human(bytes + 0) }
   '
+}
+
+show_size_report() {
+  local entry
+  local size
+  local path
+  build_size_report
+  print_heading "Estimated size by backup root:"
+  if [[ "${#SIZE_REPORT_ENTRIES[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+    return 0
+  fi
+  while IFS= read -r entry; do
+    size="${entry%%|*}"
+    path="${entry#*|}"
+    printf '  - %8s  %s\n' "$(format_bytes_human "$size")" "$path"
+  done < <(printf '%s\n' "${SIZE_REPORT_ENTRIES[@]}" | sort -t'|' -k1,1nr -k2,2)
+}
+
+available_dest_bytes() {
+  local target="$DEST_ROOT_REAL"
+  while [[ ! -e "$target" && "$target" != "/" ]]; do
+    target="$(dirname "$target")"
+  done
+  df -B1 --output=avail "$target" | awk 'NR==2 {print $1}'
 }
 
 build_exclude_file() {
   local temp_file
   local rule
-
   temp_file="$(mktemp)"
   TEMP_FILES+=("$temp_file")
-
   for rule in "${EXCLUDE_RULES[@]}"; do
     if is_absolute_rule "$rule"; then
       printf '%s\n' "${rule#/}" >>"$temp_file"
@@ -661,30 +770,7 @@ build_exclude_file() {
       printf '**/%s/***\n' "$rule" >>"$temp_file"
     fi
   done
-
   printf '%s\n' "$temp_file"
-}
-
-write_log_header() {
-  [[ -n "$ACTIVE_LOG_FILE" ]] || return 0
-  {
-    printf 'command=%s\n' "$COMMAND"
-    printf 'rules_file=%s\n' "$RULES_FILE"
-    printf 'dest=%s\n' "$DEST_ROOT_REAL"
-    printf 'start=%s\n' "$(date --iso-8601=seconds)"
-    [[ -n "$SNAPSHOT_NAME" ]] && printf 'snapshot=%s\n' "$SNAPSHOT_NAME"
-    printf '\n'
-  } >>"$ACTIVE_LOG_FILE"
-}
-
-write_log_footer() {
-  local status="$1"
-  [[ -n "$ACTIVE_LOG_FILE" ]] || return 0
-  {
-    printf '\n'
-    printf 'end=%s\n' "$(date --iso-8601=seconds)"
-    printf 'status=%s\n' "$status"
-  } >>"$ACTIVE_LOG_FILE"
 }
 
 run_command_logged() {
@@ -694,101 +780,34 @@ run_command_logged() {
     else
       "$@"
     fi
+  elif [[ -n "$ACTIVE_LOG_FILE" ]]; then
+    "$@" >>"$ACTIVE_LOG_FILE" 2>&1
   else
-    if [[ -n "$ACTIVE_LOG_FILE" ]]; then
-      "$@" >>"$ACTIVE_LOG_FILE" 2>&1
-    else
-      "$@"
-    fi
+    "$@"
   fi
-}
-
-run_command_logged_ignoreable() {
-  if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
-    set +e
-    run_command_logged "$@"
-    local rc=$?
-    set -e
-    return "$rc"
-  fi
-
-  run_command_logged "$@"
-}
-
-confirm_or_exit() {
-  local prompt="$1"
-  local reply
-
-  [[ "$ASSUME_YES" -eq 1 ]] && return 0
-
-  if [[ "$COLOR_ENABLED" -eq 1 ]]; then
-    printf '%b%s%b [y/N]: ' "${COLOR_BOLD}${COLOR_YELLOW}" "$prompt" "$COLOR_RESET"
-  else
-    printf '%s [y/N]: ' "$prompt"
-  fi
-  read -r reply
-  case "$reply" in
-    y|Y|yes|YES)
-      return 0
-      ;;
-    *)
-      die "Operation cancelled"
-      ;;
-  esac
 }
 
 rsync_backup() {
   local exclude_file="$1"
   local destination_dir="$2"
   local link_dest_dir="${3:-}"
-
-  local -a cmd=(
-    rsync
-    --archive
-    --hard-links
-    --human-readable
-    --relative
+  local -a command_line=(
+    rsync --archive --hard-links --human-readable --relative --mkpath
     --exclude-from="$exclude_file"
   )
-
-  [[ "$DRY_RUN" -eq 1 ]] && cmd+=(--dry-run)
-  [[ "$VERBOSE" -eq 1 ]] && cmd+=(--info=progress2 --itemize-changes)
-  [[ -n "$link_dest_dir" ]] && cmd+=(--link-dest="$link_dest_dir")
-
-  cmd+=("${TRANSFER_PATHS[@]}" "$destination_dir/")
-
-  run_command_logged_ignoreable "${cmd[@]}"
-}
-
-rsync_restore() {
-  local source_path="$1"
-  local destination_path="$2"
-
-  local -a cmd=(
-    rsync
-    --archive
-    --hard-links
-    --human-readable
-    --mkpath
-  )
-
-  [[ "$DRY_RUN" -eq 1 ]] && cmd+=(--dry-run)
-  [[ "$VERBOSE" -eq 1 ]] && cmd+=(--info=progress2 --itemize-changes)
-
-  cmd+=("$source_path" "$destination_path/")
-
-  run_command_logged "${cmd[@]}"
+  [[ "$DRY_RUN" -eq 1 ]] && command_line+=(--dry-run)
+  [[ "$VERBOSE" -eq 1 ]] && command_line+=(--info=progress2 --itemize-changes)
+  [[ -n "$link_dest_dir" ]] && command_line+=(--link-dest="$link_dest_dir")
+  command_line+=("${TRANSFER_PATHS[@]}" "$destination_dir/")
+  run_command_logged "${command_line[@]}"
 }
 
 manual_items() {
   local line
-
   [[ -f "$MANUAL_FILE" ]] || return 0
-
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="$(normalize_rule_line "$line")"
-    [[ -z "$line" ]] && continue
-    printf '%s\n' "$line"
+    line="$(normalize_config_line "$line")"
+    [[ -n "$line" ]] && printf '%s\n' "$line"
   done <"$MANUAL_FILE"
 }
 
@@ -796,613 +815,1096 @@ parse_manual_entry() {
   local raw="$1"
   local title
   local description=""
-
-  if [[ "$raw" == *"|"* ]]; then
+  if [[ "$raw" == *'|'* ]]; then
     title="$(trim_whitespace "${raw%%|*}")"
     description="$(trim_whitespace "${raw#*|}")"
   else
     title="$(trim_whitespace "$raw")"
   fi
-
   [[ -n "$title" ]] || return 1
   printf '%s\t%s\n' "$title" "$description"
 }
 
 manual_entries() {
-  local line
-  local parsed
-
-  while IFS= read -r line; do
-    parsed="$(parse_manual_entry "$line")" || continue
-    printf '%s\n' "$parsed"
+  local item
+  while IFS= read -r item; do
+    parse_manual_entry "$item" || true
   done < <(manual_items)
 }
 
 manual_task_count() {
   local count=0
   local _
-
   while IFS= read -r _; do
     count=$((count + 1))
   done < <(manual_entries)
-
   printf '%s\n' "$count"
 }
 
-sanitize_manual_stage_name() {
+sanitize_name() {
   local value="$1"
-
   value="$(printf '%s' "$value" | tr -cs '[:alnum:].@_-' '_' | sed -E 's/^_+//; s/_+$//; s/_+/_/g')"
   [[ -n "$value" ]] || value="item"
   printf '%s\n' "$value"
 }
 
-create_manual_stage_dir() {
+prepare_manual_stage() {
+  local target_dir="$RUN_STAGE_DIR/artifacts/manual"
   local title
   local description
   local base_name
   local dir_name
   local count
+  local reply
+  local total
   declare -A used_names=()
 
-  [[ -z "$MANUAL_STAGE_DIR" ]] || return 0
-
-  MANUAL_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/backup-home-manual.${SNAPSHOT_NAME}.XXXXXX")" \
-    || die "Could not create manual staging directory"
-
+  total="$(manual_task_count)"
+  [[ "$total" -gt 0 ]] || return 0
+  [[ -t 0 ]] || die "Manual staging requires an interactive terminal for a real run"
+  mkdir -p -- "$target_dir"
   {
-    printf 'Manual backup staging for snapshot %s\n' "$SNAPSHOT_NAME"
-    printf '\n'
-    printf 'Copy files for manual checklist items into the matching folders below.\n'
-    printf 'Everything placed here will be included in this backup run.\n'
-    printf 'After a successful backup, the staging directory is removed automatically.\n'
-  } >"$MANUAL_STAGE_DIR/README.txt"
+    printf 'Manual backup artifacts for snapshot %s\n\n' "$SNAPSHOT_NAME"
+    printf 'Copy files into the matching task directories before continuing.\n'
+  } >"$target_dir/README.txt"
 
   while IFS=$'\t' read -r title description; do
-    base_name="$(sanitize_manual_stage_name "$title")"
+    base_name="$(sanitize_name "$title")"
     count="${used_names[$base_name]:-0}"
     count=$((count + 1))
     used_names["$base_name"]="$count"
-
     dir_name="$base_name"
-    if [[ "$count" -gt 1 ]]; then
-      dir_name="${base_name}-${count}"
-    fi
-
-    mkdir -p -- "$MANUAL_STAGE_DIR/$dir_name"
+    [[ "$count" -gt 1 ]] && dir_name="${base_name}-${count}"
+    mkdir -p -- "$target_dir/$dir_name"
     if [[ -n "$description" ]]; then
-      {
-        printf 'Title: %s\n' "$title"
-        printf 'Description: %s\n' "$description"
-      } >"$MANUAL_STAGE_DIR/$dir_name/task.txt"
+      printf 'Title: %s\nDescription: %s\n' "$title" "$description" >"$target_dir/$dir_name/task.txt"
     fi
   done < <(manual_entries)
-}
 
-open_manual_stage_dir() {
-  [[ -n "$MANUAL_STAGE_DIR" ]] || return 0
-
+  printf 'Manual checklist staging: %s task(s)\n' "$total"
+  printf 'Copy related files into: %s\n' "$target_dir"
   if command -v xdg-open >/dev/null 2>&1; then
-    (xdg-open "$MANUAL_STAGE_DIR" >/dev/null 2>&1 &) || true
+    (xdg-open "$target_dir" >/dev/null 2>&1 &) || true
   fi
-}
-
-attach_manual_stage_dir() {
-  [[ -n "$MANUAL_STAGE_DIR" ]] || return 0
-  [[ "$MANUAL_STAGE_ADDED" -eq 0 ]] || return 0
-
-  TRANSFER_PATHS+=("$MANUAL_STAGE_DIR")
-  mapfile -t TRANSFER_PATHS < <(minimize_paths "${TRANSFER_PATHS[@]}")
-  MANUAL_STAGE_ADDED=1
-  SIZE_REPORT_ENTRIES=()
-  SIZE_REPORT_TOTAL=0
-  SIZE_REPORT_READY=0
-}
-
-prepare_manual_stage_for_run() {
-  local reply
-  local task_total
-
-  [[ "$DRY_RUN" -eq 0 ]] || return 0
-
-  task_total="$(manual_task_count)"
-  [[ "$task_total" -gt 0 ]] || return 0
-
-  [[ -t 0 ]] || die "Manual staging requires an interactive terminal for a real backup run"
-
-  create_manual_stage_dir
-  attach_manual_stage_dir
-
-  printf '\n'
-  printf 'Manual checklist staging: %s task(s)\n' "$task_total"
-  printf 'Copy related files into: %s\n' "$MANUAL_STAGE_DIR"
-  printf 'Each task has its own folder and optional task.txt note.\n'
-  printf '\n'
-
-  open_manual_stage_dir
-  printf 'Press Enter when the manual staging folder is ready, or type q to abort: '
+  printf 'Press Enter when ready, or type q to abort: '
   read -r reply
   case "$reply" in
-    q|Q|quit|QUIT)
-      die "Backup cancelled while waiting for manual staging"
-      ;;
+    q|Q|quit|QUIT) die "Backup cancelled during manual staging" ;;
   esac
-  printf '\n'
 }
 
-cleanup_manual_stage_dir() {
-  [[ -n "$MANUAL_STAGE_DIR" ]] || return 0
+parse_collectors_file() {
+  local line
+  local mode
+  local name
+  local command_path
+  local extra
+  local existing
 
-  rm -rf -- "$MANUAL_STAGE_DIR" || warn_line "Could not remove manual staging directory: $MANUAL_STAGE_DIR"
-  MANUAL_STAGE_DIR=""
-  MANUAL_STAGE_ADDED=0
+  COLLECTOR_MODES=()
+  COLLECTOR_NAMES=()
+  COLLECTOR_COMMANDS=()
+  COLLECTOR_STATUSES=()
+  COLLECTOR_EXIT_CODES=()
+  COLLECTOR_STARTED_AT=()
+  COLLECTOR_ENDED_AT=()
+  [[ -f "$COLLECTORS_FILE" ]] || return 0
+  COLLECTORS_FILE="$(canonicalize_path "$COLLECTORS_FILE")"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(normalize_config_line "$line")"
+    [[ -n "$line" ]] || continue
+    IFS='|' read -r mode name command_path extra <<<"$line"
+    mode="$(trim_whitespace "${mode:-}")"
+    name="$(trim_whitespace "${name:-}")"
+    command_path="$(trim_whitespace "${command_path:-}")"
+    [[ -z "${extra:-}" && -n "$mode" && -n "$name" && -n "$command_path" ]] \
+      || die "Invalid collector entry: $line"
+    [[ "$mode" == "required" || "$mode" == "optional" ]] \
+      || die "Collector mode must be required or optional: $mode"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid collector name: $name"
+    for existing in "${COLLECTOR_NAMES[@]}"; do
+      [[ "$existing" != "$name" ]] || die "Duplicate collector name: $name"
+    done
+    if [[ "$command_path" == builtin:* ]]; then
+      [[ "$command_path" == "builtin:system-inventory" ]] || die "Unknown built-in collector: $command_path"
+    else
+      [[ "$command_path" == /* ]] || die "External collector must be an absolute executable: $command_path"
+      [[ -x "$command_path" ]] || die "External collector is not executable: $command_path"
+    fi
+    COLLECTOR_MODES+=("$mode")
+    COLLECTOR_NAMES+=("$name")
+    COLLECTOR_COMMANDS+=("$command_path")
+    COLLECTOR_STATUSES+=("pending")
+    COLLECTOR_EXIT_CODES+=("0")
+    COLLECTOR_STARTED_AT+=("")
+    COLLECTOR_ENDED_AT+=("")
+  done <"$COLLECTORS_FILE"
+}
+
+inventory_warning() {
+  local output_dir="$1"
+  shift
+  printf '%s\n' "$*" >>"$output_dir/warnings.txt"
+}
+
+collector_system_inventory() {
+  local output_dir="$1"
+  local user_home="${HOME:-/home/home}"
+  local crontab_temp
+  local source_path
+
+  mkdir -p -- "$output_dir"
+  [[ -f /etc/os-release ]] && cp -- /etc/os-release "$output_dir/os-release"
+  hostname >"$output_dir/hostname.txt"
+  {
+    printf 'backup-home script sha256: %s\n' "$(sha256sum "$SCRIPT_DIR/backup-home" | awk '{print $1}')"
+    printf 'bash: %s\n' "${BASH_VERSION}"
+    printf 'rsync: %s\n' "$(rsync --version | awk 'NR==1 {print $0}')"
+  } >"$output_dir/tool-versions.txt"
+
+  if command -v hostnamectl >/dev/null 2>&1; then
+    hostnamectl >"$output_dir/hostnamectl.txt" 2>/dev/null || inventory_warning "$output_dir" "hostnamectl export failed"
+  fi
+  if command -v dconf >/dev/null 2>&1; then
+    dconf dump / >"$output_dir/dconf.ini" 2>/dev/null || inventory_warning "$output_dir" "dconf export failed"
+  else
+    inventory_warning "$output_dir" "dconf is unavailable"
+  fi
+  if command -v apt-mark >/dev/null 2>&1; then
+    apt-mark showmanual 2>/dev/null | sort >"$output_dir/apt-manual.txt" \
+      || inventory_warning "$output_dir" "apt-mark export failed"
+  fi
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --get-selections >"$output_dir/dpkg-selections.txt" 2>/dev/null \
+      || inventory_warning "$output_dir" "dpkg selections export failed"
+  fi
+  if command -v snap >/dev/null 2>&1; then
+    snap list >"$output_dir/snap-list.txt" 2>/dev/null \
+      || inventory_warning "$output_dir" "snap list export failed"
+  else
+    inventory_warning "$output_dir" "snap is unavailable"
+  fi
+  if command -v flatpak >/dev/null 2>&1; then
+    flatpak list --app --columns=application,branch,origin >"$output_dir/flatpak-apps.tsv" 2>/dev/null \
+      || inventory_warning "$output_dir" "flatpak list export failed"
+  else
+    inventory_warning "$output_dir" "flatpak is unavailable"
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    crontab_temp="$(mktemp)"
+    TEMP_FILES+=("$crontab_temp")
+    if crontab -l >"$crontab_temp" 2>/dev/null; then
+      cp -- "$crontab_temp" "$output_dir/crontab.txt"
+    else
+      printf 'No readable user crontab was found.\n' >"$output_dir/crontab-status.txt"
+    fi
+  fi
+
+  for source_path in "$user_home/.local/share/nautilus/scripts" "$user_home/.config/nautilus"; do
+    if [[ -e "$source_path" ]]; then
+      mkdir -p -- "$output_dir/nautilus"
+      rsync --archive --relative "$source_path" "$output_dir/nautilus/" >/dev/null 2>&1 \
+        || inventory_warning "$output_dir" "Could not copy Nautilus data from $source_path"
+    fi
+  done
+
+  {
+    printf '# System inventory restore guidance\n\n'
+    printf 'These files are recovery references, not an automatic restore program.\n'
+    printf 'Review package lists and settings before applying them to another system.\n'
+    printf 'Do not run package installation or dconf import commands without a separate review.\n'
+  } >"$output_dir/RESTORE.md"
+}
+
+run_collectors() {
+  local index
+  local mode
+  local name
+  local command_path
+  local output_dir
+  local rc
+  local status
+
+  for index in "${!COLLECTOR_NAMES[@]}"; do
+    mode="${COLLECTOR_MODES[$index]}"
+    name="${COLLECTOR_NAMES[$index]}"
+    command_path="${COLLECTOR_COMMANDS[$index]}"
+    output_dir="$RUN_STAGE_DIR/artifacts/collectors/$name"
+    mkdir -p -- "$output_dir"
+    COLLECTOR_STARTED_AT[index]="$(iso_now)"
+    log_line "Collector started: $name ($mode)"
+
+    set +e
+    if [[ "$command_path" == "builtin:system-inventory" ]]; then
+      collector_system_inventory "$output_dir"
+      rc=$?
+    elif [[ "$VERBOSE" -eq 1 ]]; then
+      BACKUP_HOME_STAGE_DIR="$output_dir" \
+      BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
+      BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+        "$command_path"
+      rc=$?
+    else
+      BACKUP_HOME_STAGE_DIR="$output_dir" \
+      BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
+      BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+        "$command_path" >/dev/null 2>&1
+      rc=$?
+    fi
+    set -e
+
+    COLLECTOR_ENDED_AT[index]="$(iso_now)"
+    COLLECTOR_EXIT_CODES[index]="$rc"
+    status="success"
+    if [[ "$rc" -ne 0 ]]; then
+      status="failed"
+    elif [[ -s "$output_dir/warnings.txt" ]]; then
+      status="warning"
+    fi
+    COLLECTOR_STATUSES[index]="$status"
+    log_line "Collector finished: $name status=$status rc=$rc"
+
+    if [[ "$rc" -ne 0 && "$mode" == "required" ]]; then
+      return "$rc"
+    fi
+    if [[ "$rc" -ne 0 && "$mode" == "optional" ]]; then
+      record_warning "Optional collector failed: $name (rc=$rc)"
+    elif [[ "$status" == "warning" ]]; then
+      record_warning "Collector completed with warnings: $name"
+    fi
+  done
+}
+
+profile_digest() {
+  {
+    printf 'profile\t%s\t' "$PROFILE_FILE"
+    sha256sum "$PROFILE_FILE"
+    local exclude_file
+    for exclude_file in "${EXCLUDE_FILES[@]}"; do
+      printf 'exclude\t%s\t' "$exclude_file"
+      sha256sum "$exclude_file"
+    done
+    if [[ -f "$COLLECTORS_FILE" ]]; then
+      printf 'collectors\t%s\t' "$COLLECTORS_FILE"
+      sha256sum "$COLLECTORS_FILE"
+    fi
+  } | sha256sum | awk '{print $1}'
+}
+
+script_revision() {
+  local revision=""
+  if command -v git >/dev/null 2>&1; then
+    revision="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  [[ -n "$revision" ]] && printf 'git:%s\n' "$revision" || printf 'unversioned\n'
+}
+
+os_release_value() {
+  local key="$1"
+  awk -F= -v wanted="$key" '$1 == wanted {value=$2; gsub(/^"|"$/, "", value); print value; exit}' /etc/os-release 2>/dev/null || true
+}
+
+write_snapshot_report() {
+  local path="$1"
+  local status="$2"
+  local previous_snapshot="$3"
+  local index
+  {
+    printf 'Backup Home snapshot report\n\n'
+    printf 'Snapshot: %s\n' "$SNAPSHOT_NAME"
+    printf 'Status: %s\n' "$status"
+    printf 'Started: %s\n' "$RUN_STARTED_AT"
+    printf 'Generated: %s\n' "$(iso_now)"
+    printf 'Profile: %s\n' "$PROFILE_FILE"
+    printf 'Previous snapshot: %s\n' "${previous_snapshot:-none}"
+    printf 'Rsync exit code: %s\n' "$RSYNC_EXIT_CODE"
+    printf '\nResolved roots:\n'
+    printf '  - %s\n' "${TRANSFER_PATHS[@]}"
+    printf '\nCollectors:\n'
+    if [[ "${#COLLECTOR_NAMES[@]}" -eq 0 ]]; then
+      printf '  - none\n'
+    else
+      for index in "${!COLLECTOR_NAMES[@]}"; do
+        printf '  - %s: %s (%s, rc=%s)\n' \
+          "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_STATUSES[$index]}" \
+          "${COLLECTOR_MODES[$index]}" "${COLLECTOR_EXIT_CODES[$index]}"
+      done
+    fi
+    printf '\nWarnings:\n'
+    if [[ "${#RUN_WARNINGS[@]}" -eq 0 ]]; then
+      printf '  - none\n'
+    else
+      printf '  - %s\n' "${RUN_WARNINGS[@]}"
+    fi
+  } >"$path"
+}
+
+record_snapshot_checksums() {
+  local snapshot_dir="$1"
+  local checksum_file="$snapshot_dir/.backup-home/checksums.sha256"
+  local file
+  local relative
+  local count=0
+
+  : >"$checksum_file"
+  if [[ -f "$snapshot_dir/.backup-home/report.txt" ]]; then
+    (cd "$snapshot_dir" && sha256sum -- .backup-home/report.txt) >>"$checksum_file"
+    count=$((count + 1))
+  fi
+  if [[ -d "$snapshot_dir/.backup-home/artifacts" ]]; then
+    while IFS= read -r -d '' file; do
+      relative="${file#"$snapshot_dir"/}"
+      (cd "$snapshot_dir" && sha256sum -- "$relative") >>"$checksum_file"
+      count=$((count + 1))
+    done < <(find "$snapshot_dir/.backup-home/artifacts" -type f -print0 | sort -z)
+  fi
+  while IFS= read -r -d '' file; do
+    relative="${file#"$snapshot_dir"/}"
+    (cd "$snapshot_dir" && sha256sum -- "$relative") >>"$checksum_file"
+    count=$((count + 1))
+  done < <(
+    find "$snapshot_dir" -path "$snapshot_dir/.backup-home" -prune -o \
+      -type f -size "-${CHECKSUM_SAMPLE_MAX_BYTES}c" -print0 \
+      | shuf -z -n "$CHECKSUM_SAMPLE_COUNT"
+  )
+  printf '%s\n' "$count"
+}
+
+snapshot_payload_bytes() {
+  local snapshot_dir="$1"
+  find "$snapshot_dir" -path "$snapshot_dir/.backup-home" -prune -o -type f -printf '%s\n' \
+    | awk '{sum += $1} END {print sum + 0}'
+}
+
+write_snapshot_manifest() {
+  local path="$1"
+  local status="$2"
+  local previous_snapshot="$3"
+  local checksum_count="$4"
+  local file_count="$5"
+  local payload_bytes="$6"
+  local ended_at="$7"
+  local root
+  local rule
+  local warning_message
+  local index
+  local script_hash
+  script_hash="$(sha256sum "$SCRIPT_DIR/backup-home" | awk '{print $1}')"
+
+  {
+    printf 'schema_version\t1\n'
+    printf 'snapshot\t%s\n' "$(manifest_escape "$SNAPSHOT_NAME")"
+    printf 'status\t%s\n' "$status"
+    printf 'started_at\t%s\n' "$(manifest_escape "$RUN_STARTED_AT")"
+    printf 'ended_at\t%s\n' "$(manifest_escape "$ended_at")"
+    printf 'hostname\t%s\n' "$(manifest_escape "$(hostname)")"
+    printf 'os_id\t%s\n' "$(manifest_escape "$(os_release_value ID)")"
+    printf 'os_version_id\t%s\n' "$(manifest_escape "$(os_release_value VERSION_ID)")"
+    printf 'profile_name\t%s\n' "$(manifest_escape "$(basename "$PROFILE_FILE")")"
+    printf 'config_digest\t%s\n' "$(profile_digest)"
+    printf 'previous_snapshot\t%s\n' "$(manifest_escape "${previous_snapshot:-none}")"
+    printf 'rsync_exit_code\t%s\n' "$RSYNC_EXIT_CODE"
+    printf 'backup_home_revision\t%s\n' "$(script_revision)"
+    printf 'script_sha256\t%s\n' "$script_hash"
+    printf 'payload_bytes\t%s\n' "$payload_bytes"
+    printf 'file_count\t%s\n' "$file_count"
+    printf 'checksum_count\t%s\n' "$checksum_count"
+    for root in "${TRANSFER_PATHS[@]}"; do
+      printf 'root\t%s\n' "$(manifest_escape "$root")"
+    done
+    for rule in "${EXCLUDE_RULES[@]}"; do
+      printf 'exclude\t%s\n' "$(manifest_escape "$rule")"
+    done
+    for index in "${!COLLECTOR_NAMES[@]}"; do
+      printf 'collector\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_MODES[$index]}" \
+        "${COLLECTOR_STATUSES[$index]}" "${COLLECTOR_EXIT_CODES[$index]}" \
+        "${COLLECTOR_STARTED_AT[$index]}" "${COLLECTOR_ENDED_AT[$index]}"
+    done
+    for warning_message in "${RUN_WARNINGS[@]}"; do
+      printf 'warning\t%s\n' "$(manifest_escape "$warning_message")"
+    done
+  } >"$path"
+}
+
+manifest_value() {
+  local manifest="$1"
+  local key="$2"
+  awk -F '\t' -v wanted="$key" '$1 == wanted {print $2; exit}' "$manifest"
+}
+
+self_verify_snapshot() {
+  local snapshot_dir="$1"
+  local expected_name="$2"
+  local manifest="$snapshot_dir/.backup-home/manifest.tsv"
+  local root
+  local key
+  local value
+  local name
+  local mode
+  local status
+  local rest
+
+  [[ -s "$manifest" ]] || return 1
+  [[ "$(manifest_value "$manifest" schema_version)" == "1" ]] || return 1
+  [[ "$(manifest_value "$manifest" snapshot)" == "$expected_name" ]] || return 1
+  [[ "$(manifest_value "$manifest" status)" == success* ]] || return 1
+  while IFS=$'\t' read -r key value rest; do
+    case "$key" in
+      root)
+        root="$value"
+        [[ -e "$snapshot_dir$root" || -L "$snapshot_dir$root" ]] || return 1
+        ;;
+      collector)
+        name="$value"
+        mode="${rest%%$'\t'*}"
+        rest="${rest#*$'\t'}"
+        status="${rest%%$'\t'*}"
+        if [[ "$mode" == "required" && "$status" != "success" && "$status" != "warning" ]]; then
+          return 1
+        fi
+        [[ -d "$snapshot_dir/.backup-home/artifacts/collectors/$name" ]] || return 1
+        ;;
+    esac
+  done <"$manifest"
+}
+
+confirm_or_exit() {
+  local prompt="$1"
+  local reply
+  [[ "$ASSUME_YES" -eq 1 ]] && return 0
+  printf '%s [y/N]: ' "$prompt"
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES) return 0 ;;
+    *) die "Operation cancelled" ;;
+  esac
 }
 
 show_plan() {
   local rule
   local path
-  local bytes_estimate
-  local manual_count=0
+  local index
   local title
   local description
+  local manual_count=0
+  local keep_last
 
-  ensure_dest_required
+  require_commands find du df date mkdir mktemp readlink sort awk sed dirname cut tr
   ensure_dest_access "check"
-  ensure_rules_file
-  parse_rules_file
+  load_backup_selection
   ensure_dest_not_inside_sources
-  resolve_transfer_paths
-
+  parse_collectors_file
+  keep_last="$(read_keep_last)"
   build_size_report
-  bytes_estimate="$SIZE_REPORT_TOTAL"
 
-  print_label_value "Rules file:" "$RULES_FILE"
+  print_label_value "Profile:" "$PROFILE_FILE"
   print_label_value "Destination:" "$DEST_ROOT_REAL"
-  print_label_value "Estimated source size:" "$(format_bytes_human "$bytes_estimate")"
+  print_label_value "Estimated source size:" "$(format_bytes_human "$SIZE_REPORT_TOTAL")"
+  print_label_value "Retention keep-last:" "$keep_last"
   printf '\n'
-
-  show_transfer_size_report
-  printf '\n'
-
-  print_heading "Include rules:"
-  for rule in "${INCLUDE_RULES[@]}"; do
-    printf '  - %s\n' "$rule"
-  done
-  printf '\n'
-
-  print_heading "Exclude rules:"
+  show_size_report
+  printf '\nInclude entries:\n'
+  printf '  - %s\n' "${INCLUDE_RULES[@]}"
+  printf '\nExclude files:\n'
+  printf '  - %s\n' "${EXCLUDE_FILES[@]}"
+  printf '\nApplied excludes:\n'
   if [[ "${#EXCLUDE_RULES[@]}" -eq 0 ]]; then
     printf '  - none\n'
   else
-    for rule in "${EXCLUDE_RULES[@]}"; do
-      printf '  - %s\n' "$rule"
+    for rule in "${EXCLUDE_RULES[@]}"; do printf '  - %s\n' "$rule"; done
+  fi
+  printf '\nResolved roots:\n'
+  for path in "${TRANSFER_PATHS[@]}"; do printf '  - %s\n' "$path"; done
+  printf '\nCollectors:\n'
+  if [[ "${#COLLECTOR_NAMES[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+  else
+    for index in "${!COLLECTOR_NAMES[@]}"; do
+      printf '  - %s | %s | %s\n' "${COLLECTOR_MODES[$index]}" "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_COMMANDS[$index]}"
     done
   fi
-  printf '\n'
-
-  print_heading "Resolved backup roots:"
-  for path in "${TRANSFER_PATHS[@]}"; do
-    printf '  - %s\n' "$path"
-  done
-  printf '\n'
-
-  print_heading "Manual checklist:"
+  printf '\nManual checklist:\n'
   while IFS=$'\t' read -r title description; do
-    if [[ -n "$description" ]]; then
-      printf '  - %s | %s\n' "$title" "$description"
-    else
-      printf '  - %s\n' "$title"
-    fi
+    [[ -n "$description" ]] && printf '  - %s | %s\n' "$title" "$description" || printf '  - %s\n' "$title"
     manual_count=$((manual_count + 1))
   done < <(manual_entries)
-
-  if [[ "$manual_count" -eq 0 ]]; then
-    printf '  - none\n'
-  fi
+  [[ "$manual_count" -gt 0 ]] || printf '  - none\n'
 }
 
 show_manual() {
   local total
   local index=1
-  local found=0
   local title
   local description
   local reply
-
   total="$(manual_task_count)"
-
+  if [[ "$total" -eq 0 ]]; then
+    printf 'No manual checklist items are configured.\n'
+    return 0
+  fi
   while IFS=$'\t' read -r title description; do
     printf '[%d/%s] %s\n' "$index" "$total" "$title"
-    if [[ -n "$description" ]]; then
-      printf '  %s\n' "$description"
-    fi
+    [[ -n "$description" ]] && printf '  %s\n' "$description"
     index=$((index + 1))
-    found=1
-
     if [[ "$ASSUME_YES" -eq 0 && -t 0 ]]; then
       printf 'Press Enter when done, or type q to stop: '
       read -r reply
-      case "$reply" in
-        q|Q|quit|QUIT)
-          printf 'Stopped manual checklist.\n'
-          return 0
-          ;;
-      esac
-      printf '\n'
+      case "$reply" in q|Q|quit|QUIT) printf 'Stopped manual checklist.\n'; return 0 ;; esac
     fi
   done < <(manual_entries)
+}
 
-  if [[ "$found" -eq 0 ]]; then
-    printf 'No manual checklist items are configured.\n'
-  fi
+setup_run_log() {
+  [[ -n "$LOG_FILE" ]] || LOG_FILE="$(logs_root_dir)/backup-home-$SNAPSHOT_NAME.log"
+  mkdir -p -- "$(dirname "$LOG_FILE")"
+  ACTIVE_LOG_FILE="$LOG_FILE"
+  : >"$ACTIVE_LOG_FILE"
+  {
+    printf 'command=run\n'
+    printf 'profile=%s\n' "$PROFILE_FILE"
+    printf 'destination=%s\n' "$DEST_ROOT_REAL"
+    printf 'snapshot=%s\n' "$SNAPSHOT_NAME"
+    printf 'start=%s\n\n' "$RUN_STARTED_AT"
+  } >>"$ACTIVE_LOG_FILE"
+}
+
+fail_active_run() {
+  local message="$1"
+  local code="$2"
+  write_failure_report "$message" "$code"
+  write_log_footer "failed"
+  cleanup_run_data
+  RUN_ACTIVE=0
+  die_with_code "$code" "$message"
 }
 
 run_backup() {
   local snapshot_dir
-  local previous_snapshot
+  local previous_snapshot=""
   local link_dest_dir=""
+  local exclude_file
   local estimated_bytes
   local free_bytes
-  local exclude_file
-  local backup_rc=0
+  local collector_rc=0
+  local status="success"
+  local checksum_count
+  local file_count
+  local payload_bytes
+  local ended_at
 
-  ensure_dest_required
-  ensure_dest_access "create"
-  ensure_rules_file
-  parse_rules_file
+  require_commands rsync find du df date mkdir mktemp readlink sort wc awk sed dirname cut tr \
+    sha256sum shuf flock hostname mv rm cp tee
+  ensure_dest_access "check"
+  load_backup_selection
   ensure_dest_not_inside_sources
-  resolve_transfer_paths
-  require_commands
-
-  SNAPSHOT_NAME="$(timestamp_now)"
-  prepare_manual_stage_for_run
+  parse_collectors_file
   build_size_report
   estimated_bytes="$SIZE_REPORT_TOTAL"
   free_bytes="$(available_dest_bytes)"
-
-  if [[ "$DRY_RUN" -eq 0 && "$estimated_bytes" -gt 0 && "$free_bytes" -lt "$estimated_bytes" ]]; then
-    die "Not enough free space at destination. Need about $(format_bytes_human "$estimated_bytes"), have $(format_bytes_human "$free_bytes")"
-  fi
-
-  snapshot_dir="$(snapshot_path_for "$SNAPSHOT_NAME")"
+  SNAPSHOT_NAME="$(timestamp_now)"
+  RUN_STARTED_AT="$(iso_now)"
   previous_snapshot="$(latest_snapshot_name || true)"
+
+  print_label_value "Profile:" "$PROFILE_FILE"
+  print_label_value "Destination:" "$DEST_ROOT_REAL"
+  print_label_value "Snapshot:" "$SNAPSHOT_NAME"
+  print_label_value "Estimated source size:" "$(format_bytes_human "$estimated_bytes")"
+  print_label_value "Available destination space:" "$(format_bytes_human "$free_bytes")"
+  show_size_report
+  if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
+    log_line "Ignore-errors mode: diagnostics may continue, but required failures remain non-zero"
+  fi
+  if [[ "${#COLLECTOR_NAMES[@]}" -gt 0 ]]; then
+    printf 'Collectors:\n'
+    local index
+    for index in "${!COLLECTOR_NAMES[@]}"; do
+      printf '  - would run %s (%s)\n' "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_MODES[$index]}"
+    done
+  fi
+
   exclude_file="$(build_exclude_file)"
+  snapshot_dir="$(snapshot_path_for "$SNAPSHOT_NAME")"
+  [[ -n "$previous_snapshot" ]] && link_dest_dir="$(snapshot_path_for "$previous_snapshot")"
 
-  log_line "Rules file: $RULES_FILE"
-  log_line "Destination: $DEST_ROOT_REAL"
-  log_line "Snapshot: $SNAPSHOT_NAME"
-  log_line "Estimated source size: $(format_bytes_human "$estimated_bytes")"
-  log_line "Available destination space: $(format_bytes_human "$free_bytes")"
-  log_transfer_size_report
-  if [[ -n "$MANUAL_STAGE_DIR" ]]; then
-    log_line "Manual staging directory: $MANUAL_STAGE_DIR"
-  elif [[ "$DRY_RUN" -eq 1 && "$(manual_task_count)" -gt 0 ]]; then
-    log_line "Manual staging directory: skipped in dry-run mode"
-  fi
-  if [[ -n "$previous_snapshot" ]]; then
-    log_line "Backup mode: snapshot with hard-link reuse for unchanged files"
-    log_line "Previous snapshot for link-dest: $previous_snapshot"
-    log_line "Expected behavior: unchanged files are reused from the previous snapshot, changed files are copied again"
-  else
-    log_line "Backup mode: full initial snapshot"
-    log_line "Previous snapshot for link-dest: none"
-    log_line "Expected behavior: all selected files are copied into this first snapshot"
-  fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    log_line "Mode: dry-run"
+    acquire_lock "shared"
+    log_line "Mode: dry-run; collectors and manual staging are not executed"
+    set +e
+    rsync_backup "$exclude_file" "$snapshot_dir" "$link_dest_dir"
+    RSYNC_EXIT_CODE=$?
+    set -e
+    [[ "$RSYNC_EXIT_CODE" -eq 0 ]] || die_with_code "$RSYNC_EXIT_CODE" "Dry-run rsync failed with exit code $RSYNC_EXIT_CODE"
+    log_line "Dry-run finished successfully"
+    return 0
+  fi
+
+  [[ "$estimated_bytes" -eq 0 || "$free_bytes" -ge "$estimated_bytes" ]] \
+    || die "Not enough destination space. Need about $(format_bytes_human "$estimated_bytes"), have $(format_bytes_human "$free_bytes")"
+  confirm_or_exit "Create snapshot $SNAPSHOT_NAME under $DEST_ROOT_REAL?"
+  ensure_dest_access "create"
+  acquire_lock "exclusive"
+  mkdir -p -- "$(snapshot_root_dir)" "$(logs_root_dir)"
+  previous_snapshot="$(latest_snapshot_name || true)"
+  [[ -n "$previous_snapshot" ]] && link_dest_dir="$(snapshot_path_for "$previous_snapshot")" || link_dest_dir=""
+  snapshot_dir="$(snapshot_path_for "$SNAPSHOT_NAME")"
+  [[ ! -e "$snapshot_dir" ]] || die "Snapshot already exists: $snapshot_dir"
+  INCOMPLETE_SNAPSHOT_DIR="$(snapshot_root_dir)/.incomplete-$SNAPSHOT_NAME-$$"
+  [[ ! -e "$INCOMPLETE_SNAPSHOT_DIR" ]] || die "Incomplete snapshot path already exists: $INCOMPLETE_SNAPSHOT_DIR"
+  RUN_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/backup-home-stage.$SNAPSHOT_NAME.XXXXXX")"
+  RUN_ACTIVE=1
+  setup_run_log
+  log_line "Previous snapshot: ${previous_snapshot:-none}"
+
+  prepare_manual_stage
+  set +e
+  run_collectors
+  collector_rc=$?
+  set -e
+  if [[ "$collector_rc" -ne 0 ]]; then
+    fail_active_run "Required collector failed with exit code $collector_rc" "$collector_rc"
+  fi
+
+  mkdir -p -- "$INCOMPLETE_SNAPSHOT_DIR"
+  set +e
+  rsync_backup "$exclude_file" "$INCOMPLETE_SNAPSHOT_DIR" "$link_dest_dir"
+  RSYNC_EXIT_CODE=$?
+  set -e
+  if [[ "$RSYNC_EXIT_CODE" -ne 0 ]]; then
+    fail_active_run "Backup rsync failed with exit code $RSYNC_EXIT_CODE" "$RSYNC_EXIT_CODE"
+  fi
+
+  mkdir -p -- "$INCOMPLETE_SNAPSHOT_DIR/.backup-home/artifacts"
+  if [[ -d "$RUN_STAGE_DIR/artifacts" ]]; then
+    rsync --archive "$RUN_STAGE_DIR/artifacts/" "$INCOMPLETE_SNAPSHOT_DIR/.backup-home/artifacts/"
+  fi
+  [[ "${#RUN_WARNINGS[@]}" -eq 0 ]] || status="success-with-warnings"
+  write_snapshot_report "$INCOMPLETE_SNAPSHOT_DIR/.backup-home/report.txt" "$status" "$previous_snapshot"
+  checksum_count="$(record_snapshot_checksums "$INCOMPLETE_SNAPSHOT_DIR")"
+  : >"$INCOMPLETE_SNAPSHOT_DIR/.backup-home/manifest.tsv"
+  payload_bytes="$(snapshot_payload_bytes "$INCOMPLETE_SNAPSHOT_DIR")"
+  file_count="$(find "$INCOMPLETE_SNAPSHOT_DIR" -type f | wc -l | awk '{print $1}')"
+  ended_at="$(iso_now)"
+  write_snapshot_manifest "$INCOMPLETE_SNAPSHOT_DIR/.backup-home/manifest.tsv" "$status" \
+    "$previous_snapshot" "$checksum_count" "$file_count" "$payload_bytes" "$ended_at"
+
+  if ! self_verify_snapshot "$INCOMPLETE_SNAPSHOT_DIR" "$SNAPSHOT_NAME"; then
+    fail_active_run "Snapshot self-verification failed" 1
+  fi
+  mv -- "$INCOMPLETE_SNAPSHOT_DIR" "$snapshot_dir"
+  INCOMPLETE_SNAPSHOT_DIR=""
+  cleanup_run_data
+  write_log_footer "$status"
+  RUN_ACTIVE=0
+  log_line "Backup finished: $status"
+  print_label_value "Manifest:" "$snapshot_dir/.backup-home/manifest.tsv"
+}
+
+snapshot_status() {
+  local snapshot_dir="$1"
+  local manifest="$snapshot_dir/.backup-home/manifest.tsv"
+  if [[ -s "$manifest" ]]; then
+    manifest_value "$manifest" status
   else
-    if [[ -n "$LOG_FILE" ]]; then
-      log_line "Log file: $LOG_FILE"
-    else
-      log_line "Log file: $(logs_root_dir)/backup-home-$SNAPSHOT_NAME.log"
-    fi
-  fi
-
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    printf '\n'
-    confirm_or_exit "Create snapshot $SNAPSHOT_NAME under $DEST_ROOT_REAL?"
-    mkdir -p -- "$(snapshot_root_dir)" "$(logs_root_dir)"
-    [[ -n "$LOG_FILE" ]] || LOG_FILE="$(logs_root_dir)/backup-home-$SNAPSHOT_NAME.log"
-    ACTIVE_LOG_FILE="$LOG_FILE"
-    : >"$ACTIVE_LOG_FILE"
-    write_log_header
-    trap 'write_log_footer "failed"' ERR
-    mkdir -p -- "$snapshot_dir"
-    link_dest_dir=""
-    if [[ -n "$previous_snapshot" ]]; then
-      link_dest_dir="$(snapshot_path_for "$previous_snapshot")"
-    fi
-  else
-    if [[ -n "$previous_snapshot" ]]; then
-      link_dest_dir="$(snapshot_path_for "$previous_snapshot")"
-    fi
-  fi
-
-  rsync_backup "$exclude_file" "$snapshot_dir" "$link_dest_dir"
-  backup_rc=$?
-
-  if [[ "$backup_rc" -ne 0 ]]; then
-    if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
-      warn_line "Backup completed with rsync errors. Exit code: $backup_rc"
-    else
-      die "Backup failed with rsync exit code: $backup_rc"
-    fi
-  fi
-
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    trap - ERR
-    if [[ "$backup_rc" -eq 0 ]]; then
-      cleanup_manual_stage_dir
-      write_log_footer "success"
-    else
-      [[ -n "$MANUAL_STAGE_DIR" ]] && warn_line "Manual staging directory kept for review: $MANUAL_STAGE_DIR"
-      write_log_footer "success-with-errors"
-    fi
-  fi
-
-  if [[ "$backup_rc" -eq 0 ]]; then
-    log_line "Backup finished successfully"
-  else
-    log_line "Backup finished with warnings"
+    printf 'legacy\n'
   fi
 }
 
 list_backups() {
-  local names
-
-  ensure_dest_required
+  local name
+  local found=0
+  require_commands find readlink sort awk flock hostname
   ensure_dest_access "check"
-
-  names="$(list_snapshot_names)"
-  if [[ -z "$names" ]]; then
-    printf 'No snapshots found in %s.\n' "$(snapshot_root_dir)"
-    return 0
-  fi
-
+  acquire_lock "shared"
   print_heading "Snapshots in $(snapshot_root_dir):"
-  printf '%s\n' "$names" | sed 's/^/  - /'
+  while IFS= read -r name; do
+    printf '  - %s [%s]\n' "$name" "$(snapshot_status "$(snapshot_path_for "$name")")"
+    found=1
+  done < <(list_snapshot_names)
+  [[ "$found" -eq 1 ]] || printf '  - none\n'
 }
 
 verify_snapshot() {
   local snapshot
   local snapshot_dir
+  local manifest
+  local errors=0
+  local key
+  local value
+  local rest
+  local name
+  local mode
+  local status
+  local expected_count
+  local actual_count
   local expected_path
-  local missing=0
-  local size_human
-  local file_count
 
-  ensure_dest_required
+  require_commands find du readlink sort awk wc sha256sum flock hostname
   ensure_dest_access "check"
-  ensure_rules_file
-  parse_rules_file
-  ensure_dest_not_inside_sources
-  resolve_transfer_paths
-
+  acquire_lock "shared"
   snapshot="$(resolve_snapshot_name)"
   snapshot_dir="$(snapshot_path_for "$snapshot")"
   [[ -d "$snapshot_dir" ]] || die "Snapshot not found: $snapshot_dir"
-
+  manifest="$snapshot_dir/.backup-home/manifest.tsv"
   print_label_value "Snapshot:" "$snapshot"
   print_label_value "Path:" "$snapshot_dir"
-  printf '\n'
 
-  print_heading "Expected paths:"
-  for expected_path in "${EXPECTED_PATHS[@]}"; do
-    if [[ -e "$snapshot_dir$expected_path" ]]; then
-      if [[ "$COLOR_ENABLED" -eq 1 ]]; then
-        printf '  %bOK%b  %s\n' "$COLOR_GREEN" "$COLOR_RESET" "$snapshot_dir$expected_path"
+  if [[ ! -s "$manifest" ]]; then
+    warn_line "Legacy snapshot has no manifest; using the current profile for basic verification"
+    [[ "$DEEP_VERIFY" -eq 0 ]] || die "Deep verification is unavailable for legacy snapshots"
+    load_backup_selection
+    for expected_path in "${EXPECTED_PATHS[@]}"; do
+      if [[ -e "$snapshot_dir$expected_path" || -L "$snapshot_dir$expected_path" ]]; then
+        printf '  OK  %s\n' "$expected_path"
       else
-        printf '  OK  %s\n' "$snapshot_dir$expected_path"
+        printf '  MISSING  %s\n' "$expected_path"
+        errors=$((errors + 1))
       fi
-    else
-      if [[ "$COLOR_ENABLED" -eq 1 ]]; then
-        printf '  %bMISSING%b  %s\n' "$COLOR_RED" "$COLOR_RESET" "$snapshot_dir$expected_path"
-      else
-        printf '  MISSING  %s\n' "$snapshot_dir$expected_path"
-      fi
-      missing=1
+    done
+  else
+    [[ "$(manifest_value "$manifest" schema_version)" == "1" ]] || errors=$((errors + 1))
+    [[ "$(manifest_value "$manifest" snapshot)" == "$snapshot" ]] || errors=$((errors + 1))
+    status="$(manifest_value "$manifest" status)"
+    [[ "$status" == success* ]] || errors=$((errors + 1))
+    while IFS=$'\t' read -r key value rest; do
+      case "$key" in
+        root)
+          if [[ -e "$snapshot_dir$value" || -L "$snapshot_dir$value" ]]; then
+            printf '  OK  %s\n' "$value"
+          else
+            printf '  MISSING  %s\n' "$value"
+            errors=$((errors + 1))
+          fi
+          ;;
+        collector)
+          name="$value"
+          mode="${rest%%$'\t'*}"
+          rest="${rest#*$'\t'}"
+          status="${rest%%$'\t'*}"
+          if [[ "$mode" == "required" && "$status" != "success" && "$status" != "warning" ]]; then
+            printf '  FAILED REQUIRED COLLECTOR  %s\n' "$name"
+            errors=$((errors + 1))
+          fi
+          if [[ ! -d "$snapshot_dir/.backup-home/artifacts/collectors/$name" ]]; then
+            printf '  MISSING COLLECTOR ARTIFACTS  %s\n' "$name"
+            errors=$((errors + 1))
+          fi
+          ;;
+      esac
+    done <"$manifest"
+    expected_count="$(manifest_value "$manifest" file_count)"
+    actual_count="$(find "$snapshot_dir" -type f | wc -l | awk '{print $1}')"
+    if [[ "$expected_count" != "$actual_count" ]]; then
+      printf '  FILE COUNT MISMATCH  expected=%s actual=%s\n' "$expected_count" "$actual_count"
+      errors=$((errors + 1))
     fi
-  done
-
-  size_human="$(du -sh -- "$snapshot_dir" | awk '{print $1}')"
-  file_count="$(find "$snapshot_dir" -type f | wc -l | awk '{print $1}')"
-
-  printf '\n'
-  print_label_value "Snapshot size:" "$size_human"
-  print_label_value "File count:" "$file_count"
-
-  if [[ "$missing" -ne 0 ]]; then
-    if [[ "$IGNORE_ERRORS" -eq 1 ]]; then
-      warn_line "Snapshot verification found missing expected paths"
-    else
-      die "Snapshot verification found missing expected paths"
+    if [[ "$DEEP_VERIFY" -eq 1 ]]; then
+      if [[ ! -s "$snapshot_dir/.backup-home/checksums.sha256" ]]; then
+        printf '  CHECKSUM SET MISSING\n'
+        errors=$((errors + 1))
+      elif ! (cd "$snapshot_dir" && sha256sum -c --strict --quiet .backup-home/checksums.sha256); then
+        printf '  CHECKSUM VERIFICATION FAILED\n'
+        errors=$((errors + 1))
+      else
+        printf '  CHECKSUMS OK\n'
+      fi
     fi
   fi
+
+  print_label_value "Snapshot size:" "$(du -sh -- "$snapshot_dir" | awk '{print $1}')"
+  print_label_value "File count:" "$(find "$snapshot_dir" -type f | wc -l | awk '{print $1}')"
+  [[ "$errors" -eq 0 ]] || die "Snapshot verification failed with $errors problem(s)"
+  printf 'Snapshot verification succeeded.\n'
+}
+
+validate_restore_path() {
+  local path="$1"
+  [[ "$path" == /* ]] || die "--path must be absolute: $path"
+  [[ "$path" != "/" && "$path" != "/.backup-home" && "$path" != "/.backup-home/"* ]] \
+    || die "Unsafe restore path: $path"
+  case "/${path#/}/" in
+    */../*|*/./*) die "Restore path traversal is not allowed: $path" ;;
+  esac
+}
+
+validate_restore_destination() {
+  local destination="$1"
+  [[ "$destination" != "/" ]] || die "Restore destination / is not allowed"
+  case "$destination" in
+    "$DEST_ROOT_REAL"|"$DEST_ROOT_REAL"/*)
+      die "Restore destination must not be inside the backup destination"
+      ;;
+  esac
+}
+
+rsync_restore() {
+  local source_spec="$1"
+  local destination="$2"
+  local full_restore="$3"
+  local -a command_line=(rsync --archive --hard-links --human-readable --mkpath)
+  if [[ "$full_restore" -eq 1 ]]; then
+    command_line+=(--exclude='/.backup-home')
+  else
+    command_line+=(--relative)
+  fi
+  [[ "$DRY_RUN" -eq 1 ]] && command_line+=(--dry-run)
+  [[ "$VERBOSE" -eq 1 ]] && command_line+=(--info=progress2 --itemize-changes)
+  command_line+=("$source_spec" "$destination/")
+  run_command_logged "${command_line[@]}"
 }
 
 restore_snapshot() {
   local snapshot
   local snapshot_dir
-  local source_path
   local restore_source
-  local restore_mode
+  local source_spec
+  local mode="dry-run"
+  local full_restore=0
+  local rc
 
-  ensure_dest_required
+  require_commands rsync readlink mkdir flock hostname
   ensure_dest_access "check"
-  snapshot="${SNAPSHOT_NAME:-}"
-  [[ -n "$snapshot" ]] || snapshot="${POSITIONAL_ARGS[0]:-}"
-  [[ -n "$snapshot" ]] || die "Restore requires a snapshot name"
-  [[ -n "$RESTORE_DEST" ]] || die "Restore requires --restore-to PATH"
-
+  acquire_lock "shared"
+  snapshot="$(resolve_snapshot_name)"
   snapshot_dir="$(snapshot_path_for "$snapshot")"
   [[ -d "$snapshot_dir" ]] || die "Snapshot not found: $snapshot_dir"
-
+  [[ -n "$RESTORE_DEST" ]] || die "Restore requires --restore-to PATH"
   RESTORE_DEST="$(canonicalize_path "$RESTORE_DEST")"
-
-  restore_mode="dry-run"
-  if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 1 ]]; then
-    restore_mode="real"
-  else
-    DRY_RUN=1
-  fi
-
-  if [[ "$restore_mode" == "real" ]]; then
-    mkdir -p -- "$RESTORE_DEST"
-  else
-    [[ -d "$RESTORE_DEST" || -d "$(dirname "$RESTORE_DEST")" ]] || die "Restore destination parent does not exist: $(dirname "$RESTORE_DEST")"
-    [[ -w "$RESTORE_DEST" || -w "$(dirname "$RESTORE_DEST")" ]] || die "Restore destination parent is not writable: $(dirname "$RESTORE_DEST")"
-  fi
+  validate_restore_destination "$RESTORE_DEST"
 
   if [[ -n "$RESTORE_PATH" ]]; then
-    source_path="$RESTORE_PATH"
-    case "$source_path" in
-      /*)
-        restore_source="$snapshot_dir$source_path"
-        ;;
-      *)
-        restore_source="$snapshot_dir/$source_path"
-        ;;
-    esac
-    [[ -e "$restore_source" ]] || die "Restore path not found in snapshot: $RESTORE_PATH"
+    validate_restore_path "$RESTORE_PATH"
+    RESTORE_PATH="${RESTORE_PATH%/}"
+    restore_source="$snapshot_dir$RESTORE_PATH"
+    [[ -e "$restore_source" || -L "$restore_source" ]] || die "Restore path not found: $RESTORE_PATH"
+    source_spec="$snapshot_dir/./${RESTORE_PATH#/}"
   else
-    restore_source="$snapshot_dir/"
+    restore_source="$snapshot_dir"
+    source_spec="$snapshot_dir/"
+    full_restore=1
   fi
 
+  if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 1 ]]; then
+    mode="real"
+    mkdir -p -- "$RESTORE_DEST"
+  else
+    DRY_RUN=1
+    [[ -d "$RESTORE_DEST" || -d "$(dirname "$RESTORE_DEST")" ]] \
+      || die "Restore destination parent does not exist: $(dirname "$RESTORE_DEST")"
+  fi
   print_label_value "Restore snapshot:" "$snapshot"
   print_label_value "Restore source:" "$restore_source"
   print_label_value "Restore destination:" "$RESTORE_DEST"
-  print_label_value "Mode:" "$restore_mode"
-  if [[ "$restore_mode" == "dry-run" ]]; then
-    print_status_line "$COLOR_YELLOW" "Note: restore defaults to dry-run. Re-run with --yes to apply changes."
-  fi
-  printf '\n'
+  print_label_value "Mode:" "$mode"
+  [[ "$mode" == "real" ]] || printf 'Restore defaults to dry-run; add --yes to write.\n'
 
-  rsync_restore "$restore_source" "$RESTORE_DEST"
+  set +e
+  rsync_restore "$source_spec" "$RESTORE_DEST" "$full_restore"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die_with_code "$rc" "Restore failed with exit code $rc"
+}
+
+drill_snapshot() {
+  local snapshot
+  local snapshot_dir
+  local source_path
+  local source_spec
+  local drill_dir=""
+  local restored_path
+  local comparison
+  local rc
+
+  require_commands rsync readlink mkdir mktemp rm flock hostname
+  ensure_dest_access "check"
+  acquire_lock "shared"
+  snapshot="$(resolve_snapshot_name)"
+  snapshot_dir="$(snapshot_path_for "$snapshot")"
+  [[ -d "$snapshot_dir" ]] || die "Snapshot not found: $snapshot_dir"
+  [[ -n "$RESTORE_PATH" ]] || die "Drill requires --path ABSOLUTE_PATH"
+  validate_restore_path "$RESTORE_PATH"
+  RESTORE_PATH="${RESTORE_PATH%/}"
+  source_path="$snapshot_dir$RESTORE_PATH"
+  [[ -e "$source_path" || -L "$source_path" ]] || die "Drill path not found: $RESTORE_PATH"
+  source_spec="$snapshot_dir/./${RESTORE_PATH#/}"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    print_label_value "Drill snapshot:" "$snapshot"
+    print_label_value "Drill path:" "$RESTORE_PATH"
+    print_label_value "Temporary destination:" "${TMPDIR:-/tmp}/backup-home-drill.$snapshot.XXXXXX"
+    printf 'Dry-run: no temporary directory or restored files were created.\n'
+    return 0
+  fi
+
+  drill_dir="$(mktemp -d "${TMPDIR:-/tmp}/backup-home-stage.drill.$snapshot.XXXXXX")"
+  RUN_STAGE_DIR="$drill_dir"
+  set +e
+  rsync --archive --hard-links --relative "$source_spec" "$drill_dir/" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die_with_code "$rc" "Drill restore failed with exit code $rc"
+  restored_path="$drill_dir/${RESTORE_PATH#/}"
+
+  set +e
+  if [[ -d "$source_path" && ! -L "$source_path" ]]; then
+    comparison="$(rsync --archive --hard-links --checksum --dry-run --delete --itemize-changes "$source_path/" "$restored_path/")"
+    rc=$?
+  else
+    comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes "$source_path" "$(dirname "$restored_path")/")"
+    rc=$?
+  fi
+  set -e
+  [[ "$rc" -eq 0 ]] || die_with_code "$rc" "Drill comparison failed with exit code $rc"
+  [[ -z "$comparison" ]] || die "Drill comparison found content differences"
+  cleanup_run_data
+  printf 'Restore drill succeeded for %s.\n' "$RESTORE_PATH"
+}
+
+read_keep_last() {
+  local line
+  local key
+  local value
+  local keep_last=""
+  if [[ -n "$KEEP_LAST_OVERRIDE" ]]; then
+    keep_last="$KEEP_LAST_OVERRIDE"
+  else
+    [[ -f "$RETENTION_FILE" ]] || die "Retention file not found: $RETENTION_FILE"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(normalize_config_line "$line")"
+      [[ -n "$line" ]] || continue
+      [[ "$line" == *=* ]] || die "Invalid retention entry: $line"
+      key="$(trim_whitespace "${line%%=*}")"
+      value="$(trim_whitespace "${line#*=}")"
+      [[ "$key" == "keep_last" ]] || die "Unknown retention key: $key"
+      keep_last="$value"
+    done <"$RETENTION_FILE"
+  fi
+  [[ "$keep_last" =~ ^[0-9]+$ && "$keep_last" -ge 1 ]] || die "keep_last must be an integer greater than or equal to 1"
+  printf '%s\n' "$keep_last"
+}
+
+collect_prune_candidates() {
+  local keep_last="$1"
+  local -a names=()
+  local candidate_count
+  local index
+  mapfile -t names < <(list_snapshot_names)
+  candidate_count=$((${#names[@]} - keep_last))
+  [[ "$candidate_count" -gt 0 ]] || return 0
+  for ((index = 0; index < candidate_count; index++)); do
+    printf '%s\n' "${names[$index]}"
+  done
+}
+
+prune_snapshots() {
+  local keep_last
+  local lock_mode="shared"
+  local -a candidates=()
+  local name
+  local path
+  local canonical
+  local errors=0
+  local prune_log=""
+
+  require_commands find readlink sort awk flock hostname rm date mkdir
+  ensure_dest_access "check"
+  keep_last="$(read_keep_last)"
+  if [[ "$ASSUME_YES" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+    lock_mode="exclusive"
+  fi
+  acquire_lock "$lock_mode"
+  mapfile -t candidates < <(collect_prune_candidates "$keep_last")
+  print_label_value "Retention keep-last:" "$keep_last"
+  print_heading "Prune candidates:"
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+    return 0
+  fi
+  printf '  - %s\n' "${candidates[@]}"
+  if [[ "$ASSUME_YES" -eq 0 || "$DRY_RUN" -eq 1 ]]; then
+    printf 'Preview only; add --yes without --dry-run to delete these snapshots.\n'
+    return 0
+  fi
+
+  mkdir -p -- "$(logs_root_dir)"
+  prune_log="$(logs_root_dir)/backup-home-prune-$(timestamp_now).log"
+  for name in "${candidates[@]}"; do
+    validate_snapshot_name "$name"
+    path="$(snapshot_path_for "$name")"
+    canonical="$(canonicalize_path "$path")"
+    if [[ "$canonical" != "$(snapshot_root_dir)/$name" || ! -d "$path" || -L "$path" ]]; then
+      warn "Refusing invalid prune candidate: $path"
+      errors=$((errors + 1))
+      continue
+    fi
+    printf 'delete\t%s\n' "$path" >>"$prune_log"
+    if ! rm -rf --one-file-system -- "$path"; then
+      warn "Could not delete snapshot: $path"
+      errors=$((errors + 1))
+    else
+      printf 'Deleted snapshot: %s\n' "$name"
+    fi
+  done
+  [[ "$errors" -eq 0 ]] || die "Prune completed with $errors deletion error(s)"
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      plan|manual|run|list|verify|restore|help)
-        if [[ -z "$COMMAND" ]]; then
-          COMMAND="$1"
-        else
-          POSITIONAL_ARGS+=("$1")
-        fi
+      plan|manual|run|list|verify|restore|prune|drill|help)
+        if [[ -z "$COMMAND" ]]; then COMMAND="$1"; else POSITIONAL_ARGS+=("$1"); fi
         shift
         ;;
-      --dest)
-        [[ $# -ge 2 ]] || die "--dest requires a value"
-        DEST_ROOT="$2"
-        shift 2
-        ;;
-      --config-file)
-        [[ $# -ge 2 ]] || die "--config-file requires a value"
-        RULES_FILE="$2"
-        shift 2
-        ;;
-      --manual-file)
-        [[ $# -ge 2 ]] || die "--manual-file requires a value"
-        MANUAL_FILE="$2"
-        shift 2
-        ;;
-      --dry-run)
-        DRY_RUN=1
-        shift
-        ;;
-      --verbose)
-        VERBOSE=1
-        shift
-        ;;
-      --yes)
-        ASSUME_YES=1
-        shift
-        ;;
-      --ignore-errors)
-        IGNORE_ERRORS=1
-        shift
-        ;;
-      --log-file)
-        [[ $# -ge 2 ]] || die "--log-file requires a value"
-        LOG_FILE="$2"
-        shift 2
-        ;;
-      --snapshot)
-        [[ $# -ge 2 ]] || die "--snapshot requires a value"
-        SNAPSHOT_NAME="$2"
-        shift 2
-        ;;
-      --path)
-        [[ $# -ge 2 ]] || die "--path requires a value"
-        RESTORE_PATH="$2"
-        shift 2
-        ;;
-      --restore-to)
-        [[ $# -ge 2 ]] || die "--restore-to requires a value"
-        RESTORE_DEST="$2"
-        shift 2
-        ;;
-      -h|--help)
-        COMMAND="help"
-        shift
-        ;;
-      *)
-        if [[ "$1" == -* ]]; then
-          die "Unknown option: $1"
-        fi
-        POSITIONAL_ARGS+=("$1")
-        shift
-        ;;
+      --dest) [[ $# -ge 2 ]] || die "--dest requires a value"; DEST_ROOT="$2"; shift 2 ;;
+      --config-file) [[ $# -ge 2 ]] || die "--config-file requires a value"; PROFILE_FILE="$2"; shift 2 ;;
+      --manual-file) [[ $# -ge 2 ]] || die "--manual-file requires a value"; MANUAL_FILE="$2"; shift 2 ;;
+      --collectors-file) [[ $# -ge 2 ]] || die "--collectors-file requires a value"; COLLECTORS_FILE="$2"; shift 2 ;;
+      --retention-file) [[ $# -ge 2 ]] || die "--retention-file requires a value"; RETENTION_FILE="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --verbose) VERBOSE=1; shift ;;
+      --yes) ASSUME_YES=1; shift ;;
+      --ignore-errors) IGNORE_ERRORS=1; shift ;;
+      --deep) DEEP_VERIFY=1; shift ;;
+      --log-file) [[ $# -ge 2 ]] || die "--log-file requires a value"; LOG_FILE="$2"; shift 2 ;;
+      --snapshot) [[ $# -ge 2 ]] || die "--snapshot requires a value"; SNAPSHOT_NAME="$2"; shift 2 ;;
+      --path) [[ $# -ge 2 ]] || die "--path requires a value"; RESTORE_PATH="$2"; shift 2 ;;
+      --restore-to) [[ $# -ge 2 ]] || die "--restore-to requires a value"; RESTORE_DEST="$2"; shift 2 ;;
+      --keep-last) [[ $# -ge 2 ]] || die "--keep-last requires a value"; KEEP_LAST_OVERRIDE="$2"; shift 2 ;;
+      -h|--help) COMMAND="help"; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *) POSITIONAL_ARGS+=("$1"); shift ;;
     esac
   done
 }
 
 apply_positional_defaults() {
   case "$COMMAND" in
-    verify)
+    verify|restore|drill)
       if [[ -z "$SNAPSHOT_NAME" && "${#POSITIONAL_ARGS[@]}" -gt 0 ]]; then
         SNAPSHOT_NAME="${POSITIONAL_ARGS[0]}"
-      fi
-      ;;
-    restore)
-      if [[ -z "$SNAPSHOT_NAME" && "${#POSITIONAL_ARGS[@]}" -gt 0 ]]; then
-        SNAPSHOT_NAME="${POSITIONAL_ARGS[0]}"
+        POSITIONAL_ARGS=("${POSITIONAL_ARGS[@]:1}")
       fi
       ;;
   esac
+  [[ "${#POSITIONAL_ARGS[@]}" -eq 0 ]] || die "Unexpected positional argument: ${POSITIONAL_ARGS[0]}"
 }
 
 main() {
-  init_colors
   parse_args "$@"
   [[ -n "$COMMAND" ]] || COMMAND="help"
   apply_positional_defaults
-
   case "$COMMAND" in
-    help)
-      usage
-      ;;
-    plan)
-      show_plan
-      ;;
-    manual)
-      show_manual
-      ;;
-    run)
-      run_backup
-      ;;
-    list)
-      list_backups
-      ;;
-    verify)
-      verify_snapshot
-      ;;
-    restore)
-      restore_snapshot
-      ;;
-    *)
-      die "Unknown command: $COMMAND"
-      ;;
+    help) usage ;;
+    plan) show_plan ;;
+    manual) show_manual ;;
+    run) run_backup ;;
+    list) list_backups ;;
+    verify) verify_snapshot ;;
+    restore) restore_snapshot ;;
+    prune) prune_snapshots ;;
+    drill) drill_snapshot ;;
+    *) die "Unknown command: $COMMAND" ;;
   esac
 }
 

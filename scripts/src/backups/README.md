@@ -1,85 +1,169 @@
 # Backup Home
 
-`backup-home` is a Bash backup tool built around `rsync`.
+`backup-home` is a Bash CLI for inspectable, snapshot-style home backups built on
+`rsync`. It preserves absolute source layout inside timestamped directories, reuses
+unchanged files with hard links, and keeps restore possible with ordinary filesystem
+tools.
 
-It creates timestamped snapshots, uses one rules file for include and exclude logic,
-keeps restore simple by preserving the original absolute path layout inside each
-snapshot, and can stage manual-only files in a temporary folder during real backup
-runs.
+The behavior source of truth is `app-requirements.md`. The manifest wire format is
+documented in `docs/manifest-v1.md`.
 
-The current behavior source of truth is `app-requirements.md`.
+## Design boundaries
 
-## Files
+- `rsync` snapshots are the only backup engine.
+- A run is published only after copy, metadata generation, and self-verification
+  succeed.
+- Dry runs do not execute collectors, open manual staging, publish snapshots, or
+  delete data.
+- Repository exports are handled by explicit external wrappers, not clone/API logic
+  inside this tool.
+- Compression, GPG, cloud backends, database dumps, and automatic restore scripts
+  are intentionally outside the tool.
+
+## Requirements
+
+The target is Ubuntu 24.04 with Bash and standard utilities. The main required tools
+are `rsync`, `flock`, `find`, `du`, `df`, `sha256sum`, `shuf`, `readlink`, and common
+GNU core utilities. Optional inventory tools include `dconf`, `apt-mark`, `dpkg`,
+`snap`, `flatpak`, `crontab`, and `hostnamectl`.
+
+## Project layout
 
 ```text
 .
 ├── backup-home
-├── backup-home.rules
-├── backup-home.manual
-├── README.md
-└── app-requirements.md
+├── app-requirements.md
+├── config
+│   ├── profiles
+│   │   ├── home.conf          # ignored local config
+│   │   └── home.conf.sample
+│   ├── excludes
+│   │   ├── common.exclude
+│   │   ├── local.exclude      # ignored local config
+│   │   └── local.exclude.sample
+│   ├── manual
+│   │   ├── home.manual        # ignored local config
+│   │   └── home.manual.sample
+│   ├── collectors
+│   │   ├── enabled.conf       # ignored local config
+│   │   └── enabled.conf.sample
+│   └── retention
+│       └── default.conf
+├── docs
+│   └── manifest-v1.md
+└── tests
+    └── integration.sh
 ```
 
-## Rules File
+The old top-level `backup-home.rules` and `backup-home.manual` paths are no longer
+runtime fallbacks. Existing local values were migrated into `config/`; ignored legacy
+copies may be kept under `config/migration/` only for rollback.
 
-By default the app reads:
+For a fresh checkout, create the ignored local files from the tracked samples:
 
-```text
-./backup-home.rules
+```bash
+cp config/profiles/home.conf.sample config/profiles/home.conf
+cp config/excludes/local.exclude.sample config/excludes/local.exclude
+cp config/manual/home.manual.sample config/manual/home.manual
+cp config/collectors/enabled.conf.sample config/collectors/enabled.conf
 ```
 
-You can override it with `--config-file PATH`.
+Review every include, exclude, manual task, and collector before the first run.
 
-Format:
+## Configuration
+
+### Profile
+
+The default profile is `config/profiles/home.conf`:
 
 ```text
-# comment
-/home/home/my-files
-/home/home/Downloads/*.txt
-!/home/home/Desktop/temp
-!node_modules
-!bin
+include=/home/home/Downloads
+include=/home/home/my-files
+exclude_file=../excludes/common.exclude
+exclude_file=../excludes/local.exclude
 ```
 
-Rules behave like this:
+An include must be an absolute path or glob. `/` is rejected. `exclude_file` may be
+absolute or relative to the profile file. Pass a different profile with
+`--config-file PATH`.
 
-- a normal line includes an absolute path or glob pattern
-- a line starting with `!` excludes a path or pattern
-- absolute excludes match specific absolute paths
-- non-absolute excludes such as `!node_modules` or `!bin` match those names anywhere under included roots
-- inline comments are allowed after whitespace
-- blank lines are ignored
+### Excludes
 
-## Manual Checklist File
-
-By default the app reads:
+Exclude files contain one pattern per line without the old `!` prefix:
 
 ```text
-./backup-home.manual
+# Absolute path
+/home/home/Desktop/temp
+
+# Name matched below any included root
+node_modules
+bin
+obj
+
+# Glob
+*.tmp
 ```
 
-If you want a different checklist file, pass `--manual-file PATH`.
+Shared development/build exclusions belong in `config/excludes/common.exclude`.
+Machine-specific paths belong in the ignored `config/excludes/local.exclude`.
 
-Format:
+### Manual checklist
+
+The default `config/manual/home.manual` format is unchanged:
 
 ```text
-# comment
-# Title | Description
 Mobile Contacts
-OTP | Copy google Auth backups
+Passwords | Export the recovery material that is not already in a selected path
 ```
 
-Each line can be either `Title` or `Title | Description`. The description is
-optional. The `manual` command shows one task at a time and waits for confirmation
-before moving to the next item unless you use `--yes`.
+The `manual` command walks the list. A real run with checklist items creates an
+interactive staging tree and stores its contents under the stable snapshot path
+`.backup-home/artifacts/manual/`. The staging directory is removed on every exit
+path, including errors and signals.
 
-During a real `run`, the script also creates a temporary staging folder for manual
-tasks, opens it with `xdg-open` when available, and waits for you to place files
-there before the backup continues. Folder names are based on task titles. If a task
-has a description, the related folder gets a `task.txt` file with the title and
-description. The staged files are included in the snapshot, and the temporary folder
-is removed when the script exits, including successful completion, cancellation, and
-interrupts such as `Ctrl+C`.
+### Collectors
+
+Collectors are opt-in and listed in `config/collectors/enabled.conf`:
+
+```text
+required|system-inventory|builtin:system-inventory
+optional|repository-export|/absolute/path/to/repository-export-wrapper
+```
+
+The fields are mode, unique safe name, and command. External entries must be an
+absolute executable with no shell evaluation. Use a wrapper when arguments or more
+configuration are needed.
+
+Each collector receives:
+
+- `BACKUP_HOME_STAGE_DIR`: its private artifact directory
+- `BACKUP_HOME_SNAPSHOT_NAME`: the planned timestamp
+- `BACKUP_HOME_DEST`: the canonical destination
+
+Proxy variables already present in the environment are inherited. Tokens,
+environment dumps, and raw collector output are not written into the manifest.
+External collectors should put only deliberate recovery artifacts in their stage
+directory and must not print secrets.
+
+A required collector failure aborts the run. An optional failure is recorded and can
+produce a `success-with-warnings` snapshot. Dry-run lists collectors but never calls
+them.
+
+The built-in `system-inventory` collector captures available dconf settings, manual
+APT packages, dpkg selections, Snap and Flatpak application lists, current-user
+crontab, selected Nautilus data, OS metadata, tool versions, and a conservative
+`RESTORE.md`. It never runs with `sudo` and never applies settings or installs
+packages.
+
+### Retention
+
+`config/retention/default.conf` currently contains:
+
+```text
+keep_last=10
+```
+
+This does not schedule or trigger pruning. It is read only when `prune` is invoked.
 
 ## Commands
 
@@ -87,233 +171,224 @@ interrupts such as `Ctrl+C`.
 backup-home [global-options] <command> [command-options]
 ```
 
-Commands:
+- `plan`: show profile, excludes, resolved roots, size estimate, collectors, manual
+  tasks, and retention policy.
+- `manual`: walk through the manual checklist.
+- `run`: create or dry-run a snapshot.
+- `list`: list finalized snapshots with `success`, `success-with-warnings`, or
+  `legacy` status.
+- `verify`: perform basic verification; `--deep` also validates recorded checksums.
+- `restore`: dry-run or apply a full/partial restore.
+- `prune`: preview or apply keep-last retention.
+- `drill`: restore one selected path to a temporary directory and compare it.
+- `help`: show CLI usage.
 
-- `plan` - show the active rules, resolved backup roots, and manual checklist
-- `plan` also shows an estimated size breakdown for each resolved backup root after exclusions are applied
-- `manual` - print the manual checklist
-- `run` - create a new snapshot
-- `list` - list snapshots in the destination
-- `verify` - confirm a snapshot exists and check expected paths
-- `restore` - restore a full snapshot or one path
-- `help` - show usage
+Common options:
 
-## Global Options
+- `--dest PATH`
+- `--config-file PATH`
+- `--manual-file PATH`
+- `--collectors-file PATH`
+- `--retention-file PATH`
+- `--dry-run`
+- `--verbose`
+- `--yes`
+- `--ignore-errors`
+- `--log-file PATH`
 
-- `--dest PATH` - backup destination root
-- `--config-file PATH` - use a different rules file
-- `--manual-file PATH` - use a different manual checklist file
-- `--dry-run` - preview without writing changes
-- `--verbose` - show detailed `rsync` output
-- `--yes` - skip confirmation where supported
-- `--ignore-errors` - continue when rsync or verification hits recoverable errors
-- `--log-file PATH` - write the backup log to an explicit path
+`--ignore-errors` means “finish useful diagnostics where possible.” It never converts
+a required collector, rsync, verify, restore, drill, lock, or prune failure into exit
+code zero.
 
-## How Backup Works
+## Plan and backup
 
-- `backup-home` reads include and exclude rules from `backup-home.rules`
-- it resolves matching absolute paths
-- it estimates the size of each resolved backup root after exclusions and shows the largest ones first
-- for real backups with manual checklist items, it creates a temporary staging folder under `/tmp`
-- it includes that staging folder in the snapshot for that backup run
-- it creates a snapshot under `<dest>/snapshots/YYYY-MM-DD_HH-mm-ss`
-- it writes logs under `<dest>/logs/`
-- if an older snapshot exists, it uses `rsync --link-dest` to save space
-
-In practice:
-
-- the first snapshot is a full copy of the selected data
-- later snapshots still look complete, but unchanged files are reused with hard links
-- changed and new files are copied into the newer snapshot
-
-## Default Rules In This Project
-
-Current default includes:
-
-- `/home/home/Downloads`
-- `/home/home/Desktop`
-- `/home/home/my-files`
-- `/home/home/Private`
-- `/home/home/.dotfiles`
-- `/home/home/.gapcode`
-- `/home/home/.secure-exports`
-- `/home/home/.copilot`
-- `/home/home/.config/WirePanelClient`
-- `/home/home/backups/joplin`
-- `/home/home/backups/server`
-- `/media/home/09190305819/Medical`
-
-Current default excludes:
-
-- `/home/home/Desktop/temp`
-- `/home/home/.dotfiles/docker-services/adguard/data/adguard/workdir/data`
-- `/home/home/my-files/learning-daily`
-- global dev/build folders: `node_modules`, `bin`, `obj`, `dist`, `build`,
-  `.next`, `.nuxt`, `.cache`, and `coverage`
-
-## Examples
-
-Show the plan:
+Inspect the active configuration:
 
 ```bash
 ./backup-home --dest /media/home/backup-drive plan
 ```
 
-Dry-run a backup:
+Preview rsync without collectors or staging:
 
 ```bash
 ./backup-home --dest /media/home/backup-drive run --dry-run
 ```
 
-Dry-run and continue even if some paths fail:
-
-```bash
-./backup-home --dest /media/home/backup-drive --ignore-errors run --dry-run
-```
-
-Run a real backup:
+Create a real snapshot after the confirmation prompt:
 
 ```bash
 ./backup-home --dest /media/home/backup-drive run
 ```
 
-List snapshots:
+For intentional unattended execution without manual checklist items:
 
 ```bash
-./backup-home --dest /media/home/backup-drive list
+./backup-home --dest /media/home/backup-drive run --yes
 ```
 
-Verify the latest snapshot:
+A real run uses this transaction:
+
+1. Validate config, sources, destination, estimated size, collectors, and lock.
+2. Create temporary manual/collector staging.
+3. Copy selected sources into `snapshots/.incomplete-TIMESTAMP-PID`.
+4. Copy generated artifacts and create report/checksums/manifest.
+5. Perform basic self-verification.
+6. Atomically rename the incomplete directory to `snapshots/TIMESTAMP`.
+
+If a required step fails, the incomplete snapshot and staging are removed. The dated
+log plus `*.failure.tsv` and `*.failure.txt` remain under `<dest>/logs/`.
+
+## Destination layout and locking
+
+```text
+<dest>/
+├── .backup-home/
+│   ├── run.lock
+│   └── lock-owner.tsv
+├── logs/
+└── snapshots/
+    └── YYYY-MM-DD_HH-mm-ss/
+        ├── home/home/...
+        └── .backup-home/
+            ├── manifest.tsv
+            ├── report.txt
+            ├── checksums.sha256
+            └── artifacts/
+```
+
+Real `run` and `prune --yes` operations use an exclusive `flock`. `list`, `verify`,
+`restore`, `drill`, and previews use a shared lock. A lock conflict returns exit code
+75 and prints available owner metadata. A stale file alone cannot hold a lock.
+
+## Verify
+
+Verify the latest finalized snapshot:
 
 ```bash
 ./backup-home --dest /media/home/backup-drive verify
 ```
 
-Restore one path from a snapshot:
+Verify one snapshot and its recorded checksum sample:
 
 ```bash
 ./backup-home --dest /media/home/backup-drive \
-  restore 2026-04-07_12-00-00 \
+  verify 2026-07-17_12-00-00 --deep
+```
+
+Basic verification uses captured roots from the snapshot manifest, not today's
+profile. It also validates status, required collector artifact directories, and file
+count. Deep verification checks all generated artifacts plus up to 16 recorded
+payload files no larger than 16 MiB.
+
+Snapshots created before manifests are shown as `legacy`. They remain listable and
+restorable, and basic verification falls back to the current profile with a warning.
+Deep verification is unavailable for them.
+
+## Prune
+
+Preview snapshots older than the newest configured count:
+
+```bash
+./backup-home --dest /media/home/backup-drive prune
+```
+
+Preview a one-off policy:
+
+```bash
+./backup-home --dest /media/home/backup-drive prune --keep-last 5
+```
+
+Apply exactly the displayed candidates:
+
+```bash
+./backup-home --dest /media/home/backup-drive prune --keep-last 5 --yes
+```
+
+Prune considers only timestamp-named directories, requires at least one retained
+snapshot, revalidates candidates under the exclusive lock, and logs each deletion.
+Hard-linked snapshots remain independently inspectable; actual reclaimed space can
+be smaller than their apparent size.
+
+## Restore and restore drill
+
+Restore defaults to dry-run. Partial restore now preserves the original absolute
+layout below the alternate destination.
+
+```bash
+./backup-home --dest /media/home/backup-drive \
+  restore 2026-07-17_12-00-00 \
   --path /home/home/.dotfiles \
   --restore-to /tmp/restore-dotfiles
 ```
 
-Apply the restore for real:
+The corresponding real restore writes to:
 
-```bash
-./backup-home --dest /media/home/backup-drive \
-  restore 2026-04-07_12-00-00 \
-  --path /home/home/.dotfiles \
-  --restore-to /tmp/restore-dotfiles \
-  --yes
-```
-
-## Restore Joplin Backups
-
-The default rules include `/home/home/backups/joplin`, which should contain
-Joplin PostgreSQL dumps, `.sha256` files, and optional `.gpg` copies created by
-the VPS migration helper.
-
-Restore the backup folder from a snapshot into a staging directory first:
-
-```bash
-./backup-home --dest /media/home/backup-drive \
-  restore 2026-04-07_12-00-00 \
-  --path /home/home/backups/joplin \
-  --restore-to /tmp/restore-joplin
-```
-
-Apply the folder restore only after reviewing the dry-run:
-
-```bash
-./backup-home --dest /media/home/backup-drive \
-  restore 2026-04-07_12-00-00 \
-  --path /home/home/backups/joplin \
-  --restore-to /tmp/restore-joplin \
-  --yes
-```
-
-Verify the dump before using it:
-
-```bash
-cd /tmp/restore-joplin/home/home/backups/joplin
-sha256sum -c joplin-YYYYMMDDTHHMMSSZ.dump.sha256
-```
-
-To restore Joplin on the VPS, stop the app, restore the selected dump into the
-PostgreSQL container, then start and verify the app:
-
-```bash
-ssh arvan 'sudo docker stop arvan-joplin-app'
-cat /tmp/restore-joplin/home/home/backups/joplin/joplin-YYYYMMDDTHHMMSSZ.dump \
-  | ssh arvan 'sudo docker exec -i arvan-joplin-db sh -lc '"'"'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --no-privileges --exit-on-error'"'"''
-ssh arvan 'sudo docker start arvan-joplin-app'
-/home/home/my-files/temp/arvan-vps/scripts/joplin-vps status arvan
-```
-
-Use the local rollback database only when intentionally rolling back to the old
-local Joplin stack. Do not run the local and VPS Joplin apps against
-independently changing databases.
-
-## Restore Server Artifact Backups
-
-The default rules include `/home/home/backups/server`. This folder is for local
-artifacts pulled from servers, not the live server itself.
-
-Restore it into a staging directory first:
-
-```bash
-./backup-home --dest /media/home/backup-drive \
-  restore 2026-04-07_12-00-00 \
-  --path /home/home/backups/server \
-  --restore-to /tmp/restore-server
+```text
+/tmp/restore-dotfiles/home/home/.dotfiles
 ```
 
 Apply after reviewing the dry-run:
 
 ```bash
 ./backup-home --dest /media/home/backup-drive \
-  restore 2026-04-07_12-00-00 \
-  --path /home/home/backups/server \
-  --restore-to /tmp/restore-server \
+  restore 2026-07-17_12-00-00 \
+  --path /home/home/.dotfiles \
+  --restore-to /tmp/restore-dotfiles \
   --yes
 ```
 
-After restore, inspect any checksum, manifest, or service-specific README files
-inside `/tmp/restore-server/home/home/backups/server`. Restore artifacts back to
-a live server only through that service's own documented procedure; do not
-blindly overwrite live server paths.
+Snapshot names and selected paths reject traversal. `/` and destinations inside the
+backup destination are rejected. A full restore excludes internal `.backup-home`
+metadata from the restored payload.
 
-Walk the manual checklist interactively:
-
-```bash
-./backup-home manual
-```
-
-Use a custom manual checklist file:
+Exercise one path without keeping restored files:
 
 ```bash
-./backup-home --manual-file /path/to/my.manual manual
+./backup-home --dest /media/home/backup-drive \
+  drill 2026-07-17_12-00-00 \
+  --path /home/home/.dotfiles
 ```
 
-## Safety Notes
+The drill copies the selected path to `mktemp -d`, compares it with checksum-aware
+rsync, reports differences as failure, and cleans the temporary tree on every exit.
 
-- `--dest` is required for commands that operate on snapshots
-- the tool refuses `/` as a destination
-- the tool refuses destinations inside configured source roots
-- `run` supports dry-run mode
-- missing configured paths are reported as warnings and skipped
-- `restore` defaults to dry-run unless `--yes` is provided
-- the tool estimates free space before a real backup
-- `plan` and `run` show an estimated size breakdown for each backup root
-- real `run` creates a manual staging folder for checklist items and removes it when the script exits
-- real backups write logs under `<dest>/logs/`
-- `manual` pauses after each task unless `--yes` is provided
-- `--ignore-errors` lets backup and verify continue with warnings instead of stopping on some errors
+## Joplin and server artifacts
 
-## Customization
+If the active profile includes `/home/home/backups/joplin`, restore it into staging:
 
-Edit `backup-home.rules` to change what gets backed up.
+```bash
+./backup-home --dest /media/home/backup-drive \
+  restore 2026-07-17_12-00-00 \
+  --path /home/home/backups/joplin \
+  --restore-to /tmp/restore-joplin \
+  --yes
+```
 
-Use normal lines to include and `!` lines to exclude. If you want to use a totally
-separate rule set, create another file and pass it with `--config-file`.
+The files are then under:
+
+```text
+/tmp/restore-joplin/home/home/backups/joplin
+```
+
+Verify service-specific `.sha256` files and follow the Joplin PostgreSQL restore
+procedure separately. `backup-home` restores files; it does not stop services or run
+`pg_restore`.
+
+The same distinction applies to `/home/home/backups/server`: it contains local
+artifacts pulled from servers, not the live servers. Restore them to staging, inspect
+their manifests/checksums/readmes, and use each service's documented recovery flow.
+
+## Validation
+
+Run the complete isolated suite:
+
+```bash
+bash -n backup-home tests/integration.sh
+shellcheck -x backup-home tests/integration.sh
+tests/integration.sh
+```
+
+The suite uses only temporary sources and destinations. It covers dry-run, two linked
+snapshots, manifests, required/optional collectors, system inventory, rsync failure,
+signal cleanup, lock conflicts, retention, basic/deep verification, checksum
+tampering, legacy snapshots, safe partial restore, traversal rejection, and drill.

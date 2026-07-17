@@ -1,215 +1,115 @@
-# Backup Home Script Requirements
+# Backup Home Requirements
 
-## Purpose
+## Purpose and platform
 
-Create a command-line backup script for the current Ubuntu workstation that backs up
-important files and folders from explicitly configured absolute paths to a
-user-selected destination.
+`backup-home` is a Bash CLI for safe, inspectable backups of explicitly selected
+absolute paths on Ubuntu 24.04. It uses `rsync 3.2.7` and timestamped filesystem
+snapshots as its only backup engine.
 
-The default focus is `/home/home`, but the rules file may also include other
-absolute paths such as mounted external folders.
+The tool must remain understandable, dependency-light, dry-run friendly, and safe
+for local external disks or mounted filesystems. Archive-only engines, built-in
+compression, GPG wrappers, cloud backends, database dumps, and automatic repository
+mirroring are outside this version.
 
-## Target Environment
+## Configuration
 
-- OS: Ubuntu 24.04
-- Shell: `zsh`, but the script itself should run with `bash`
-- Primary home root: `/home/home`
-- Additional source roots: allowed when explicitly listed in the rules file
-- Primary usage: local backup to an external disk or mounted filesystem
-- Available backup engine: `rsync 3.2.7`
+All active configuration lives under `config/`:
 
-## Implementation Decision
+- `config/profiles/home.conf` defines `include=ABSOLUTE_PATH_OR_GLOB` entries and
+  repeated `exclude_file=PATH` references.
+- exclude files contain one absolute or global pattern per line without a leading
+  `!`; relative exclude-file references resolve from the profile directory.
+- `config/manual/home.manual` contains `Title` or `Title | Description` checklist
+  entries.
+- `config/collectors/enabled.conf` contains `MODE|NAME|COMMAND` collector entries.
+- `config/retention/default.conf` contains `keep_last=POSITIVE_INTEGER`.
 
-- Language: Bash
-- Primary engine: `rsync`
-- Rationale: the script is orchestration around standard Linux tools, should stay
-  easy to audit, and should keep runtime dependencies minimal
+Comments start with `#`; blank lines are ignored. Control characters, unknown keys,
+duplicate collector names, non-absolute includes, and dangerous root includes are
+invalid. The CLI may override each default config path. Legacy top-level rules and
+manual files are not runtime fallbacks.
 
-## Main Goals
+## Commands and options
 
-- back up important personal and development data from a simple rules file
-- use one backup rules file for include and exclude logic
-- support dry runs before real writes
-- support repeatable snapshot-style backups
-- make partial restore easy
-- keep the script understandable and maintainable
+Required commands are `plan`, `manual`, `run`, `list`, `verify`, `restore`, `prune`,
+`drill`, and `help`.
 
-## Backup Model
+Global options are `--dest`, `--config-file`, `--manual-file`, `--collectors-file`,
+`--retention-file`, `--dry-run`, `--verbose`, `--yes`, `--ignore-errors`, and
+`--log-file`. Command options include `--snapshot`, `--path`, `--restore-to`,
+`--keep-last`, and `--deep`.
 
-- create snapshot directories instead of one giant tarball
-- create a timestamped snapshot for each run
-- use sortable names such as `YYYY-MM-DD_HH-mm-ss`
-- keep the destination layout easy to inspect with normal filesystem tools
-- preserve path structure and metadata as supported by `rsync`
+`--ignore-errors` may allow an operation to finish collecting diagnostics, but it
+must never turn a required collector, rsync, verify, restore, drill, lock, or prune
+failure into a successful exit code.
 
-## Required Commands
+## Snapshot transaction and layout
 
-The script must support:
+- Real runs create `snapshots/.incomplete-TIMESTAMP-PID` and publish the final
+  `snapshots/TIMESTAMP` only after rsync, artifact collection, manifest creation,
+  and basic self-verification succeed.
+- Failed or interrupted runs remove temporary staging and incomplete snapshot data.
+  Their log and failure report remain under `logs/`.
+- Final snapshots preserve absolute path layout and may reuse unchanged files with
+  `rsync --link-dest` against the latest finalized snapshot.
+- Every final snapshot contains `.backup-home/manifest.tsv`, `report.txt`,
+  `checksums.sha256`, and stable `artifacts/manual` and `artifacts/collectors`
+  locations.
+- The manifest records schema version, timing, host and OS, safe config digest,
+  roots, excludes, previous snapshot, collector results, rsync status, warnings,
+  payload metrics, checksum count, and script revision/digest. It must not contain
+  tokens, environment dumps, or raw authentication diagnostics.
 
-- `plan`
-- `manual`
-- `run`
-- `list`
-- `verify`
-- `restore`
-- `help`
+## Collectors and manual staging
 
-## Required Global Options
+- Collectors are explicitly enabled as `required|name|builtin:system-inventory` or
+  `optional|name|/absolute/executable`; arbitrary directory auto-discovery and
+  `eval` are forbidden.
+- Each collector receives a private staging directory through
+  `BACKUP_HOME_STAGE_DIR`. Dry runs list collectors but never execute them.
+- A required collector failure aborts the backup. An optional collector failure is
+  recorded as a warning and may produce a successful-with-warnings snapshot.
+- The opt-in system inventory collector exports dconf, manual APT packages, dpkg
+  selections, Snap and Flatpak lists when available, crontab, selected Nautilus
+  data, OS/tool versions, and conservative restore guidance. It never uses sudo or
+  automatically restores settings.
+- Repository recovery uses only an explicit external collector or an included local
+  artifact path. GitHub/GitLab clone and API logic do not belong in the backup core.
+- Real manual staging remains interactive and is stored under the stable manual
+  artifact path. All staging is removed on success, error, cancellation, or signal.
 
-- `--dest PATH`
-- `--config-file PATH`
-- `--manual-file PATH`
-- `--dry-run`
-- `--verbose`
-- `--yes`
-- `--ignore-errors`
-- `--log-file PATH`
+## Locking, retention, verification, and restore
 
-## Backup Rules File
+- `run` and real `prune` use an exclusive destination lock. `list`, `verify`,
+  `restore`, `drill`, and read-only previews use a shared lock. `plan`, `manual`,
+  and `help` do not lock.
+- Lock conflicts are failures and identify the lock path and available owner
+  metadata. Stale lock files do not block because ownership is enforced by `flock`.
+- Pruning is an explicit command, previews by default, requires `--yes` for deletion,
+  requires `keep_last >= 1`, considers only valid timestamp directories, protects
+  the newest retained snapshots, revalidates candidates under the exclusive lock,
+  and logs every deletion. Backup runs never prune automatically.
+- Basic verification validates the manifest, captured roots, required collector
+  artifacts, file count, and status. Legacy snapshots without manifests remain
+  listable/restorable and use the current profile for basic verification.
+- Each new snapshot records checksums for generated artifacts and at most 16 sampled
+  regular payload files no larger than 16 MiB. `verify --deep` checks that recorded
+  set; full checksum scans remain out of scope.
+- Restore defaults to dry-run and requires `--yes` for real writes. Snapshot names
+  and selected paths are validated against traversal. Partial restore preserves the
+  original absolute path layout beneath the chosen alternate destination.
+- `drill` requires an explicit absolute path, restores it to a temporary directory,
+  compares source and restored content with checksum-aware rsync, returns non-zero
+  on mismatch, and always cleans its temporary data.
 
-The backup selection config must live in a single rules file.
+## Safety and acceptance
 
-Default file name:
+The backup destination must not be `/`, `/home/home`, or inside a configured source.
+Missing configured sources warn and continue, but invalid configuration and required
+operation failures are non-zero. Real runs confirm destination and estimated size,
+write dated logs, and never expose secrets in summaries.
 
-- `backup-home.rules`
-
-The script should also allow the user to pass a different file path with
-`--config-file`.
-
-### Rules Format
-
-- one rule per line
-- `#` starts a comment
-- blank lines are ignored
-- a normal line includes an absolute path or glob pattern
-- a line starting with `!` excludes an absolute path, absolute glob, or a global name such as `node_modules`
-- inline comments after whitespace are allowed
-
-Examples:
-
-```text
-# include a full folder
-/home/home/my-files
-
-# include only matching files
-/home/home/Downloads/*.txt
-
-# exclude a path or pattern
-!/home/home/Desktop/temp
-
-# exclude matching names anywhere under included roots
-!node_modules
-!bin
-```
-
-## Manual Checklist File
-
-The script should support a separate manual checklist file for informational items.
-
-Default file name:
-
-- `backup-home.manual`
-
-The script should also allow the user to pass a different checklist path with:
-
-- `--manual-file`
-
-Format:
-
-- one checklist item per line
-- `#` starts a comment
-- blank lines are ignored
-- each line may be either `Title` or `Title | Description`
-- the description part is optional
-
-Examples:
-
-- OTP
-- Mobile Contacts
-- Google Authenticator | Copy exported backup files
-- Bookmarks
-
-### Manual Command Behavior
-
-- if no custom path is provided, use the default manual checklist file name
-- show one task at a time
-- wait for user confirmation before moving to the next task
-- allow skipping the pause with `--yes`
-- during a real backup run, create a temporary staging folder for manual checklist files
-- open that staging folder for the user when possible and wait before continuing
-- name staging subfolders from manual task titles
-- when a manual task has a description, create `task.txt` in that task folder with the title and description
-- include the staged manual files in that backup run
-- remove the staging folder when the script exits, including cancellation and interrupts
-
-## Safety Requirements
-
-- refuse to run if `--dest` is missing where required
-- refuse clearly dangerous destinations such as `/`
-- refuse destinations inside any configured source path
-- check that the destination exists or can be created
-- estimate available free space before a real backup
-- support dry-run mode for every write-capable command
-- print a clear summary before starting a real backup
-- show an estimated size breakdown for each resolved backup root during planning and backup startup, with exclude rules reflected in the estimate
-- if a configured backup path does not exist, show a warning and continue
-- support an option to continue on recoverable backup or verification errors
-
-## Logging and Output
-
-- each real backup run should write a dated log file by default
-- logs should include the rules file, destination, start time, end time, and final status
-- console output should be human-readable and concise by default
-- `--verbose` should expose more detailed `rsync` output
-- errors should be explicit and actionable
-
-## Restore Requirements
-
-- support restoring an entire snapshot
-- support restoring a single path from a snapshot
-- support restoring to an alternate destination path
-- default restore to dry-run unless `--yes` is provided
-- do not silently overwrite data without a clear confirmation path
-
-## Verification Requirements
-
-- confirm that the target snapshot exists
-- confirm that expected paths derived from the current rules file are present
-- report snapshot size and basic file counts
-- full checksum verification is out of scope for v1
-
-## Incremental Snapshot Behavior
-
-- create distinct timestamped snapshots
-- use `rsync --link-dest` when practical to reduce storage usage
-- keep restore behavior transparent even when hard links are used
-
-## Non-Functional Requirements
-
-- keep the script readable and self-contained
-- avoid nonstandard dependencies
-- work on a default Ubuntu installation with `bash`, `find`, `du`, `df`, and `rsync`
-- fail fast on invalid input
-- use English for help text, comments, and logs
-
-## Out of Scope for v1
-
-- cloud backup providers
-- database-aware dumps
-- Docker volume export automation
-- encrypted storage built into the script
-- GUI or TUI interfaces
-- full checksum verification of all files
-
-## Acceptance Criteria
-
-The v1 script is acceptable when all of the following are true:
-
-- a user can preview the active rules with `plan`
-- a user can run a dry-run backup with `run --dry-run`
-- a user can run a real backup to an external destination
-- a timestamped snapshot directory is created successfully
-- the rules file can both include and exclude paths
-- the `manual` command prints checklist items from `backup-home.manual`
-- a user can list snapshots and restore one path from a chosen snapshot
-- the script logs its work and exits with a meaningful status code
+Acceptance requires syntax and ShellCheck validation plus isolated integration tests
+for help/plan/dry-run, two linked snapshots, manifests, collectors, failure cleanup,
+locking, pruning, basic/deep verification, legacy handling, safe partial restore,
+restore drill, traversal rejection, and meaningful exit codes.

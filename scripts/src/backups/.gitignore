@@ -1,2 +1,7 @@
-backup-home.rules
-backup-home.manual
+config/profiles/*.conf
+!config/profiles/*.conf.sample
+config/excludes/local.exclude
+config/manual/*.manual
+!config/manual/*.manual.sample
+config/collectors/enabled.conf
+config/migration/
