@@ -40,6 +40,9 @@ source_uid           numeric source user ID
 source_gid           numeric source primary group ID
 source_home          canonical source home path
 profile_name         profile basename only
+sensitive_profile    yes | no
+destination_encryption_state detected | not-detected | unknown | not-applicable
+unencrypted_destination_policy warn | require | allow
 config_digest        SHA-256 over profile/exclude/collector config inputs
 previous_snapshot    timestamp or none
 rsync_exit_code      integer
@@ -53,6 +56,13 @@ checksum_count       records in checksums.sha256
 The four source identity fields are the schema v2 addition. `restore-plan` reports
 them, and `recover` uses `source_home` as the default mapping prefix. A different
 target account or layout may be selected explicitly without rewriting the snapshot.
+
+The three sensitivity fields are backward-compatible schema v2 extensions. For a
+sensitive profile, the producer walks the mounted destination's block-device
+ancestry and reports whether a `crypto_LUKS` layer is visible. `unknown` means the
+tools or mount topology did not permit a reliable answer. `not-applicable` means the
+profile was not marked sensitive. This is a local best-effort observation, not a
+cryptographic attestation.
 
 The configuration digest identifies inputs without embedding their contents. The
 manifest must not contain tokens, environment dumps, connection strings, or raw

@@ -1,0 +1,4 @@
+# firefox-root|snap/firefox/common/.mozilla/firefox
+# chromium-root|.config/google-chrome
+# firefox-extension|onetab|extension@one-tab.com|required
+# firefox-extension|proxy-settings|example@example.invalid|optional

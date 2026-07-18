@@ -1,0 +1,14 @@
+# host|ssh-alias
+# cache-relative|backups/server/ssh-alias
+# max-age-hours|24
+# keep-snapshots|2
+# config-path|/etc/example-service
+# config-exclude|/var/lib/example/*/access.log
+# sqlite|service-label|/var/lib/example/state.db|systemd:example.service
+# sqlite|container-label|/var/lib/example/other.db|docker:example-container
+# log-unit|example.service
+# docker-log|example-container
+# log-days|7
+# log-max-bytes|52428800
+# joplin-helper|/absolute/path/to/trusted/helper
+# joplin-backup-relative|backups/joplin

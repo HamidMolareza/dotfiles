@@ -2,4 +2,9 @@
 # All collectors are disabled in this sample until the operator reviews them.
 # required|system-inventory|builtin:system-inventory
 # required|docker-recovery|/absolute/path/to/collectors/docker-recovery
+# required|credentials-recovery|/absolute/path/to/collectors/credentials-recovery
+# required|codex-mcp-recovery|/absolute/path/to/collectors/codex-mcp-recovery
+# required|browser-recovery|/absolute/path/to/collectors/browser-recovery
+# required|github-recovery|/absolute/path/to/collectors/github-recovery
+# required|server-recovery|/absolute/path/to/collectors/server-recovery
 # optional|repository-export|/absolute/path/to/repository-export-wrapper

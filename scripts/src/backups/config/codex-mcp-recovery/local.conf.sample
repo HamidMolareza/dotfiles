@@ -1,0 +1,7 @@
+# kind|category|home-relative-path
+# sqlite|codex|.codex/state.sqlite
+# sqlite|mcp|.local/share/example-mcp/data.sqlite
+# static|mcp|.local/share/example-mcp/legacy.db
+# candidate-root|.codex
+# candidate-root|.local/share/example-mcp
+# ignore-root|.codex/cache

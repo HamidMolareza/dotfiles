@@ -6,5 +6,12 @@ config/manual/*.manual
 !config/manual/*.manual.sample
 config/collectors/*.conf
 config/docker-recovery/*.conf
+config/credentials-recovery/*.conf
+config/codex-mcp-recovery/*.conf
+config/browser-recovery/*.conf
+config/github-recovery/*.conf
+config/server-recovery/*.conf
 config/restore/*.conf
 !config/restore/handlers.local.conf.sample
+__pycache__/
+*.pyc

@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ACTION="${1:-}"
+COMPONENT="${2:-}"
+ARTIFACT_DIR="${BACKUP_HOME_ARTIFACT_DIR:-}"
+SOURCE_HOME="${BACKUP_HOME_SOURCE_HOME:-}"
+TARGET_HOME="${BACKUP_HOME_TARGET_HOME:-}"
+TARGET_UID="${BACKUP_HOME_TARGET_UID:-}"
+SESSION_DIR="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+DRY_RUN="${BACKUP_HOME_RESTORE_DRY_RUN:-0}"
+DESTRUCTIVE_APPROVED="${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}"
+CONFIG_FILE="${BACKUP_HOME_GITHUB_CONFIG:-$PROJECT_DIR/config/github-recovery/local.conf}"
+CACHE_RELATIVE="backups/github"
+declare -a ACCOUNTS=()
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+validate_relative() {
+  [[ -n "$1" && "$1" != /* && ! "$1" =~ (^|/)\.\.?(/|$) ]] || fail "Unsafe GitHub cache path"
+}
+
+load_config() {
+  local line kind value _extra
+  [[ -f "$CONFIG_FILE" ]] || fail "GitHub recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind value _extra <<<"$line"
+    case "$kind" in
+      account) ACCOUNTS+=("$value") ;;
+      cache-relative) validate_relative "$value"; CACHE_RELATIVE="$value" ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+describe() {
+  if [[ -d "$BACKUP_HOME_SNAPSHOT_DIR$SOURCE_HOME/$CACHE_RELATIVE" ]]; then
+    printf 'component\tgithub.local-mirrors\tGitHub repository, wiki, gist, and metadata mirrors\tfiles-only\tsafe\trecommended\n'
+    printf 'path\tgithub.local-mirrors\t%s/%s\n' "$SOURCE_HOME" "$CACHE_RELATIVE"
+  fi
+  if find "$ARTIFACT_DIR/credentials" -type f -name '*.token' -print -quit 2>/dev/null | grep -q .; then
+    printf 'component\tgithub.credentials\tGitHub CLI credentials\tautomatic\tdestructive\trecommended\n'
+  fi
+  printf 'component\tgithub.remote-rebuild\tReview and rebuild GitHub remotes\tguided\tmanual\toptional\n'
+}
+
+preflight() {
+  case "$COMPONENT" in
+    github.local-mirrors)
+      command -v git >/dev/null 2>&1 && printf 'ok\tGit is available for mirror verification\n' || printf 'blocker\tGit is unavailable\n'
+      ;;
+    github.credentials)
+      command -v gh >/dev/null 2>&1 && printf 'ok\tGitHub CLI is available\n' || printf 'blocker\tGitHub CLI is unavailable\n'
+      [[ -z "$TARGET_UID" || "$TARGET_UID" == "$(id -u)" ]] \
+        || printf 'blocker\tGitHub keyring import must run as the target desktop user\n'
+      [[ ! -s "$TARGET_HOME/.config/gh/hosts.yml" ]] || { printf 'risk\tdestructive\n'; printf 'warning\tExisting GitHub CLI authentication will be safety-copied\n'; }
+      ;;
+    github.remote-rebuild)
+      printf 'warning\tRemote repository creation and pushes always require operator review\n'
+      printf 'risk\tmanual\n'
+      ;;
+    *) fail "Unknown GitHub recovery component: $COMPONENT" ;;
+  esac
+}
+
+apply_credentials() {
+  local token account current_token safety="$SESSION_DIR/safety/github.credentials"
+  [[ "$DESTRUCTIVE_APPROVED" -eq 1 ]] || fail "GitHub credential recovery requires destructive approval"
+  [[ -z "$TARGET_UID" || "$TARGET_UID" == "$(id -u)" ]] \
+    || fail "GitHub credential recovery must run as the target desktop user"
+  if [[ "$DRY_RUN" -eq 1 ]]; then printf 'Would import GitHub CLI credentials without printing tokens.\n'; return 0; fi
+  mkdir -p -- "$safety"
+  chmod 700 -- "$safety"
+  [[ ! -e "$TARGET_HOME/.config/gh" ]] || cp -a -- "$TARGET_HOME/.config/gh" "$safety/gh-config"
+  for account in "${ACCOUNTS[@]}"; do
+    current_token="$(HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" env -u GITHUB_TOKEN -u GH_TOKEN \
+      gh auth token --hostname github.com --user "$account" 2>/dev/null || true)"
+    [[ -n "$current_token" ]] || continue
+    printf '%s\n' "$current_token" >"$safety/pre-restore-$account.token"
+    chmod 600 -- "$safety/pre-restore-$account.token"
+    current_token=""
+  done
+  while IFS= read -r -d '' token; do
+    account="$(basename -- "$token" .token)"
+    [[ "$account" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || fail "Unsafe GitHub account artifact"
+    HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" env -u GITHUB_TOKEN -u GH_TOKEN \
+      gh auth login --hostname github.com --git-protocol https --with-token \
+      <"$token" >/dev/null 2>&1 || fail "GitHub CLI rejected the stored token for $account"
+  done < <(find "$ARTIFACT_DIR/credentials" -type f -name '*.token' -print0)
+}
+
+apply_remote_guide() {
+  local guide="$SESSION_DIR/github-remote-rebuild.md"
+  {
+    printf '# GitHub remote rebuild\n\n'
+    printf 'No remote changes were made. For each account, first validate authentication:\n\n'
+    printf '```bash\n'
+    for account in "${ACCOUNTS[@]}"; do printf 'env -u GITHUB_TOKEN -u GH_TOKEN gh auth status --hostname github.com\n'; done
+    printf '```\n\n'
+    printf 'Inspect bare mirrors under `%s/%s/accounts/ACCOUNT/repos`. Verify each with `git fsck --full`.\n\n' "$TARGET_HOME" "$CACHE_RELATIVE"
+    printf 'Create an empty destination repository only after checking visibility, archived state, default branch, rules, issues, and release metadata. Then run an explicit reviewed `git push --mirror` for that one repository. Never bulk-push without reviewing name collisions and ownership.\n'
+  } >"$guide"
+  chmod 600 -- "$guide"
+  printf 'Remote rebuild guide: %s\n' "$guide"
+  return 20
+}
+
+apply() {
+  case "$COMPONENT" in
+    github.local-mirrors) : ;;
+    github.credentials) apply_credentials ;;
+    github.remote-rebuild) apply_remote_guide ;;
+    *) fail "Component is handled by the core or is unknown: $COMPONENT" ;;
+  esac
+}
+
+verify() {
+  local token account actual mirror found=0
+  case "$COMPONENT" in
+    github.local-mirrors)
+      while IFS= read -r -d '' mirror; do
+        git -C "$mirror" fsck --connectivity-only >/dev/null || return 1
+        found=1
+      done < <(find "$TARGET_HOME/$CACHE_RELATIVE/accounts" -type d \
+        \( -path '*/repos/*.git' -o -path '*/wikis/*.git' -o -path '*/gists/*.git' \) -print0 2>/dev/null)
+      [[ "$found" -eq 1 ]] || return 1
+      ;;
+    github.credentials)
+      while IFS= read -r -d '' token; do
+        account="$(basename -- "$token" .token)"
+        actual="$(HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" env -u GITHUB_TOKEN -u GH_TOKEN \
+          gh auth token --hostname github.com --user "$account" 2>/dev/null)" || return 1
+        [[ -n "$actual" ]] || return 1
+        actual=""
+      done < <(find "$ARTIFACT_DIR/credentials" -type f -name '*.token' -print0)
+      ;;
+    github.remote-rebuild) return 20 ;;
+  esac
+}
+
+guide() {
+  case "$COMPONENT" in
+    github.credentials) printf '%s\n' 'Validate each account with `env -u GITHUB_TOKEN -u GH_TOKEN gh auth status`; do not paste tokens into a shared terminal or log.' ;;
+    github.remote-rebuild) printf '%s\n' 'Use the generated guide one repository at a time. Actions and webhook secret values must be re-entered from the password manager because GitHub never exports them.' ;;
+    github.local-mirrors) printf '%s\n' 'Run `git fsck --full` on important bare mirrors and compare exported repository metadata before any remote rebuild.' ;;
+    *) fail "Unknown GitHub recovery component: $COMPONENT" ;;
+  esac
+}
+
+[[ -d "$ARTIFACT_DIR" && -n "$TARGET_HOME" && -n "$SESSION_DIR" ]] || fail "Restore environment is incomplete"
+load_config
+case "$ACTION" in
+  describe) describe ;;
+  preflight) preflight ;;
+  apply) apply ;;
+  verify) verify ;;
+  guide) guide ;;
+  *) fail "Unknown restore handler action: $ACTION" ;;
+esac

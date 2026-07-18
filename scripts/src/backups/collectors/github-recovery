@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+CONFIG_FILE="${BACKUP_HOME_GITHUB_CONFIG:-$PROJECT_DIR/config/github-recovery/local.conf}"
+EXPORT_HELPER="$PROJECT_DIR/lib/github-export.py"
+CACHE_RELATIVE="backups/github"
+MAX_AGE_HOURS=168
+MIGRATION_INTERVAL_HOURS=168
+KEEP_MIGRATIONS=2
+declare -a ACCOUNTS=()
+ASKPASS_FILE=""
+ACTIVE_TOKEN=""
+
+cleanup() {
+  [[ -z "$ASKPASS_FILE" ]] || rm -f -- "$ASKPASS_FILE"
+  ACTIVE_TOKEN=""
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+load_config() {
+  local line kind value extra
+  [[ -f "$CONFIG_FILE" ]] || collector_fail "GitHub recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind value extra <<<"$line"
+    [[ -n "$value" && -z "${extra:-}" ]] || collector_fail "Invalid GitHub recovery config entry: $line"
+    case "$kind" in
+      account)
+        [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || collector_fail "Invalid GitHub owner: $value"
+        ACCOUNTS+=("$value")
+        ;;
+      cache-relative) collector_validate_relative_path "$value"; CACHE_RELATIVE="$value" ;;
+      max-age-hours) [[ "$value" =~ ^[1-9][0-9]*$ ]] || collector_fail "max-age-hours must be positive"; MAX_AGE_HOURS="$value" ;;
+      migration-interval-hours) [[ "$value" =~ ^[1-9][0-9]*$ ]] || collector_fail "migration-interval-hours must be positive"; MIGRATION_INTERVAL_HOURS="$value" ;;
+      keep-migrations) [[ "$value" =~ ^[1-9][0-9]*$ ]] || collector_fail "keep-migrations must be positive"; KEEP_MIGRATIONS="$value" ;;
+      *) collector_fail "Unknown GitHub recovery config key: $kind" ;;
+    esac
+  done <"$CONFIG_FILE"
+  [[ "${#ACCOUNTS[@]}" -gt 0 ]] || collector_fail "At least one GitHub account is required"
+}
+
+gh_api() {
+  GH_TOKEN="$ACTIVE_TOKEN" env -u GITHUB_TOKEN gh api "$@"
+}
+
+load_account_token() {
+  local account="$1" actual
+  ACTIVE_TOKEN="$(env -u GITHUB_TOKEN -u GH_TOKEN gh auth token --hostname github.com --user "$account" 2>/dev/null)" || return 1
+  [[ -n "$ACTIVE_TOKEN" ]] || return 1
+  actual="$(gh_api user --jq .login 2>/dev/null)" || return 1
+  [[ "${actual,,}" == "${account,,}" ]]
+}
+
+write_askpass() {
+  ASKPASS_FILE="$(mktemp)"
+  chmod 700 -- "$ASKPASS_FILE"
+  cat >"$ASKPASS_FILE" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' x-access-token ;;
+  *) printf '%s\n' "${GITHUB_BACKUP_TOKEN:?}" ;;
+esac
+EOF
+}
+
+git_authenticated() {
+  GITHUB_BACKUP_TOKEN="$ACTIVE_TOKEN" GIT_ASKPASS="$ASKPASS_FILE" \
+    GIT_ASKPASS_REQUIRE=force GIT_TERMINAL_PROMPT=0 git "$@"
+}
+
+mirror_repository() {
+  local clone_url="$1" target="$2" temporary
+  [[ "$target" == "$COLLECTOR_SOURCE_HOME/$CACHE_RELATIVE/accounts/"* ]] || return 1
+  [[ "$clone_url" =~ ^https://(github\.com|gist\.github\.com)/[A-Za-z0-9_.~/-]+\.git$ ]] || return 1
+  mkdir -p -- "$(dirname -- "$target")"
+  if [[ -d "$target" ]]; then
+    git -C "$target" remote set-url origin "$clone_url" || return 1
+    git_authenticated -C "$target" remote update --prune || return 1
+  else
+    temporary="$target.incomplete-$$"
+    rm -rf -- "$temporary"
+    git_authenticated clone --mirror "$clone_url" "$temporary" || { rm -rf -- "$temporary"; return 1; }
+    mv -- "$temporary" "$target"
+  fi
+  git -C "$target" fsck --connectivity-only >/dev/null || return 1
+  if git -C "$target" show HEAD:.gitattributes 2>/dev/null | grep -q 'filter=lfs'; then
+    command -v git-lfs >/dev/null 2>&1 || return 42
+    git_authenticated -C "$target" lfs fetch --all >/dev/null || return 1
+  fi
+}
+
+api_export() {
+  local endpoint="$1" output="$2" required="$3"
+  mkdir -p -- "$(dirname -- "$output")"
+  if gh_api --paginate --slurp "$endpoint" >"$output.tmp" 2>/dev/null; then
+    mv -- "$output.tmp" "$output"
+    rm -f -- "$output.unavailable"
+    return 0
+  fi
+  rm -f -- "$output.tmp"
+  if [[ "$required" == required ]]; then return 1; fi
+  rm -f -- "$output"
+  printf 'unavailable\n' >"$output.unavailable"
+  [[ "$required" != warning ]] || collector_warn "Optional GitHub API export was unavailable: $endpoint"
+}
+
+export_repository_metadata() {
+  local full="$1" output="$2" endpoint artifact_name branch encoded
+  api_export "/repos/$full" "$output/repository.json" required || return 1
+  for endpoint in \
+    "issues?state=all&per_page=100" "pulls?state=all&per_page=100" \
+    "issues/comments?per_page=100" "issues/events?per_page=100" \
+    "pulls/comments?per_page=100" \
+    "labels?per_page=100" "milestones?state=all&per_page=100" \
+    "releases?per_page=100" "deployments?per_page=100" "branches?per_page=100" \
+    "rulesets?per_page=100" "environments?per_page=100" \
+    "collaborators?affiliation=all&per_page=100" "pages" "hooks?per_page=100" \
+    "keys?per_page=100" "actions/variables?per_page=100" "actions/secrets?per_page=100"; do
+    artifact_name="${endpoint%%\?*}"
+    artifact_name="${artifact_name//\//--}"
+    api_export "/repos/$full/$endpoint" "$output/$artifact_name.json" optional || true
+  done
+  if [[ -s "$output/branches.json" ]]; then
+    mkdir -p -- "$output/branch-protection"
+    while IFS=$'\t' read -r branch encoded; do
+      [[ -n "$branch" && -n "$encoded" ]] || continue
+      api_export "/repos/$full/branches/$encoded/protection" \
+        "$output/branch-protection/${encoded//%/_}.json" optional || true
+    done < <(python3 "$EXPORT_HELPER" branches "$output/branches.json")
+  fi
+}
+
+migration_is_fresh() {
+  local directory="$1" newest now age
+  newest="$(find "$directory" -maxdepth 1 -type f -name 'migration-*.tar.gz' -printf '%T@\n' 2>/dev/null | sort -nr | head -n 1)"
+  [[ -n "$newest" ]] || return 1
+  now="$(date +%s)"
+  age=$((now - ${newest%.*}))
+  [[ "$age" -le $((MIGRATION_INTERVAL_HOURS * 3600)) ]]
+}
+
+create_user_migration() {
+  local account_dir="$1" repositories_file="$2"
+  local migration_dir="$account_dir/migrations"
+  local full _ migration_id state _attempt archive old_archive
+  local -a fields=()
+  local -a old=()
+  mkdir -p -- "$migration_dir"
+  migration_is_fresh "$migration_dir" && return 0
+  while IFS=$'\t' read -r full _; do [[ -n "$full" ]] && fields+=(-f "repositories[]=$full"); done <"$repositories_file"
+  [[ "${#fields[@]}" -gt 0 ]] || { collector_warn "No repositories were available for a GitHub user migration"; return 0; }
+  migration_id="$(gh_api --method POST /user/migrations \
+    -F lock_repositories=false -F exclude_git_data=true "${fields[@]}" --jq .id 2>/dev/null)" || return 1
+  [[ "$migration_id" =~ ^[0-9]+$ ]] || return 1
+  state=""
+  for _attempt in {1..60}; do
+    state="$(gh_api "/user/migrations/$migration_id" --jq .state 2>/dev/null)" || return 1
+    [[ "$state" == exported ]] && break
+    [[ "$state" != failed ]] || return 1
+    sleep 10
+  done
+  [[ "$state" == exported ]] || return 1
+  archive="$migration_dir/migration-$(date -u +%Y%m%dT%H%M%SZ)-$migration_id.tar.gz"
+  gh_api "/user/migrations/$migration_id/archive" >"$archive.tmp" 2>/dev/null || { rm -f -- "$archive.tmp"; return 1; }
+  [[ -s "$archive.tmp" ]] && tar -tzf "$archive.tmp" >/dev/null 2>&1 \
+    || { rm -f -- "$archive.tmp"; return 1; }
+  mv -- "$archive.tmp" "$archive"
+  sha256sum "$archive" >"$archive.sha256"
+  mapfile -t old < <(find "$migration_dir" -maxdepth 1 -type f -name 'migration-*.tar.gz' -printf '%T@\t%p\n' | sort -nr | tail -n +$((KEEP_MIGRATIONS + 1)) | cut -f2-)
+  for old_archive in "${old[@]}"; do rm -f -- "$old_archive" "$old_archive.sha256"; done
+}
+
+refresh_account() {
+  local account="$1" cache_root="$2"
+  local account_dir="$cache_root/accounts/$account"
+  local repos_json="$account_dir/repositories.json" repos_tsv="$account_dir/repositories.tsv"
+  local gists_json="$account_dir/gists.json" gists_tsv="$account_dir/gists.tsv"
+  local full clone_url has_wiki _default_branch _archived target rc gist_id
+
+  load_account_token "$account" || return 1
+  gh_api '/user/migrations?per_page=1' --silent 2>/dev/null || {
+    printf 'GitHub user-migration API is unavailable for %s; use a compatible classic PAT.\n' "$account" >&2
+    return 1
+  }
+  mkdir -p -- "$account_dir/repos" "$account_dir/wikis" "$account_dir/gists" "$account_dir/metadata"
+  chmod 700 -- "$account_dir"
+  : >"$account_dir/.refresh-incomplete"
+  gh_api --paginate --slurp '/user/repos?affiliation=owner&per_page=100' \
+    >"$repos_json.tmp" 2>/dev/null || return 1
+  mv -- "$repos_json.tmp" "$repos_json"
+  python3 "$EXPORT_HELPER" repositories "$repos_json" "$account" >"$repos_tsv" || return 1
+  while IFS=$'\t' read -r full clone_url has_wiki _default_branch _archived; do
+    [[ -n "$full" && -n "$clone_url" ]] || continue
+    [[ "$full" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+    target="$account_dir/repos/${full//\//--}.git"
+    if mirror_repository "$clone_url" "$target"; then rc=0; else rc=$?; fi
+    [[ "$rc" -ne 42 ]] || { printf 'Git LFS is required by %s but git-lfs is unavailable.\n' "$full" >&2; return 1; }
+    [[ "$rc" -eq 0 ]] || return 1
+    export_repository_metadata "$full" "$account_dir/metadata/${full//\//--}" || return 1
+    if [[ "$has_wiki" == yes ]]; then
+      mirror_repository "${clone_url%.git}.wiki.git" "$account_dir/wikis/${full//\//--}.wiki.git" \
+        || collector_warn "Repository advertises a wiki but no wiki mirror was available: $full"
+    fi
+  done <"$repos_tsv"
+
+  gh_api --paginate --slurp '/gists?per_page=100' >"$gists_json.tmp" 2>/dev/null || return 1
+  mv -- "$gists_json.tmp" "$gists_json"
+  python3 "$EXPORT_HELPER" gists "$gists_json" >"$gists_tsv" || return 1
+  while IFS=$'\t' read -r gist_id clone_url; do
+    [[ -n "$gist_id" ]] || continue
+    [[ "$gist_id" =~ ^[A-Fa-f0-9]+$ ]] || return 1
+    mirror_repository "$clone_url" "$account_dir/gists/$gist_id.git" || return 1
+  done <"$gists_tsv"
+  create_user_migration "$account_dir" "$repos_tsv" || {
+    migration_is_fresh "$account_dir/migrations" \
+      || { printf 'GitHub migration archive is stale or unavailable for %s.\n' "$account" >&2; return 1; }
+    collector_warn "GitHub migration refresh failed; a fresh cached migration remains available: $account"
+  }
+  date +%s >"$account_dir/.last-success"
+  rm -f -- "$account_dir/.refresh-incomplete"
+  printf '%s\n' "$ACTIVE_TOKEN" >"$COLLECTOR_STAGE_DIR/credentials/$account.token"
+  chmod 600 -- "$COLLECTOR_STAGE_DIR/credentials/$account.token"
+  printf '%s\t%s\t%s\n' "$account" "$(wc -l <"$repos_tsv")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$COLLECTOR_STAGE_DIR/accounts.tsv"
+}
+
+cache_is_fresh() {
+  local file="$1" now recorded
+  [[ -s "$file" ]] || return 1
+  [[ ! -e "$(dirname -- "$file")/.refresh-incomplete" ]] || return 1
+  read -r recorded <"$file"
+  [[ "$recorded" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  [[ $((now - recorded)) -le $((MAX_AGE_HOURS * 3600)) ]]
+}
+
+main() {
+  local command cache_root account lock_file
+  for command in cut date env find flock gh git grep mkdir mktemp mv python3 rm sha256sum sort tar wc; do collector_require_command "$command"; done
+  collector_init
+  load_config
+  write_askpass
+  cache_root="$COLLECTOR_SOURCE_HOME/$CACHE_RELATIVE"
+  mkdir -p -- "$cache_root" "$COLLECTOR_STAGE_DIR/credentials"
+  chmod 700 -- "$cache_root" "$COLLECTOR_STAGE_DIR/credentials"
+  lock_file="$cache_root/.collector.lock"
+  exec 9>"$lock_file"
+  flock -n 9 || collector_fail "Another GitHub recovery collector is already running"
+  printf 'account\trepositories\trefreshed_at\n' >"$COLLECTOR_STAGE_DIR/accounts.tsv"
+  for account in "${ACCOUNTS[@]}"; do
+    if refresh_account "$account" "$cache_root"; then
+      collector_index github-account "$account" "$CACHE_RELATIVE/accounts/$account" success "owned repositories"
+    elif cache_is_fresh "$cache_root/accounts/$account/.last-success"; then
+      ACTIVE_TOKEN=""
+      collector_warn "GitHub refresh failed; using cache younger than $MAX_AGE_HOURS hours: $account"
+      collector_index github-account "$account" "$CACHE_RELATIVE/accounts/$account" cached "refresh failed"
+    else
+      collector_fail "GitHub refresh failed and cache is stale or missing: $account"
+    fi
+  done
+  printf 'cache_relative\t%s\n' "$CACHE_RELATIVE" >"$COLLECTOR_STAGE_DIR/cache.tsv"
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# GitHub recovery
+
+The home snapshot contains bare repository, wiki, and gist mirrors plus exported
+metadata and recent official user-migration archives. Secret values for Actions and
+webhooks cannot be read back through GitHub APIs; restore those from a separate
+password manager. The guided handler can restore local GitHub CLI credentials but
+never creates repositories or pushes mirrors automatically. Review the generated
+remote-rebuild instructions before changing GitHub.
+EOF
+  collector_finalize
+}
+
+main "$@"

@@ -47,6 +47,9 @@ RECOVERY_TARGET_GID=""
 RECOVERY_ALL=0
 SKIP_DEEP_VERIFY=0
 ALLOW_LEGACY=0
+SENSITIVE_PROFILE="no"
+UNENCRYPTED_DESTINATION_POLICY="allow"
+DESTINATION_ENCRYPTION_STATE="not-applicable"
 
 RUN_STAGE_DIR=""
 INCOMPLETE_SNAPSHOT_DIR=""
@@ -149,6 +152,8 @@ Command options:
 Profile format:
   include=/home/alice/Projects
   exclude_file=../excludes/common.exclude
+  sensitive=yes
+  unencrypted_destination=warn
 
 Collector format:
   required|system-inventory|builtin:system-inventory
@@ -377,6 +382,8 @@ parse_profile_file() {
   local value
   local profile_dir
   local exclude_path
+  local sensitive_seen=0
+  local policy_seen=0
 
   [[ -f "$PROFILE_FILE" ]] || die "Profile file not found: $PROFILE_FILE"
   PROFILE_FILE="$(canonicalize_path "$PROFILE_FILE")"
@@ -384,6 +391,9 @@ parse_profile_file() {
   INCLUDE_RULES=()
   INCLUDE_ANCHORS=()
   EXCLUDE_FILES=()
+  SENSITIVE_PROFILE="no"
+  UNENCRYPTED_DESTINATION_POLICY="allow"
+  DESTINATION_ENCRYPTION_STATE="not-applicable"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(normalize_config_line "$line")"
@@ -407,6 +417,22 @@ parse_profile_file() {
           exclude_path="$(canonicalize_path "$profile_dir/$value")"
         fi
         EXCLUDE_FILES+=("$exclude_path")
+        ;;
+      sensitive)
+        [[ "$sensitive_seen" -eq 0 ]] || die "Duplicate profile key: sensitive"
+        case "$value" in
+          yes|no) SENSITIVE_PROFILE="$value" ;;
+          *) die "Profile sensitive value must be yes or no: $value" ;;
+        esac
+        sensitive_seen=1
+        ;;
+      unencrypted_destination)
+        [[ "$policy_seen" -eq 0 ]] || die "Duplicate profile key: unencrypted_destination"
+        case "$value" in
+          warn|require|allow) UNENCRYPTED_DESTINATION_POLICY="$value" ;;
+          *) die "Profile unencrypted_destination must be warn, require, or allow: $value" ;;
+        esac
+        policy_seen=1
         ;;
       *)
         die "Unknown profile key: $key"
@@ -664,6 +690,49 @@ ensure_dest_not_inside_sources() {
         ;;
     esac
   done
+}
+
+detect_destination_encryption() {
+  local anchor
+  local source
+  local filesystems
+
+  if [[ "$SENSITIVE_PROFILE" != "yes" ]]; then
+    printf 'not-applicable\n'
+    return 0
+  fi
+  if ! command -v findmnt >/dev/null 2>&1 || ! command -v lsblk >/dev/null 2>&1; then
+    printf 'unknown\n'
+    return 0
+  fi
+
+  anchor="$(existing_ancestor "$DEST_ROOT_REAL")"
+  source="$(findmnt -T "$anchor" -n -o SOURCE 2>/dev/null | head -n 1 || true)"
+  [[ "$source" == /dev/* ]] || { printf 'unknown\n'; return 0; }
+  filesystems="$(lsblk -s -n -o FSTYPE -- "$source" 2>/dev/null || true)"
+  [[ -n "$filesystems" ]] || { printf 'unknown\n'; return 0; }
+  if grep -qx 'crypto_LUKS' <<<"$filesystems"; then
+    printf 'detected\n'
+  else
+    printf 'not-detected\n'
+  fi
+}
+
+apply_destination_encryption_policy() {
+  DESTINATION_ENCRYPTION_STATE="$(detect_destination_encryption)"
+  [[ "$SENSITIVE_PROFILE" == "yes" ]] || return 0
+  case "$UNENCRYPTED_DESTINATION_POLICY" in
+    allow) return 0 ;;
+    warn)
+      if [[ "$DESTINATION_ENCRYPTION_STATE" != "detected" ]]; then
+        record_warning "Sensitive profile destination encryption was not detected (state=$DESTINATION_ENCRYPTION_STATE)"
+      fi
+      ;;
+    require)
+      [[ "$DESTINATION_ENCRYPTION_STATE" == "detected" ]] \
+        || die "Sensitive profile requires a detected encrypted destination (state=$DESTINATION_ENCRYPTION_STATE)"
+      ;;
+  esac
 }
 
 snapshot_root_dir() {
@@ -1099,12 +1168,18 @@ run_collectors() {
       BACKUP_HOME_STAGE_DIR="$output_dir" \
       BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
       BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+      BACKUP_HOME_SOURCE_HOME="${HOME:?HOME is required}" \
+      BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
+      BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
         "$command_path"
       rc=$?
     else
       BACKUP_HOME_STAGE_DIR="$output_dir" \
       BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
       BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+      BACKUP_HOME_SOURCE_HOME="${HOME:?HOME is required}" \
+      BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
+      BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
         "$command_path" >/dev/null 2>&1
       rc=$?
     fi
@@ -1173,6 +1248,9 @@ write_snapshot_report() {
     printf 'Started: %s\n' "$RUN_STARTED_AT"
     printf 'Generated: %s\n' "$(iso_now)"
     printf 'Profile: %s\n' "$PROFILE_FILE"
+    printf 'Sensitive profile: %s\n' "$SENSITIVE_PROFILE"
+    printf 'Destination encryption state: %s\n' "$DESTINATION_ENCRYPTION_STATE"
+    printf 'Unencrypted destination policy: %s\n' "$UNENCRYPTED_DESTINATION_POLICY"
     printf 'Previous snapshot: %s\n' "${previous_snapshot:-none}"
     printf 'Rsync exit code: %s\n' "$RSYNC_EXIT_CODE"
     printf '\nResolved roots:\n'
@@ -1262,6 +1340,9 @@ write_snapshot_manifest() {
     printf 'source_gid\t%s\n' "$(id -g)"
     printf 'source_home\t%s\n' "$(manifest_escape "$(canonicalize_path "${HOME:?HOME is required}")")"
     printf 'profile_name\t%s\n' "$(manifest_escape "$(basename "$PROFILE_FILE")")"
+    printf 'sensitive_profile\t%s\n' "$SENSITIVE_PROFILE"
+    printf 'destination_encryption_state\t%s\n' "$DESTINATION_ENCRYPTION_STATE"
+    printf 'unencrypted_destination_policy\t%s\n' "$UNENCRYPTED_DESTINATION_POLICY"
     printf 'config_digest\t%s\n' "$(profile_digest)"
     printf 'previous_snapshot\t%s\n' "$(manifest_escape "${previous_snapshot:-none}")"
     printf 'rsync_exit_code\t%s\n' "$RSYNC_EXIT_CODE"
@@ -1358,12 +1439,15 @@ show_plan() {
   ensure_dest_access "check"
   load_backup_selection
   ensure_dest_not_inside_sources
+  apply_destination_encryption_policy
   parse_collectors_file
   keep_last="$(read_keep_last)"
   build_size_report
 
   print_label_value "Profile:" "$PROFILE_FILE"
   print_label_value "Destination:" "$DEST_ROOT_REAL"
+  print_label_value "Sensitive profile:" "$SENSITIVE_PROFILE"
+  print_label_value "Destination encryption:" "$DESTINATION_ENCRYPTION_STATE ($UNENCRYPTED_DESTINATION_POLICY policy)"
   print_label_value "Estimated source size:" "$(format_bytes_human "$SIZE_REPORT_TOTAL")"
   print_label_value "Retention keep-last:" "$keep_last"
   printf '\n'
@@ -1466,6 +1550,7 @@ run_backup() {
   ensure_dest_access "check"
   load_backup_selection
   ensure_dest_not_inside_sources
+  apply_destination_encryption_policy
   parse_collectors_file
   build_size_report
   estimated_bytes="$SIZE_REPORT_TOTAL"
@@ -1476,6 +1561,8 @@ run_backup() {
 
   print_label_value "Profile:" "$PROFILE_FILE"
   print_label_value "Destination:" "$DEST_ROOT_REAL"
+  print_label_value "Sensitive profile:" "$SENSITIVE_PROFILE"
+  print_label_value "Destination encryption:" "$DESTINATION_ENCRYPTION_STATE ($UNENCRYPTED_DESTINATION_POLICY policy)"
   print_label_value "Snapshot:" "$SNAPSHOT_NAME"
   print_label_value "Estimated source size:" "$(format_bytes_human "$estimated_bytes")"
   print_label_value "Available destination space:" "$(format_bytes_human "$free_bytes")"
@@ -1865,8 +1952,15 @@ parse_restore_handlers() {
   local name
   local command_path
   local extra
-  local builtin="$SCRIPT_DIR/restore-handlers/docker-recovery"
-  local has_docker=0
+  local builtin
+  local -a builtin_names=(
+    docker-recovery
+    credentials-recovery
+    codex-mcp-recovery
+    browser-recovery
+    github-recovery
+    server-recovery
+  )
 
   RESTORE_HANDLER_NAMES=()
   RESTORE_HANDLER_COMMANDS=()
@@ -1886,12 +1980,11 @@ parse_restore_handlers() {
     die "Restore handler file not found: $HANDLERS_FILE"
   fi
 
-  for name in "${RESTORE_HANDLER_NAMES[@]}"; do
-    [[ "$name" == "docker-recovery" ]] && has_docker=1
+  for name in "${builtin_names[@]}"; do
+    array_contains "$name" "${RESTORE_HANDLER_NAMES[@]}" && continue
+    builtin="$SCRIPT_DIR/restore-handlers/$name"
+    [[ -x "$builtin" ]] && register_restore_handler "$name" "$builtin"
   done
-  if [[ "$has_docker" -eq 0 && -x "$builtin" ]]; then
-    register_restore_handler "docker-recovery" "$builtin"
-  fi
 }
 
 restore_handler_command() {
@@ -2113,6 +2206,8 @@ validate_recovery_snapshot() {
   local status
   local expected_count
   local actual_count
+  local sensitive_profile
+  local encryption_state
 
   [[ "$RECOVERY_SCHEMA" != "legacy" ]] || return 0
   case "$RECOVERY_SCHEMA" in
@@ -2125,6 +2220,13 @@ validate_recovery_snapshot() {
   [[ "$status" == success* ]] || RECOVERY_BLOCKERS+=("Snapshot status is not successful: $status")
   [[ "$status" != "success-with-warnings" ]] \
     || RECOVERY_WARNINGS+=("The snapshot completed with collector or backup warnings")
+  sensitive_profile="$(manifest_value "$RECOVERY_MANIFEST" sensitive_profile)"
+  encryption_state="$(manifest_value "$RECOVERY_MANIFEST" destination_encryption_state)"
+  if [[ -z "$sensitive_profile" ]]; then
+    RECOVERY_WARNINGS+=("Snapshot predates recorded sensitive-profile and destination-encryption fields")
+  elif [[ "$sensitive_profile" == "yes" && "$encryption_state" != "detected" ]]; then
+    RECOVERY_WARNINGS+=("Snapshot contains sensitive data and destination encryption was not detected (state=${encryption_state:-unknown})")
+  fi
 
   while IFS=$'\t' read -r key value rest; do
     case "$key" in
@@ -2345,15 +2447,28 @@ print_recovery_plan() {
   local payload_bytes="unknown"
   local free_bytes
   local stage_anchor
+  local sensitive_profile="not-recorded"
+  local encryption_state="not-recorded"
+  local encryption_policy="not-recorded"
 
   [[ "$RECOVERY_SCHEMA" == "legacy" ]] \
     || payload_bytes="$(manifest_value "$RECOVERY_MANIFEST" payload_bytes)"
+  if [[ "$RECOVERY_SCHEMA" != "legacy" ]]; then
+    sensitive_profile="$(manifest_value "$RECOVERY_MANIFEST" sensitive_profile)"
+    encryption_state="$(manifest_value "$RECOVERY_MANIFEST" destination_encryption_state)"
+    encryption_policy="$(manifest_value "$RECOVERY_MANIFEST" unencrypted_destination_policy)"
+    [[ -n "$sensitive_profile" ]] || sensitive_profile="not-recorded"
+    [[ -n "$encryption_state" ]] || encryption_state="not-recorded"
+    [[ -n "$encryption_policy" ]] || encryption_policy="not-recorded"
+  fi
   stage_anchor="$(existing_ancestor "$STAGING_DIR")"
   free_bytes="$(df -B1 --output=avail "$stage_anchor" | awk 'NR==2 {print $1}')"
 
   print_heading "Recovery plan"
   print_label_value "Snapshot:" "$SNAPSHOT_NAME"
   print_label_value "Manifest schema:" "$RECOVERY_SCHEMA"
+  print_label_value "Sensitive profile:" "$sensitive_profile"
+  print_label_value "Backup destination encryption:" "$encryption_state ($encryption_policy policy)"
   print_label_value "Source identity:" "$RECOVERY_SOURCE_USER uid=$RECOVERY_SOURCE_UID gid=$RECOVERY_SOURCE_GID home=$RECOVERY_SOURCE_HOME"
   print_label_value "Target identity:" "$TARGET_USER uid=${RECOVERY_TARGET_UID:-missing} gid=${RECOVERY_TARGET_GID:-missing} home=$TARGET_HOME"
   print_label_value "Staging directory:" "$STAGING_DIR"

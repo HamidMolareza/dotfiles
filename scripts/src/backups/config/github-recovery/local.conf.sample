@@ -1,0 +1,5 @@
+# account|github-user
+# cache-relative|backups/github
+# max-age-hours|168
+# migration-interval-hours|168
+# keep-migrations|2

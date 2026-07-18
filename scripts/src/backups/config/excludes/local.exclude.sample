@@ -9,6 +9,21 @@
 # /home/alice/.gradle/caches
 # /home/alice/.npm/_cacache
 # /home/alice/.local/share/Trash
+# /home/alice/.codex/cache
+# /home/alice/.codex/tmp
+# /home/alice/.codex/plugins/cache
+# /home/alice/.config/Code/WebStorage/*/CacheStorage
+# /home/alice/.config/Code/User/globalStorage/ms-dotnettools.vscode-dotnet-runtime
+# /home/alice/.config/JetBrains/*/resharper-host/SourcesCache
+
+# If browser-recovery is enabled, exclude raw browser profiles so cookies,
+# passwords, history, caches, and live databases are not copied accidentally.
+# /home/alice/.config/google-chrome
+# /home/alice/.config/chromium
+
+# Exclude each raw live SQLite database only after codex-mcp-recovery explicitly
+# classifies and backs it up with the online SQLite API.
+# /home/alice/.codex/state.sqlite*
 
 # Exclude live database storage only when a required application-aware collector
 # creates a verified logical or native backup for it.

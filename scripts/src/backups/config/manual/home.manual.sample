@@ -2,5 +2,8 @@
 
 # Password manager | Export recovery material not already covered by selected paths
 # Mobile data | Confirm contacts, photos, and application exports are current
-# Browser data | Export bookmarks or sessions that are not synchronized
+# GitHub secret values | Store Actions and webhook secret values separately; APIs expose names only
+# Provider network state | Record VPS DNS, firewall, security-group, and rescue-console settings
+# Offsite copy | Confirm one recent verified snapshot exists away from the primary backup disk
+# Destination encryption | Confirm the sensitive-profile policy matches the mounted destination
 # Offline recovery codes | Store them through an approved encrypted process

@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+BROWSER_HELPER="$PROJECT_DIR/lib/browser-export.py"
+ACTION="${1:-}"
+COMPONENT="${2:-}"
+ARTIFACT_DIR="${BACKUP_HOME_ARTIFACT_DIR:-}"
+TARGET_HOME="${BACKUP_HOME_TARGET_HOME:-}"
+TARGET_UID="${BACKUP_HOME_TARGET_UID:-}"
+TARGET_GID="${BACKUP_HOME_TARGET_GID:-}"
+SESSION_DIR="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+DRY_RUN="${BACKUP_HOME_RESTORE_DRY_RUN:-0}"
+DESTRUCTIVE_APPROVED="${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}"
+CONFIG_FILE="${BACKUP_HOME_BROWSER_CONFIG:-$PROJECT_DIR/config/browser-recovery/local.conf}"
+FIREFOX_ROOT=""
+CHROMIUM_ROOT=""
+declare -a EXTENSION_LABELS=()
+declare -a EXTENSION_IDS=()
+declare -a EXTENSION_MODES=()
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+validate_relative() {
+  [[ -n "$1" && "$1" != /* && ! "$1" =~ (^|/)\.\.?(/|$) ]] || fail "Unsafe browser path"
+}
+
+load_config() {
+  local line kind first second third extra
+  [[ -f "$CONFIG_FILE" ]] || fail "Browser recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind first second third extra <<<"$line"
+    case "$kind" in
+      firefox-root) validate_relative "$first"; FIREFOX_ROOT="$first" ;;
+      chromium-root) validate_relative "$first"; CHROMIUM_ROOT="$first" ;;
+      firefox-extension)
+        validate_relative "$first"
+        [[ -n "$second" && ( "$third" == required || "$third" == optional ) && -z "${extra:-}" ]] || fail "Invalid extension config"
+        EXTENSION_LABELS+=("$first"); EXTENSION_IDS+=("$second"); EXTENSION_MODES+=("$third")
+        ;;
+      *) fail "Unknown browser config record: $kind" ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+browsers_running() {
+  local -a user_scope=()
+  [[ -z "$TARGET_UID" ]] || user_scope=(-u "$TARGET_UID")
+  pgrep "${user_scope[@]}" -x firefox >/dev/null 2>&1 \
+    || pgrep "${user_scope[@]}" -x chrome >/dev/null 2>&1 \
+    || pgrep "${user_scope[@]}" -x chromium >/dev/null 2>&1 \
+    || pgrep "${user_scope[@]}" -x google-chrome >/dev/null 2>&1
+}
+
+target_firefox_profile() {
+  local root profile
+  [[ -n "$FIREFOX_ROOT" && -f "$TARGET_HOME/$FIREFOX_ROOT/profiles.ini" ]] || return 1
+  root="$(readlink -f -- "$TARGET_HOME/$FIREFOX_ROOT")" || return 1
+  profile="$(python3 "$BROWSER_HELPER" firefox-profile "$root")" || return 1
+  [[ "$profile" == "$root"/* ]] || return 1
+  printf '%s\n' "$profile"
+}
+
+validate_chromium_profile_name() {
+  [[ "$1" == Default || "$1" =~ ^Profile\ [0-9]+$ ]] || fail "Unsafe Chromium profile name in artifact"
+}
+
+validate_extension_uuid() {
+  [[ "$1" =~ ^[A-Za-z0-9-]+$ ]] || fail "Unsafe Firefox extension UUID"
+}
+
+describe() {
+  if find "$ARTIFACT_DIR/firefox" "$ARTIFACT_DIR/chromium" -type f -path '*/bookmarkbackups/*' -o -name Bookmarks 2>/dev/null | grep -q .; then
+    printf 'component\tbrowser.bookmarks\tBrowser bookmarks\tautomatic\tdestructive\trecommended\n'
+  fi
+  if find "$ARTIFACT_DIR/firefox" "$ARTIFACT_DIR/chromium" -type f \( -path '*/sessionstore-backups/*' -o -path '*/Sessions/*' \) 2>/dev/null | grep -q .; then
+    printf 'component\tbrowser.sessions\tOpen browser sessions\tautomatic\tdestructive\toptional\n'
+  fi
+  if [[ -d "$ARTIFACT_DIR/firefox/extensions/onetab/storage" ]]; then
+    printf 'component\tbrowser.onetab\tOneTab saved tabs\tautomatic\tdestructive\trecommended\n'
+  fi
+  if [[ -s "$ARTIFACT_DIR/extensions.tsv" ]] || find "$ARTIFACT_DIR" -name extensions-inventory.json -print -quit | grep -q .; then
+    printf 'component\tbrowser.extensions\tExtension inventory and allowlisted settings\tguided\tdestructive\trecommended\n'
+  fi
+}
+
+preflight() {
+  command -v python3 >/dev/null 2>&1 \
+    && printf 'ok\tPython 3 is available for browser profile and extension mapping\n' \
+    || printf 'blocker\tPython 3 is unavailable\n'
+  if ! command -v pgrep >/dev/null 2>&1; then
+    printf 'blocker\tpgrep is unavailable; browser shutdown cannot be verified\n'
+  elif browsers_running; then
+    printf 'blocker\tA browser is running; close every Firefox and Chromium process before recovery\n'
+  else
+    printf 'ok\tNo supported browser process is running\n'
+  fi
+  if [[ "$COMPONENT" == browser.onetab || "$COMPONENT" == browser.extensions ]]; then
+    if target_firefox_profile >/dev/null 2>&1; then
+      printf 'ok\tTarget Firefox profile is available\n'
+    else
+      printf 'warning\tTarget Firefox profile is not initialized; install and start Firefox once, then close it\n'
+    fi
+  fi
+  printf 'risk\tdestructive\n'
+}
+
+preserve_target() {
+  local target="$1"
+  local relative="${target#"$TARGET_HOME"/}"
+  local safety="$SESSION_DIR/safety/$COMPONENT"
+  [[ -e "$target" || -L "$target" ]] || return 0
+  mkdir -p -- "$safety"
+  rsync -a --relative "$TARGET_HOME/./$relative" "$safety/"
+}
+
+replace_path() {
+  local source="$1" target="$2" artifact_root source_real home_root target_real
+  artifact_root="$(readlink -f -- "$ARTIFACT_DIR")" || fail "Browser artifact root is unavailable"
+  source_real="$(readlink -f -- "$source")" || fail "Browser artifact source is unavailable"
+  [[ "$source_real" == "$artifact_root"/* ]] || fail "Browser artifact source escapes its collector directory"
+  home_root="$(readlink -f -- "$TARGET_HOME")" || fail "Target home is unavailable"
+  target_real="$(readlink -m -- "$target")"
+  [[ "$target_real" == "$home_root"/* ]] || fail "Browser target escapes the target home"
+  preserve_target "$target"
+  if [[ -d "$source" ]]; then
+    mkdir -p -- "$target"
+    rsync -a --delete "$source/" "$target/"
+  else
+    mkdir -p -- "$(dirname -- "$target")"
+    rsync -a "$source" "$target"
+  fi
+  if [[ -n "$TARGET_UID" && "$TARGET_UID" != "$(id -u)" ]]; then
+    command -v sudo >/dev/null 2>&1 || fail "sudo is required to set browser target ownership"
+    sudo chown -hR -- "$TARGET_UID:$TARGET_GID" "$target"
+  fi
+}
+
+manual_copy() {
+  local target="$SESSION_DIR/browser-manual/$COMPONENT"
+  mkdir -p -- "$target"
+  rsync -a "$ARTIFACT_DIR/" "$target/"
+  printf 'Browser artifacts were staged for manual recovery at %s.\n' "$target"
+  return 20
+}
+
+apply_bookmarks() {
+  local target_profile source profile_name
+  target_profile="$(target_firefox_profile 2>/dev/null || true)"
+  while IFS= read -r -d '' source; do
+    [[ -n "$target_profile" ]] || return 20
+    replace_path "$source" "$target_profile/bookmarkbackups"
+  done < <(find "$ARTIFACT_DIR/firefox" -mindepth 2 -maxdepth 2 -type d -name bookmarkbackups -print0 2>/dev/null)
+  while IFS= read -r -d '' source; do
+    profile_name="$(basename -- "$(dirname -- "$source")")"
+    validate_chromium_profile_name "$profile_name"
+    [[ -n "$CHROMIUM_ROOT" && -d "$TARGET_HOME/$CHROMIUM_ROOT/$profile_name" ]] || continue
+    replace_path "$source" "$TARGET_HOME/$CHROMIUM_ROOT/$profile_name/Bookmarks"
+  done < <(find "$ARTIFACT_DIR/chromium" -mindepth 2 -maxdepth 2 -type f -name Bookmarks -print0 2>/dev/null)
+}
+
+apply_sessions() {
+  local target_profile source profile_name found=0
+  target_profile="$(target_firefox_profile 2>/dev/null || true)"
+  while IFS= read -r -d '' source; do
+    [[ -n "$target_profile" ]] || return 20
+    replace_path "$source" "$target_profile/sessionstore-backups"
+    found=1
+  done < <(find "$ARTIFACT_DIR/firefox" -mindepth 2 -maxdepth 2 -type d -name sessionstore-backups -print0 2>/dev/null)
+  while IFS= read -r -d '' source; do
+    profile_name="$(basename -- "$(dirname -- "$source")")"
+    validate_chromium_profile_name "$profile_name"
+    [[ -n "$CHROMIUM_ROOT" && -d "$TARGET_HOME/$CHROMIUM_ROOT/$profile_name" ]] || continue
+    replace_path "$source" "$TARGET_HOME/$CHROMIUM_ROOT/$profile_name/Sessions"
+    found=1
+  done < <(find "$ARTIFACT_DIR/chromium" -mindepth 2 -maxdepth 2 -type d -name Sessions -print0 2>/dev/null)
+  [[ "$found" -eq 1 ]] || return 20
+}
+
+extension_config() {
+  local wanted="$1" index
+  for index in "${!EXTENSION_LABELS[@]}"; do
+    [[ "${EXTENSION_LABELS[$index]}" == "$wanted" ]] || continue
+    printf '%s\t%s\n' "${EXTENSION_IDS[$index]}" "${EXTENSION_MODES[$index]}"
+    return 0
+  done
+  return 1
+}
+
+restore_extension() {
+  local label="$1" profile extension_id mode uuid source target
+  IFS=$'\t' read -r extension_id mode < <(extension_config "$label") || return 20
+  profile="$(target_firefox_profile 2>/dev/null || true)"
+  [[ -n "$profile" ]] || return 20
+  if ! uuid="$(python3 "$BROWSER_HELPER" firefox-uuid "$profile/prefs.js" "$extension_id" 2>/dev/null)"; then
+    [[ "$mode" == optional ]] && return 0
+    return 20
+  fi
+  validate_extension_uuid "$uuid"
+  source="$ARTIFACT_DIR/firefox/extensions/$label/storage"
+  [[ -d "$source" ]] || return 0
+  target="$profile/storage/default/moz-extension+++$uuid"
+  replace_path "$source" "$target"
+}
+
+apply_extensions() {
+  local label rc manual=0
+  mkdir -p -- "$SESSION_DIR/browser-extension-inventory"
+  find "$ARTIFACT_DIR" -name extensions-inventory.json -type f -exec cp --parents {} "$SESSION_DIR/browser-extension-inventory"/ \; 2>/dev/null || true
+  while IFS=$'\t' read -r label _; do
+    [[ "$label" != label && "$label" != onetab ]] || continue
+    if restore_extension "$label"; then
+      :
+    else
+      rc=$?
+      [[ "$rc" -eq 20 ]] || return "$rc"
+      manual=1
+    fi
+  done <"$ARTIFACT_DIR/extensions.tsv"
+  [[ "$manual" -eq 0 ]] || return 20
+  return 0
+}
+
+apply() {
+  local rc
+  [[ "$DESTRUCTIVE_APPROVED" -eq 1 ]] || fail "Browser recovery requires component-specific destructive approval"
+  command -v pgrep >/dev/null 2>&1 || fail "pgrep is required to verify browser shutdown"
+  ! browsers_running || fail "A browser is still running"
+  if [[ "$DRY_RUN" -eq 1 ]]; then printf 'Would restore %s after preserving existing browser state.\n' "$COMPONENT"; return 0; fi
+  case "$COMPONENT" in
+    browser.bookmarks)
+      if apply_bookmarks; then return 0; else rc=$?; fi
+      [[ "$rc" -eq 20 ]] && manual_copy || return "$rc"
+      ;;
+    browser.sessions)
+      if apply_sessions; then return 0; else rc=$?; fi
+      [[ "$rc" -eq 20 ]] && manual_copy || return "$rc"
+      ;;
+    browser.onetab)
+      if restore_extension onetab; then return 0; else rc=$?; fi
+      [[ "$rc" -eq 20 ]] && manual_copy || return "$rc"
+      ;;
+    browser.extensions)
+      if apply_extensions; then return 0; else rc=$?; fi
+      [[ "$rc" -eq 20 ]] && manual_copy || return "$rc"
+      ;;
+    *) fail "Unknown browser recovery component: $COMPONENT" ;;
+  esac
+}
+
+verify() {
+  local profile label extension_id mode uuid source
+  ! browsers_running || fail "A browser was started before verification completed"
+  case "$COMPONENT" in
+    browser.bookmarks)
+      profile="$(target_firefox_profile 2>/dev/null || true)"
+      [[ -z "$profile" || -d "$profile/bookmarkbackups" ]] || return 1
+      ;;
+    browser.sessions)
+      profile="$(target_firefox_profile 2>/dev/null || true)"
+      [[ -z "$profile" || -d "$profile/sessionstore-backups" ]] || return 1
+      ;;
+    browser.onetab|browser.extensions)
+      profile="$(target_firefox_profile 2>/dev/null || true)"
+      [[ -n "$profile" ]] || return 20
+      while IFS=$'\t' read -r label extension_id mode _ _; do
+        [[ "$label" != label ]] || continue
+        if [[ "$COMPONENT" == browser.onetab ]]; then
+          [[ "$label" == onetab ]] || continue
+        else
+          [[ "$label" != onetab ]] || continue
+        fi
+        source="$ARTIFACT_DIR/firefox/extensions/$label/storage"
+        [[ -d "$source" ]] || continue
+        if ! uuid="$(python3 "$BROWSER_HELPER" firefox-uuid "$profile/prefs.js" "$extension_id" 2>/dev/null)"; then
+          [[ "$mode" == optional ]] && continue
+          return 20
+        fi
+        validate_extension_uuid "$uuid"
+        [[ -d "$profile/storage/default/moz-extension+++$uuid" ]] || return 1
+      done <"$ARTIFACT_DIR/extensions.tsv"
+      ;;
+    *) fail "Unknown browser recovery component: $COMPONENT" ;;
+  esac
+}
+
+guide() {
+  case "$COMPONENT" in
+    browser.bookmarks) printf '%s\n' 'If no target profile existed, start each browser once, close it, and use its bookmark import/restore UI with the staged files.' ;;
+    browser.sessions) printf '%s\n' 'Session files are version-sensitive. Keep the safety copy and open the browser offline first to confirm the expected tabs.' ;;
+    browser.onetab) printf '%s\n' 'Install OneTab from the official extension store, start Firefox once, close it, then resume this recovery session.' ;;
+    browser.extensions) printf '%s\n' 'Review the sanitized extension inventory, install only trusted extensions from official stores, start Firefox once, close it, and resume to restore allowlisted state such as ZeroOmega.' ;;
+    *) fail "Unknown browser recovery component: $COMPONENT" ;;
+  esac
+}
+
+[[ -d "$ARTIFACT_DIR" && -n "$TARGET_HOME" && -n "$SESSION_DIR" ]] || fail "Restore environment is incomplete"
+load_config
+case "$ACTION" in
+  describe) describe ;;
+  preflight) preflight ;;
+  apply) apply ;;
+  verify) verify ;;
+  guide) guide ;;
+  *) fail "Unknown restore handler action: $ACTION" ;;
+esac

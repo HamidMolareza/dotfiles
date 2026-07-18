@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
+ACTION="${1:-}"
+COMPONENT="${2:-}"
+ARTIFACT_DIR="${BACKUP_HOME_ARTIFACT_DIR:-}"
+TARGET_HOME="${BACKUP_HOME_TARGET_HOME:-}"
+TARGET_UID="${BACKUP_HOME_TARGET_UID:-}"
+TARGET_GID="${BACKUP_HOME_TARGET_GID:-}"
+SESSION_DIR="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+DRY_RUN="${BACKUP_HOME_RESTORE_DRY_RUN:-0}"
+DESTRUCTIVE_APPROVED="${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}"
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+category() { printf '%s\n' "${1%%.*}"; }
+validate_relative() {
+  [[ -n "$1" && "$1" != /* && ! "$1" =~ (^|/)\.\.?(/|$) ]] \
+    || fail "Unsafe database path in collector index"
+}
+
+safe_artifact_file() {
+  local relative="$1" root candidate
+  validate_relative "$relative"
+  root="$(readlink -f -- "$ARTIFACT_DIR")" || fail "Artifact root is unavailable"
+  candidate="$(readlink -f -- "$ARTIFACT_DIR/$relative")" || return 1
+  [[ "$candidate" == "$root"/* ]] || fail "Database artifact escapes its collector directory"
+  printf '%s\n' "$candidate"
+}
+
+database_rows() {
+  local wanted
+  wanted="$(category "$1")"
+  awk -F '\t' -v prefix="$wanted" 'NR > 1 && $4 == "success" && $5 ~ ("^" prefix ";") {print $1 "\t" $2 "\t" $3}' \
+    "$ARTIFACT_DIR/index.tsv"
+}
+
+processes_running() {
+  local -a user_scope=()
+  [[ -z "$TARGET_UID" ]] || user_scope=(-u "$TARGET_UID")
+  if [[ "$(category "$COMPONENT")" == codex ]]; then
+    pgrep "${user_scope[@]}" -x codex >/dev/null 2>&1
+  else
+    pgrep "${user_scope[@]}" -f '[R]ecall-mcp|[m]emorymcp|[m]cp-mssql|[A]ccountExplorer' >/dev/null 2>&1
+  fi
+}
+
+describe() {
+  local wanted
+  for wanted in codex mcp; do
+    if awk -F '\t' -v prefix="$wanted" 'NR > 1 && $4 == "success" && $5 ~ ("^" prefix ";") {found=1} END {exit !found}' "$ARTIFACT_DIR/index.tsv"; then
+      printf 'component\t%s.databases\t%s databases\tautomatic\tdestructive\trecommended\n' \
+        "$wanted" "$( [[ "$wanted" == codex ]] && printf 'Codex state and history' || printf 'MCP application' )"
+    fi
+  done
+}
+
+preflight() {
+  local kind
+  local relative
+  local artifact artifact_file
+  local count=0
+  while IFS=$'\t' read -r kind relative artifact; do
+    [[ -n "$relative" ]] || continue
+    validate_relative "$relative"
+    if ! artifact_file="$(safe_artifact_file "$artifact")" || [[ ! -s "$artifact_file" ]]; then
+      printf 'blocker\tDatabase artifact is missing or unsafe: %s\n' "$artifact"
+      continue
+    fi
+    if [[ "$kind" == sqlite ]] && ! python3 "$SQLITE_HELPER" check "$artifact_file" >/dev/null 2>&1; then
+      printf 'blocker\tSQLite integrity check failed: %s\n' "$relative"
+    fi
+    count=$((count + 1))
+  done < <(database_rows "$COMPONENT")
+  [[ "$count" -gt 0 ]] || printf 'blocker\tNo database artifacts were declared for this component\n'
+  if ! command -v pgrep >/dev/null 2>&1; then
+    printf 'blocker\tpgrep is unavailable; process shutdown cannot be verified\n'
+  elif processes_running; then
+    printf 'blocker\tRelated Codex or MCP processes are running; close them before recovery\n'
+  else
+    printf 'ok\tRelated processes are not running\n'
+  fi
+  printf 'risk\tdestructive\n'
+}
+
+apply() {
+  local kind
+  local relative
+  local artifact
+  local target source_artifact
+  local target_home_real target_real
+  local temporary
+  local safety="$SESSION_DIR/safety/$COMPONENT"
+
+  [[ "$DESTRUCTIVE_APPROVED" -eq 1 ]] \
+    || fail "Database recovery requires component-specific destructive approval"
+  command -v pgrep >/dev/null 2>&1 || fail "pgrep is required to verify process shutdown"
+  ! processes_running || fail "Related Codex or MCP processes are still running"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'Would replace %s databases after per-file safety copies.\n' "$COMPONENT"
+    return 0
+  fi
+  mkdir -p -- "$safety"
+  chmod 700 -- "$safety"
+  target_home_real="$(readlink -f -- "$TARGET_HOME")" || fail "Target home is unavailable"
+  while IFS=$'\t' read -r kind relative artifact; do
+    [[ -n "$relative" ]] || continue
+    validate_relative "$relative"
+    source_artifact="$(safe_artifact_file "$artifact")" || fail "Database artifact is missing"
+    target="$TARGET_HOME/$relative"
+    target_real="$(readlink -m -- "$target")"
+    [[ "$target_real" == "$target_home_real"/* ]] || fail "Database target escapes the target home"
+    mkdir -p -- "$(dirname -- "$target")" "$safety/$(dirname -- "$relative")"
+    for existing in "$target" "$target-wal" "$target-shm"; do
+      [[ -e "$existing" ]] || continue
+      cp -a -- "$existing" "$safety/${existing#"$TARGET_HOME"/}"
+    done
+    temporary="$target.backup-home-$$"
+    cp -- "$source_artifact" "$temporary"
+    chmod 600 -- "$temporary"
+    mv -f -- "$temporary" "$target"
+    rm -f -- "$target-wal" "$target-shm"
+    if [[ -n "$TARGET_UID" && "$TARGET_UID" != "$(id -u)" ]]; then
+      command -v sudo >/dev/null 2>&1 || fail "sudo is required to set target ownership"
+      sudo chown -- "$TARGET_UID:$TARGET_GID" "$target"
+    fi
+    [[ "$kind" != sqlite ]] || python3 "$SQLITE_HELPER" check "$target" >/dev/null
+  done < <(database_rows "$COMPONENT")
+}
+
+verify() {
+  local kind relative artifact target target_home_real target_real
+  target_home_real="$(readlink -f -- "$TARGET_HOME")" || fail "Target home is unavailable"
+  while IFS=$'\t' read -r kind relative artifact; do
+    [[ -n "$relative" ]] || continue
+    target="$TARGET_HOME/$relative"
+    target_real="$(readlink -m -- "$target")"
+    [[ "$target_real" == "$target_home_real"/* ]] || fail "Database target escapes the target home"
+    [[ -s "$target" ]] || fail "Restored database is missing: $relative"
+    [[ "$kind" != sqlite ]] || python3 "$SQLITE_HELPER" check "$target" >/dev/null
+  done < <(database_rows "$COMPONENT")
+}
+
+guide() {
+  printf '%s\n' 'Keep Codex and MCP processes closed until verification finishes. Start one service at a time and use read-only health checks before resuming normal work.'
+}
+
+[[ -s "$ARTIFACT_DIR/index.tsv" && -n "$TARGET_HOME" ]] || fail "Restore environment is incomplete"
+case "$ACTION" in
+  describe) describe ;;
+  preflight) preflight ;;
+  apply) apply ;;
+  verify) verify ;;
+  guide) guide ;;
+  *) fail "Unknown restore handler action: $ACTION" ;;
+esac

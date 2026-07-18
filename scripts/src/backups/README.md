@@ -27,18 +27,19 @@ The target is Ubuntu 24.04 with Bash and standard utilities. The main required t
 are `rsync`, `flock`, `find`, `du`, `df`, `sha256sum`, `shuf`, `readlink`, and common
 GNU core utilities. Optional inventory tools include `dconf`, `apt-mark`, `dpkg`,
 `snap`, `flatpak`, `crontab`, and `hostnamectl`.
+Application collectors add explicit requirements: Python 3 for consistent SQLite
+backup and sanitized JSON export, Git/GitHub CLI for GitHub recovery, SSH for server
+recovery, and Docker for Docker service recovery. The core still works without those
+collectors when they are disabled.
 
 ## Project layout
 
 ```text
 .
 ├── backup-home
-├── collectors
-│   └── docker-recovery
-├── restore-handlers
-│   └── docker-recovery
-├── lib
-│   └── docker-recovery-config
+├── collectors                 # Docker, credentials, Codex/MCP, browser, GitHub, server
+├── restore-handlers           # matching trusted recovery handlers
+├── lib                        # configuration and Python standard-library helpers
 ├── app-requirements.md
 ├── config
 │   ├── profiles
@@ -57,6 +58,7 @@ GNU core utilities. Optional inventory tools include `dconf`, `apt-mark`, `dpkg`
 │   ├── docker-recovery
 │   │   ├── local.conf         # ignored local config
 │   │   └── local.conf.sample
+│   ├── *-recovery             # ignored local.conf plus tracked inactive sample
 │   ├── restore
 │   │   ├── handlers.local.conf        # ignored local config
 │   │   └── handlers.local.conf.sample
@@ -68,9 +70,11 @@ GNU core utilities. Optional inventory tools include `dconf`, `apt-mark`, `dpkg`
 │   ├── manifest-v1.md
 │   ├── manifest-v2.md
 │   ├── new-machine-recovery.md
+│   ├── recovery-collectors.md
 │   └── restore-handler-contract.md
 └── tests
-    └── integration.sh
+    ├── integration.sh
+    └── recovery-collectors.sh
 ```
 
 The old top-level `backup-home.rules` and `backup-home.manual` paths are no longer
@@ -93,6 +97,14 @@ When enabling Docker recovery, also copy and review its local layout:
 cp config/docker-recovery/local.conf.sample config/docker-recovery/local.conf
 ```
 
+Other recovery collectors follow the same ignored-local pattern:
+
+```bash
+for name in credentials codex-mcp browser github server; do
+  cp "config/$name-recovery/local.conf.sample" "config/$name-recovery/local.conf"
+done
+```
+
 Review every include, exclude, manual task, collector, and handler before the first
 run. See `config/README.md` for the tracked-versus-local policy.
 
@@ -105,6 +117,8 @@ The default profile is `config/profiles/home.conf`:
 ```text
 include=/home/alice/Downloads
 include=/home/alice/Projects
+sensitive=yes
+unencrypted_destination=warn
 exclude_file=../excludes/common.exclude
 exclude_file=../excludes/local.exclude
 ```
@@ -113,6 +127,16 @@ An include must be an absolute path or glob. `/` is rejected. `exclude_file` may
 absolute or relative to the profile file. Exclude files are optional; omitting every
 `exclude_file` entry copies all matched paths. Pass a different profile with
 `--config-file PATH`.
+
+`sensitive` defaults to `no`. For `sensitive=yes`, the destination policy is:
+
+- `warn`: continue when LUKS encryption is not detected, record the condition, and
+  publish `success-with-warnings`
+- `require`: block both `not-detected` and `unknown`
+- `allow`: continue without a policy warning
+
+Detection is best-effort through the mounted block-device ancestry. It is visible in
+`plan`, the report, the manifest, and `restore-plan`; it is not proof of encryption.
 
 ### Excludes
 
@@ -166,6 +190,9 @@ Each collector receives:
 - `BACKUP_HOME_STAGE_DIR`: its private artifact directory
 - `BACKUP_HOME_SNAPSHOT_NAME`: the planned timestamp
 - `BACKUP_HOME_DEST`: the canonical destination
+- `BACKUP_HOME_SOURCE_HOME`: the source account home
+- `BACKUP_HOME_PROFILE_FILE`: the canonical active profile
+- `BACKUP_HOME_RUN_STARTED_AT`: the run start timestamp
 
 Proxy variables already present in the environment are inherited. Tokens,
 environment dumps, and raw collector output are not written into the manifest.
@@ -198,9 +225,17 @@ path is needed.
 
 The Docker collector requires the Docker daemon and its referenced images to already
 be available. Its artifacts contain database content and credentials or keys, so the
-destination must be encrypted. Large collector outputs are staged below `TMPDIR`
+destination should be encrypted; a temporary `warn` policy records the accepted risk
+until storage is migrated. Large collector outputs are staged below `TMPDIR`
 before being copied into the snapshot; point `TMPDIR` at a filesystem with enough
 temporary space when the default `/tmp` is too small.
+
+Tracked collectors also cover explicit credential groups, Codex/MCP SQLite state,
+targeted browser recovery, GitHub mirrors and metadata, and remote server state.
+Their account names, paths, hosts, extension allowlists, and freshness policies live
+only in ignored local configuration. Each creates an index, checksums, and restore
+guidance. See [recovery-collectors.md](docs/recovery-collectors.md) for coverage,
+failure policy, sensitive-data boundaries, and known non-automatable steps.
 
 ### Restore handlers
 
@@ -212,9 +247,11 @@ docker-recovery|/absolute/path/to/trusted/docker-recovery-handler
 ```
 
 The first field must match a collector name. The second field must be an absolute
-executable path. The default local file may be absent; the tracked Docker handler is
-registered automatically when present. The tool never executes a script from a
-snapshot. See `docs/restore-handler-contract.md` before adding a custom handler.
+executable path. The default local file may be absent; tracked handlers for Docker,
+credentials, Codex/MCP, browsers, GitHub, and server recovery are registered
+automatically when present and may be overridden by an explicit local registration.
+The tool never executes a script from a snapshot. See
+`docs/restore-handler-contract.md` before adding a custom handler.
 
 ### Retention
 
@@ -511,19 +548,24 @@ restore Joplin Server PostgreSQL and start Compose on a fresh target, or after e
 approval when existing state would be replaced.
 
 The same distinction applies to `/home/alice/backups/server`: it contains local
-artifacts pulled from servers, not the live servers. Restore them to staging, inspect
-their manifests/checksums/readmes, and use each service's documented recovery flow.
+artifacts pulled from servers, not the live servers. Guided recovery can restore two
+explicitly configured SQLite services after exact approval, but network, firewall,
+WireGuard, provider, secret, and Joplin changes remain reviewable operator steps.
+
+GitHub mirrors under the configured cache are normal filesystem data. The GitHub
+handler can restore local credentials, but remote repository creation and
+`git push --mirror` are always guided and never performed in bulk automatically.
 
 ## Validation
 
 Run the complete isolated suite:
 
 ```bash
-bash -n backup-home tests/integration.sh collectors/docker-recovery \
-  restore-handlers/docker-recovery lib/docker-recovery-config
-shellcheck -x backup-home tests/integration.sh collectors/docker-recovery \
-  restore-handlers/docker-recovery lib/docker-recovery-config
+bash -n backup-home tests/*.sh collectors/* restore-handlers/* lib/collector-common
+python3 -m py_compile lib/*.py
+shellcheck -x backup-home tests/*.sh collectors/* restore-handlers/* lib/collector-common
 tests/integration.sh
+tests/recovery-collectors.sh
 ```
 
 The suite uses only temporary sources and destinations. It covers dry-run, two linked
@@ -532,3 +574,6 @@ signal cleanup, lock conflicts, retention, basic/deep verification, checksum
 tampering, legacy snapshots, safe partial restore, traversal rejection, drill,
 manifest v2 identity, read-only recovery planning, staged merge conflicts, resumable
 sessions, trusted handlers, destructive approval, and collector fallbacks.
+The recovery collector suite also covers sensitive-destination policy, live-WAL
+SQLite backup, unclassified database rejection, targeted browser boundaries, and
+fresh-cache versus stale-cache behavior for GitHub and server collection.

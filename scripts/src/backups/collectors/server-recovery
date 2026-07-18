@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+CONFIG_FILE="${BACKUP_HOME_SERVER_CONFIG:-$PROJECT_DIR/config/server-recovery/local.conf}"
+SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
+HOST=""
+CACHE_RELATIVE="backups/server/server"
+MAX_AGE_HOURS=24
+KEEP_SNAPSHOTS=2
+LOG_DAYS=7
+LOG_MAX_BYTES=52428800
+JOPLIN_HELPER=""
+JOPLIN_BACKUP_RELATIVE="backups/joplin"
+declare -a CONFIG_PATHS=()
+declare -a CONFIG_EXCLUDES=()
+declare -a SQLITE_LABELS=()
+declare -a SQLITE_PATHS=()
+declare -a SQLITE_SERVICES=()
+declare -a LOG_UNITS=()
+declare -a DOCKER_LOG_CONTAINERS=()
+REMOTE_TEMP=""
+INCOMPLETE_BUNDLE=""
+
+cleanup() {
+  if [[ -n "$REMOTE_TEMP" && "$REMOTE_TEMP" == /tmp/backup-home-server.* ]]; then
+    ssh "$HOST" sudo rm -rf -- "$REMOTE_TEMP" >/dev/null 2>&1 || true
+  fi
+  [[ -z "$INCOMPLETE_BUNDLE" || ! -d "$INCOMPLETE_BUNDLE" ]] || rm -rf -- "$INCOMPLETE_BUNDLE"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+validate_remote_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && ! "$1" =~ (^|/)\.\.?(/|$) ]] \
+    || collector_fail "Unsafe remote path: $1"
+}
+
+validate_remote_pattern() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/*-]+$ && ! "$1" =~ (^|/)\.\.?(/|$) ]] \
+    || collector_fail "Unsafe remote exclude pattern: $1"
+}
+
+load_config() {
+  local line kind first second third extra
+  [[ -f "$CONFIG_FILE" ]] || collector_fail "Server recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind first second third extra <<<"$line"
+    case "$kind" in
+      host)
+        [[ "$first" =~ ^[A-Za-z0-9._-]+$ && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Invalid SSH host"
+        HOST="$first"
+        ;;
+      cache-relative|joplin-backup-relative)
+        [[ -n "$first" && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Invalid relative config entry"
+        collector_validate_relative_path "$first"
+        [[ "$kind" == cache-relative ]] && CACHE_RELATIVE="$first" || JOPLIN_BACKUP_RELATIVE="$first"
+        ;;
+      max-age-hours|keep-snapshots|log-days|log-max-bytes)
+        [[ "$first" =~ ^[1-9][0-9]*$ && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Invalid numeric server config"
+        case "$kind" in
+          max-age-hours) MAX_AGE_HOURS="$first" ;;
+          keep-snapshots) KEEP_SNAPSHOTS="$first" ;;
+          log-days) LOG_DAYS="$first" ;;
+          log-max-bytes) LOG_MAX_BYTES="$first" ;;
+        esac
+        ;;
+      config-path)
+        validate_remote_path "$first"; CONFIG_PATHS+=("$first")
+        ;;
+      config-exclude)
+        validate_remote_pattern "$first"; CONFIG_EXCLUDES+=("$first")
+        ;;
+      sqlite)
+        collector_validate_name "$first"; validate_remote_path "$second"
+        [[ "$third" =~ ^(systemd|docker):[A-Za-z0-9@_.-]+$ && -z "${extra:-}" ]] || collector_fail "Invalid SQLite service control entry"
+        SQLITE_LABELS+=("$first"); SQLITE_PATHS+=("$second"); SQLITE_SERVICES+=("$third")
+        ;;
+      log-unit)
+        [[ "$first" =~ ^[A-Za-z0-9@_.-]+$ && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Invalid log unit"
+        LOG_UNITS+=("$first")
+        ;;
+      docker-log)
+        [[ "$first" =~ ^[A-Za-z0-9@_.-]+$ && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Invalid Docker log container"
+        DOCKER_LOG_CONTAINERS+=("$first")
+        ;;
+      joplin-helper)
+        [[ "$first" == /* && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Joplin helper must be an absolute executable path"
+        JOPLIN_HELPER="$first"
+        ;;
+      *) collector_fail "Unknown server recovery config record: $kind" ;;
+    esac
+  done <"$CONFIG_FILE"
+  [[ -n "$HOST" && "${#CONFIG_PATHS[@]}" -gt 0 && "${#SQLITE_PATHS[@]}" -gt 0 ]] \
+    || collector_fail "Server recovery config is incomplete"
+}
+
+remote_online() {
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST" true >/dev/null 2>&1
+}
+
+create_remote_temp() {
+  REMOTE_TEMP="$(ssh "$HOST" sudo mktemp -d /tmp/backup-home-server.XXXXXX 2>/dev/null)" || return 1
+  [[ "$REMOTE_TEMP" == /tmp/backup-home-server.* ]] || return 1
+  ssh "$HOST" sudo chmod 700 "$REMOTE_TEMP" >/dev/null 2>&1 || return 1
+}
+
+backup_config_archive() {
+  local bundle="$1" path pattern remote_command
+  local -a relative=()
+  local -a exclude_args=()
+  for path in "${CONFIG_PATHS[@]}"; do relative+=("${path#/}"); done
+  for pattern in "${CONFIG_EXCLUDES[@]}"; do exclude_args+=("--exclude=${pattern#/}"); done
+  printf -v remote_command '%q ' sudo tar --acls --xattrs --numeric-owner -C / -cf - \
+    "${exclude_args[@]}" "${relative[@]}"
+  ssh "$HOST" "$remote_command" \
+    >"$bundle/server-config.tar" || return 1
+  [[ -s "$bundle/server-config.tar" ]] || return 1
+  chmod 600 -- "$bundle/server-config.tar"
+}
+
+backup_sqlite_databases() {
+  local bundle="$1" index label path service remote_file local_file metadata
+  mkdir -p -- "$bundle/databases"
+  printf 'label\tremote_path\tservice\tartifact\tmode\tuid\tgid\n' >"$bundle/databases.tsv"
+  for index in "${!SQLITE_PATHS[@]}"; do
+    label="${SQLITE_LABELS[$index]}"; path="${SQLITE_PATHS[$index]}"; service="${SQLITE_SERVICES[$index]}"
+    remote_file="$REMOTE_TEMP/$label.sqlite"
+    ssh "$HOST" sudo python3 - backup "$path" "$remote_file" <"$SQLITE_HELPER" >/dev/null 2>&1 || return 1
+    local_file="$bundle/databases/$label.sqlite"
+    ssh "$HOST" sudo cat "$remote_file" >"$local_file" || return 1
+    python3 "$SQLITE_HELPER" check "$local_file" >/dev/null || return 1
+    chmod 600 -- "$local_file"
+    metadata="$(ssh "$HOST" sudo stat -c '%a\t%u\t%g' "$path" 2>/dev/null)" || return 1
+    printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$path" "$service" "databases/$label.sqlite" "$metadata" >>"$bundle/databases.tsv"
+  done
+}
+
+backup_inventory() {
+  local bundle="$1"
+  mkdir -p -- "$bundle/inventory"
+  ssh "$HOST" 'uname -a; printf "\n"; cat /etc/os-release' >"$bundle/inventory/system.txt" || return 1
+  ssh "$HOST" sudo systemctl list-units --type=service --all --no-pager >"$bundle/inventory/services.txt" || return 1
+  ssh "$HOST" sudo docker ps -a --no-trunc >"$bundle/inventory/docker.txt" 2>/dev/null || collector_warn "Remote Docker inventory was unavailable"
+  ssh "$HOST" sudo nft list ruleset >"$bundle/inventory/nftables.conf" 2>/dev/null || collector_warn "Remote nftables inventory was unavailable"
+  ssh "$HOST" sudo wg show all dump >"$bundle/inventory/wireguard.tsv" 2>/dev/null || collector_warn "Remote WireGuard inventory was unavailable"
+}
+
+backup_logs() {
+  local bundle="$1" unit safe_unit container safe_container log_hours
+  mkdir -p -- "$bundle/logs"
+  log_hours=$((LOG_DAYS * 24))
+  for unit in "${LOG_UNITS[@]}"; do
+    safe_unit="${unit//[^A-Za-z0-9_.-]/_}"
+    if ! ssh "$HOST" "bash -o pipefail -c \"sudo journalctl --unit '$unit' --since '$LOG_DAYS days ago' --no-pager --output=short-iso | tail -c '$LOG_MAX_BYTES'\"" \
+      >"$bundle/logs/$safe_unit.log" 2>/dev/null; then
+      collector_warn "Could not export bounded journal for remote unit: $unit"
+      rm -f -- "$bundle/logs/$safe_unit.log"
+    fi
+  done
+  for container in "${DOCKER_LOG_CONTAINERS[@]}"; do
+    safe_container="${container//[^A-Za-z0-9_.-]/_}"
+    if ! ssh "$HOST" "bash -o pipefail -c \"sudo docker logs --since '${log_hours}h' '$container' 2>&1 | tail -c '$LOG_MAX_BYTES'\"" \
+      >"$bundle/logs/docker-$safe_container.log" 2>/dev/null; then
+      collector_warn "Could not export bounded Docker logs for remote container: $container"
+      rm -f -- "$bundle/logs/docker-$safe_container.log"
+    fi
+  done
+}
+
+run_joplin_backup() {
+  local directory="$COLLECTOR_SOURCE_HOME/$JOPLIN_BACKUP_RELATIVE" latest checksum now age
+  [[ -n "$JOPLIN_HELPER" ]] || return 0
+  [[ -x "$JOPLIN_HELPER" ]] || return 1
+  LOCAL_BACKUP_DIR="$directory" "$JOPLIN_HELPER" backup "$HOST" >/dev/null 2>&1 || return 1
+  latest="$(find "$directory" -maxdepth 1 -type f -name 'joplin-*.dump' -printf '%T@\t%p\n' | sort -nr | head -n 1 | cut -f2-)"
+  [[ -n "$latest" && -s "$latest.sha256" ]] || return 1
+  checksum="$(basename -- "$latest").sha256"
+  (cd "$directory" && sha256sum -c "$checksum" >/dev/null) || return 1
+  now="$(date +%s)"; age=$((now - $(stat -c %Y "$latest")))
+  [[ "$age" -le $((MAX_AGE_HOURS * 3600)) ]]
+}
+
+write_bundle_checksums() {
+  local bundle="$1"
+  (cd "$bundle" && find . -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 -r sha256sum) \
+    >"$bundle/checksums.sha256"
+}
+
+refresh_server() {
+  local cache_root="$1" stamp final old_bundle
+  local -a old_bundles=()
+  remote_online || return 1
+  create_remote_temp || return 1
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  INCOMPLETE_BUNDLE="$cache_root/.incomplete-$stamp-$$"
+  final="$cache_root/$stamp"
+  mkdir -p -- "$INCOMPLETE_BUNDLE"
+  chmod 700 -- "$INCOMPLETE_BUNDLE"
+  backup_config_archive "$INCOMPLETE_BUNDLE" || return 1
+  backup_sqlite_databases "$INCOMPLETE_BUNDLE" || return 1
+  backup_inventory "$INCOMPLETE_BUNDLE" || return 1
+  backup_logs "$INCOMPLETE_BUNDLE"
+  run_joplin_backup || return 1
+  printf 'host\t%s\ncreated_at\t%s\n' "$HOST" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$INCOMPLETE_BUNDLE/bundle.tsv"
+  write_bundle_checksums "$INCOMPLETE_BUNDLE"
+  mv -- "$INCOMPLETE_BUNDLE" "$final"
+  INCOMPLETE_BUNDLE=""
+  mapfile -t old_bundles < <(find "$cache_root" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' | sort -r | tail -n +$((KEEP_SNAPSHOTS + 1)))
+  for old_bundle in "${old_bundles[@]}"; do
+    [[ "$old_bundle" == 20* ]] || collector_fail "Unsafe cached server bundle name: $old_bundle"
+    rm -rf -- "${cache_root:?}/$old_bundle"
+  done
+  printf '%s\n' "$final"
+}
+
+latest_fresh_bundle() {
+  local cache_root="$1" latest now age
+  latest="$(find "$cache_root" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%T@\t%p\n' | sort -nr | head -n 1 | cut -f2-)"
+  [[ -n "$latest" ]] || return 1
+  now="$(date +%s)"; age=$((now - $(stat -c %Y "$latest")))
+  [[ "$age" -le $((MAX_AGE_HOURS * 3600)) ]] || return 1
+  printf '%s\n' "$latest"
+}
+
+main() {
+  local command cache_root bundle lock_file
+  for command in cut date find flock mkdir mv python3 rsync sha256sum sort ssh stat tar xargs; do collector_require_command "$command"; done
+  collector_init
+  load_config
+  cache_root="$COLLECTOR_SOURCE_HOME/$CACHE_RELATIVE"
+  mkdir -p -- "$cache_root"
+  chmod 700 -- "$cache_root"
+  lock_file="$cache_root/.collector.lock"
+  exec 9>"$lock_file"; flock -n 9 || collector_fail "Another server collector is already running"
+  if bundle="$(refresh_server "$cache_root")"; then
+    collector_index server "$HOST" "$CACHE_RELATIVE/${bundle##*/}" success "fresh remote export"
+  elif bundle="$(latest_fresh_bundle "$cache_root")"; then
+    collector_warn "Server refresh failed; using cache younger than $MAX_AGE_HOURS hours"
+    collector_index server "$HOST" "$CACHE_RELATIVE/${bundle##*/}" cached "remote refresh failed"
+  else
+    collector_fail "Server refresh failed and no cache younger than $MAX_AGE_HOURS hours exists"
+  fi
+  rsync -a "$bundle/" "$COLLECTOR_STAGE_DIR/bundle/"
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# Server recovery
+
+The bundle contains a metadata-preserving configuration archive, consistent SQLite
+backups, bounded journals, and a safe inventory. Historical deployment backups and
+physical PostgreSQL storage are excluded. The trusted Joplin helper creates and
+verifies the logical PostgreSQL dump separately. Network, firewall, provider DNS,
+and WireGuard changes remain guided because applying them blindly can remove remote
+access. Database replacement requires exact destructive approval and a remote safety
+copy.
+EOF
+  collector_finalize
+}
+
+main "$@"

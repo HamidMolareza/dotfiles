@@ -1,5 +1,10 @@
 # Backup sources. Values must be absolute paths or glob patterns.
 # Replace alice with the local account name before copying this sample.
+sensitive=no
+unencrypted_destination=allow
+# For credentials or other private data, use `sensitive=yes` and review whether
+# `unencrypted_destination=warn` or `require` matches the storage policy.
+
 include=/home/alice/Downloads
 include=/home/alice/Desktop
 
@@ -8,6 +13,9 @@ include=/home/alice/Desktop
 # include=/home/alice/Projects
 # include=/home/alice/.dotfiles
 # include=/home/alice/Private
+# include=/home/alice/.codex
+# include=/home/alice/backups/github
+# include=/home/alice/backups/server
 
 # Exclude files may be relative to this profile.
 exclude_file=../excludes/common.exclude

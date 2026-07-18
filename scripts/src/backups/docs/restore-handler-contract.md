@@ -16,8 +16,9 @@ collector-name|/absolute/path/to/trusted/executable
 The collector name identifies the matching snapshot artifact directory. The command
 must be absolute and executable; shell fragments, arguments, relative paths, and
 duplicate names are rejected. A missing default local file is valid. The tracked
-`restore-handlers/docker-recovery` is registered automatically when executable and
-not overridden by a local `docker-recovery` entry.
+tracked handlers below `restore-handlers/` for Docker, credentials, Codex/MCP,
+browser, GitHub, and server recovery are registered automatically when executable
+and not overridden by a matching local entry.
 
 Review a handler with the same care as a root-capable restore script. It may inspect
 snapshot data, change services, and use `sudo` only when its documented component

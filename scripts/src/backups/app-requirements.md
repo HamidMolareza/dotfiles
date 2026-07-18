@@ -9,16 +9,19 @@ snapshots as its only backup engine.
 The tool must remain understandable, dependency-light, dry-run friendly, and safe
 for local external disks or mounted filesystems. Archive-only engines, built-in
 compression, GPG wrappers, cloud backends, database logic inside the backup core,
-and automatic repository mirroring are outside this version. Application-aware
-database backups may be supplied by explicit external collectors.
+and repository/database logic inside the core are outside this version.
+Application-aware database backups and repository mirrors may be supplied by
+explicit external collectors, including trusted collectors shipped beside the core.
 
 ## Configuration
 
 All active configuration lives under `config/`:
 
-- `config/profiles/home.conf` defines `include=ABSOLUTE_PATH_OR_GLOB` entries and
-  zero or more repeated `exclude_file=PATH` references. A profile without an
-  exclude file copies every matched path.
+- `config/profiles/home.conf` defines `include=ABSOLUTE_PATH_OR_GLOB` entries, zero
+  or more repeated `exclude_file=PATH` references, `sensitive=yes|no`, and
+  `unencrypted_destination=warn|require|allow`. A profile without an exclude file
+  copies every matched path. Profiles that omit the new keys retain the compatible
+  defaults `sensitive=no` and `unencrypted_destination=allow`.
 - exclude files contain one absolute or global pattern per line without a leading
   `!`; relative exclude-file references resolve from the profile directory.
 - `config/manual/home.manual` contains `Title` or `Title | Description` checklist
@@ -28,6 +31,10 @@ All active configuration lives under `config/`:
   container and volume names, Compose identifiers, and helper images used by the
   optional Docker collector and restore handler. It is ignored by Git; only an
   inactive sample is tracked.
+- `config/{credentials,codex-mcp,browser,github,server}-recovery/local.conf` contains
+  reviewed machine/account/application selections for the corresponding collector
+  and handler. These files are ignored; tracked `.sample` files contain no personal
+  account, host, token, or absolute machine path.
 - `config/restore/handlers.local.conf` optionally contains
   `COLLECTOR|ABSOLUTE_EXECUTABLE` restore-handler entries. A missing default local
   file is valid. Only trusted local executables may be configured; code stored in a
@@ -71,8 +78,10 @@ failure into a successful exit code.
 - New snapshots use manifest schema v2. The manifest records schema version, timing,
   host and OS, source user/UID/GID/home, safe config digest, roots, excludes,
   previous snapshot, collector results, rsync status, warnings, payload metrics,
-  checksum count, and script revision/digest. It must not contain tokens, environment
-  dumps, or raw authentication diagnostics. Schema v1 remains readable.
+  checksum count, script revision/digest, sensitive-profile state, best-effort
+  destination-encryption detection, and the configured unencrypted-destination
+  policy. It must not contain tokens, environment dumps, or raw authentication
+  diagnostics. Schema v1 remains readable.
 
 ## Collectors and manual staging
 
@@ -80,7 +89,9 @@ failure into a successful exit code.
   `optional|name|/absolute/executable`; arbitrary directory auto-discovery and
   `eval` are forbidden.
 - Each collector receives a private staging directory through
-  `BACKUP_HOME_STAGE_DIR`. Dry runs list collectors but never execute them.
+  `BACKUP_HOME_STAGE_DIR`, plus `BACKUP_HOME_SNAPSHOT_NAME`, `BACKUP_HOME_DEST`,
+  `BACKUP_HOME_SOURCE_HOME`, `BACKUP_HOME_PROFILE_FILE`, and
+  `BACKUP_HOME_RUN_STARTED_AT`. Dry runs list collectors but never execute them.
 - A required collector failure aborts the backup. An optional collector failure is
   recorded as a warning and may produce a successful-with-warnings snapshot.
 - The opt-in system inventory collector exports dconf, manual APT packages, dpkg
@@ -89,6 +100,29 @@ failure into a successful exit code.
   automatically restores settings.
 - Repository recovery uses only an explicit external collector or an included local
   artifact path. GitHub/GitLab clone and API logic do not belong in the backup core.
+- Every shipped recovery collector writes `index.tsv`, `checksums.sha256`, and
+  `RESTORE.md`, uses a private staging directory, never prints secret contents, and
+  fails rather than silently omitting a required configured source.
+- The credentials collector creates component-separated metadata-preserving archives
+  for explicitly configured SSH/GPG, keyring, GitHub CLI, and Codex credential paths.
+- The Codex/MCP collector uses the Python standard-library SQLite online backup API
+  and `PRAGMA quick_check`. Candidate roots must not contain an unclassified
+  SQLite-like file. Raw WAL/SHM/database files may be excluded only after explicit
+  classification.
+- The browser collector is targeted: bookmark backups, open-session files, sanitized
+  extension inventory, and allowlisted extension state are permitted. Raw profiles,
+  history, cookies, saved passwords, and unselected extension state are forbidden.
+- The GitHub collector mirrors explicitly configured accounts' owned repositories,
+  wikis, gists, LFS objects when required tooling is available, and reviewable API
+  metadata. It periodically obtains an official user-migration archive with Git data
+  excluded, retains two by default, and may fall back only to a cache no older than
+  the configured limit. It exports secret names but cannot export Actions or webhook
+  secret values.
+- The server collector uses a reviewed SSH alias, a metadata-preserving configuration
+  archive, online SQLite backups, bounded journals, safe inventory, and an external
+  trusted Joplin logical-backup helper. It excludes historical deployment backups
+  and physical PostgreSQL storage. A remote failure may use only a cache no older
+  than the configured limit.
 - The shipped `collectors/docker-recovery` wrapper is an explicit external collector.
   It requires reviewed local configuration and must not embed a username, mount
   point, or machine-specific service layout in tracked code.
@@ -167,6 +201,11 @@ failure into a successful exit code.
   where verified artifacts and local prerequisites are available. It prepares SQL
   Server artifacts and a T-SQL template but intentionally leaves the final database
   selection and replacement to the operator.
+- Tracked handlers for credentials, Codex/MCP databases, targeted browser data,
+  GitHub recovery, and server recovery are automatically registered when executable
+  and not overridden locally. They create safety copies before approved replacement.
+  Browser installation, GitHub remote creation/push, server network/firewall changes,
+  secret rotation, and Joplin remote database replacement remain guided steps.
 - Legacy snapshots remain available to low-level restore. Guided recovery warns that
   identity and checksums are incomplete, requires `--allow-legacy`, and blocks a
   snapshot with a matching failed-run report.
@@ -175,6 +214,10 @@ failure into a successful exit code.
 
 The backup destination must not be `/`, the current account's home directory, or
 inside a configured source.
+For a sensitive profile, encryption detection walks the destination block-device
+ancestry looking for `crypto_LUKS`. `require` blocks `not-detected` and `unknown`,
+`warn` records a warning and produces `success-with-warnings`, and `allow` proceeds.
+Detection is advisory and cannot prove physical or provider-level encryption.
 Missing configured sources warn and continue, but invalid configuration and required
 operation failures are non-zero. Real runs confirm destination and estimated size,
 write dated logs, and never expose secrets in summaries.
@@ -185,3 +228,6 @@ locking, pruning, basic/deep verification, legacy handling, safe partial restore
 restore drill, traversal rejection, manifest v2 identity, read-only recovery plans,
 staging and conflict handling, resumable sessions, destructive approval boundaries,
 trusted restore handlers, collector fallbacks, and meaningful exit codes.
+Acceptance also requires isolated tests for sensitive-destination policy, live-WAL
+SQLite backup, explicit database classification, targeted browser boundaries, and
+GitHub/server freshness fallback.

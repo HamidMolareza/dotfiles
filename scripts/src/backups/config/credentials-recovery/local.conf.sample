@@ -1,0 +1,9 @@
+# component|home-relative-path
+# Enable only after reviewing the destination encryption policy.
+# ssh-gpg|Private/.ssh
+# ssh-gpg|Private/.gnupg
+# keyring|.local/share/keyrings
+# github|.config/gh
+# codex|.codex/auth.json
+# codex|.codex/secrets
+# codex|.codex/config.toml

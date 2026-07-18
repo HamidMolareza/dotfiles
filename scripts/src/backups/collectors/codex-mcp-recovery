@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+CONFIG_FILE="${BACKUP_HOME_CODEX_MCP_CONFIG:-$PROJECT_DIR/config/codex-mcp-recovery/local.conf}"
+SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
+declare -a ENTRY_KINDS=()
+declare -a ENTRY_CATEGORIES=()
+declare -a ENTRY_PATHS=()
+declare -a CANDIDATE_ROOTS=()
+declare -a IGNORE_ROOTS=()
+declare -A CONFIGURED_DATABASES=()
+
+load_config() {
+  local line
+  local kind
+  local category
+  local relative
+  local extra
+
+  [[ -f "$CONFIG_FILE" ]] || collector_fail "Codex/MCP recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind category relative extra <<<"$line"
+    case "$kind" in
+      sqlite|static)
+        [[ "$category" == codex || "$category" == mcp ]] \
+          || collector_fail "Invalid Codex/MCP database category: $category"
+        [[ -n "$relative" && -z "${extra:-}" ]] \
+          || collector_fail "Invalid Codex/MCP config entry: $line"
+        collector_validate_relative_path "$relative"
+        [[ -z "${CONFIGURED_DATABASES[$relative]+x}" ]] \
+          || collector_fail "Duplicate Codex/MCP database path: $relative"
+        CONFIGURED_DATABASES["$relative"]="$kind"
+        ENTRY_KINDS+=("$kind")
+        ENTRY_CATEGORIES+=("$category")
+        ENTRY_PATHS+=("$relative")
+        ;;
+      candidate-root|ignore-root)
+        [[ -n "$category" && -z "${relative:-}${extra:-}" ]] \
+          || collector_fail "Invalid Codex/MCP root entry: $line"
+        collector_validate_relative_path "$category"
+        if [[ "$kind" == candidate-root ]]; then CANDIDATE_ROOTS+=("$category"); else IGNORE_ROOTS+=("$category"); fi
+        ;;
+      *) collector_fail "Unknown Codex/MCP config record: $kind" ;;
+    esac
+  done <"$CONFIG_FILE"
+  [[ "${#ENTRY_PATHS[@]}" -gt 0 ]] || collector_fail "No Codex/MCP databases are configured"
+}
+
+is_ignored_candidate() {
+  local relative="$1"
+  local ignored
+  for ignored in "${IGNORE_ROOTS[@]}"; do
+    [[ "$relative" == "$ignored" || "$relative" == "$ignored"/* ]] && return 0
+  done
+  return 1
+}
+
+validate_candidate_coverage() {
+  local root
+  local source
+  local relative
+  local uncovered=0
+
+  for root in "${CANDIDATE_ROOTS[@]}"; do
+    if [[ ! -d "$COLLECTOR_SOURCE_HOME/$root" ]]; then
+      collector_warn "SQLite candidate root does not exist: $root"
+      continue
+    fi
+    while IFS= read -r -d '' source; do
+      relative="${source#"$COLLECTOR_SOURCE_HOME"/}"
+      is_ignored_candidate "$relative" && continue
+      if [[ -z "${CONFIGURED_DATABASES[$relative]+x}" ]]; then
+        printf 'Unconfigured SQLite-like file: %s\n' "$relative" >&2
+        uncovered=1
+      fi
+    done < <(find "$COLLECTOR_SOURCE_HOME/$root" -type f \
+      \( -iname '*.db' -o -iname '*.sqlite' -o -iname '*.sqlite3' \) -print0)
+  done
+  [[ "$uncovered" -eq 0 ]] \
+    || collector_fail "Unconfigured SQLite-like files were found; classify them before backup"
+}
+
+backup_entry() {
+  local index="$1"
+  local kind="${ENTRY_KINDS[$index]}"
+  local category="${ENTRY_CATEGORIES[$index]}"
+  local relative="${ENTRY_PATHS[$index]}"
+  local source="$COLLECTOR_SOURCE_HOME/$relative"
+  local artifact="databases/$category/$relative"
+  local target="$COLLECTOR_STAGE_DIR/$artifact"
+  local metadata
+
+  [[ -f "$source" ]] || collector_fail "Required Codex/MCP database file is missing: $relative"
+  mkdir -p -- "$(dirname -- "$target")"
+  if [[ "$kind" == sqlite ]]; then
+    python3 "$SQLITE_HELPER" backup "$source" "$target" \
+      || collector_fail "Could not create consistent SQLite backup: $relative"
+  else
+    collector_copy_stable_file "$source" "$target" \
+      || collector_fail "Could not copy stable database-like file: $relative"
+    chmod 600 -- "$target"
+  fi
+  metadata="mode=$(stat -c '%a' -- "$source");uid=$(stat -c '%u' -- "$source");gid=$(stat -c '%g' -- "$source")"
+  collector_index "$kind" "$relative" "$artifact" success "$category;$metadata"
+}
+
+main() {
+  local command
+  local index
+  for command in cp find mkdir python3 sha256sum sort stat xargs; do collector_require_command "$command"; done
+  [[ -f "$SQLITE_HELPER" ]] || collector_fail "SQLite helper is missing: $SQLITE_HELPER"
+  collector_init
+  load_config
+  validate_candidate_coverage
+  for index in "${!ENTRY_PATHS[@]}"; do backup_entry "$index"; done
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# Codex and MCP database recovery
+
+Every SQLite artifact was created with the online SQLite backup API and passed
+`PRAGMA quick_check`. Database-like files explicitly classified as static were
+copied only after a stability check. Stop Codex and every related MCP process before
+restoring. The guided handler makes per-file safety copies, removes stale WAL/SHM
+sidecars, applies private modes, and runs another integrity check.
+EOF
+  collector_finalize
+}
+
+main "$@"

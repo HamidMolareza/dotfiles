@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
+ACTION="${1:-}"
+COMPONENT="${2:-}"
+ARTIFACT_DIR="${BACKUP_HOME_ARTIFACT_DIR:-}"
+TARGET_HOME="${BACKUP_HOME_TARGET_HOME:-}"
+SESSION_DIR="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+DRY_RUN="${BACKUP_HOME_RESTORE_DRY_RUN:-0}"
+DESTRUCTIVE_APPROVED="${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}"
+CONFIG_FILE="${BACKUP_HOME_SERVER_CONFIG:-$PROJECT_DIR/config/server-recovery/local.conf}"
+HOST=""
+JOPLIN_BACKUP_RELATIVE="backups/joplin"
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+validate_remote_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && ! "$1" =~ (^|/)\.\.?(/|$) ]] || fail "Unsafe remote path"
+}
+
+load_config() {
+  local line kind first _second _third _extra
+  [[ -f "$CONFIG_FILE" ]] || fail "Server recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind first _second _third _extra <<<"$line"
+    case "$kind" in
+      host) [[ "$first" =~ ^[A-Za-z0-9._-]+$ ]] || fail "Unsafe SSH host"; HOST="$first" ;;
+      joplin-backup-relative) [[ "$first" != /* ]] || fail "Unsafe Joplin path"; JOPLIN_BACKUP_RELATIVE="$first" ;;
+    esac
+  done <"$CONFIG_FILE"
+  [[ -n "$HOST" ]] || fail "Server SSH host is missing"
+}
+
+database_row() {
+  local wanted="${1#server.}"
+  awk -F '\t' -v wanted="$wanted" 'NR > 1 && $1 == wanted {print; exit}' "$ARTIFACT_DIR/bundle/databases.tsv"
+}
+
+describe() {
+  if [[ -s "$ARTIFACT_DIR/bundle/server-config.tar" ]]; then
+    printf 'component\tserver.foundation\tServer foundation and service configuration\tguided\tprivileged\trecommended\n'
+    printf 'component\tserver.secrets\tServer secrets and credentials review\tguided\tmanual\trecommended\n'
+    printf 'component\tserver.wireguard\tWireGuard and network recovery\tguided\tmanual\trecommended\n'
+    printf 'component\tserver.proxy-router\tProxy router, sing-box, and gateway state\tguided\tmanual\trecommended\n'
+  fi
+  if [[ -s "$ARTIFACT_DIR/bundle/databases/gateway-monitor.sqlite" ]]; then
+    printf 'component\tserver.gateway-monitor\tGateway Monitor SQLite state\tautomatic\tdestructive\trecommended\n'
+  fi
+  if [[ -s "$ARTIFACT_DIR/bundle/databases/gh-proxy.sqlite" ]]; then
+    printf 'component\tserver.gh-proxy\tGitHub proxy SQLite state\tautomatic\tdestructive\trecommended\n'
+  fi
+  printf 'component\tserver.joplin\tJoplin Server logical database recovery\tguided\tmanual\trecommended\n'
+  if [[ -d "$ARTIFACT_DIR/bundle/logs" ]]; then
+    printf 'component\tserver.logs\tBounded server diagnostic logs\tguided\tsafe\toptional\n'
+  fi
+}
+
+remote_ready() {
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST" true >/dev/null 2>&1
+}
+
+preflight_database() {
+  local row label path service artifact mode uid gid control_kind control_name
+  row="$(database_row "$COMPONENT")"
+  [[ -n "$row" ]] || { printf 'blocker\tDatabase metadata is missing\n'; return; }
+  IFS=$'\t' read -r label path service artifact mode uid gid <<<"$row"
+  [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "Unsafe database label"
+  [[ "$artifact" == "databases/$label.sqlite" ]] || fail "Unsafe database artifact path"
+  command -v scp >/dev/null 2>&1 || printf 'blocker\tscp is unavailable for reviewed database upload\n'
+  validate_remote_path "$path"
+  [[ "$service" =~ ^(systemd|docker):[A-Za-z0-9@_.-]+$ ]] || fail "Unsafe remote service control"
+  control_kind="${service%%:*}"; control_name="${service#*:}"
+  [[ -s "$ARTIFACT_DIR/bundle/$artifact" ]] || { printf 'blocker\tDatabase artifact is missing\n'; return; }
+  python3 "$SQLITE_HELPER" check "$ARTIFACT_DIR/bundle/$artifact" >/dev/null 2>&1 \
+    && printf 'ok\tSQLite artifact passed an integrity check\n' \
+    || printf 'blocker\tSQLite artifact failed its integrity check\n'
+  if remote_ready; then
+    printf 'ok\tRemote server is reachable through the configured SSH alias\n'
+    if [[ "$control_kind" == systemd ]]; then
+      ssh "$HOST" sudo systemctl cat "$control_name" >/dev/null 2>&1 \
+        && printf 'ok\tRemote systemd unit is installed: %s\n' "$control_name" \
+        || printf 'blocker\tRemote systemd unit is missing: %s\n' "$control_name"
+    else
+      ssh "$HOST" sudo docker container inspect "$control_name" >/dev/null 2>&1 \
+        && printf 'ok\tRemote Docker container exists: %s\n' "$control_name" \
+        || printf 'blocker\tRemote Docker container is missing: %s\n' "$control_name"
+    fi
+  else
+    printf 'blocker\tRemote server is unavailable: %s\n' "$HOST"
+  fi
+  printf 'risk\tdestructive\n'
+  printf 'warning\tThe handler will stop one explicit service or container and keep a timestamped remote safety copy\n'
+}
+
+preflight() {
+  case "$COMPONENT" in
+    server.gateway-monitor|server.gh-proxy) preflight_database ;;
+    server.foundation|server.secrets|server.wireguard|server.proxy-router)
+      [[ -s "$ARTIFACT_DIR/bundle/server-config.tar" ]] \
+        && printf 'ok\tMetadata-preserving server configuration archive is present\n' \
+        || printf 'blocker\tServer configuration archive is missing\n'
+      printf 'warning\tConfiguration, network, firewall, and secret changes require operator review\n'
+      ;;
+    server.joplin)
+      [[ -d "$TARGET_HOME/$JOPLIN_BACKUP_RELATIVE" ]] \
+        && printf 'ok\tLocal Joplin logical backup directory is available\n' \
+        || printf 'warning\tRestore the home backup containing Joplin dumps before this step\n'
+      ;;
+    server.logs) printf 'ok\tBounded diagnostic logs are available for inspection\n' ;;
+    *) fail "Unknown server recovery component: $COMPONENT" ;;
+  esac
+}
+
+apply_database() {
+  local row label path service artifact mode uid gid upload
+  [[ "$DESTRUCTIVE_APPROVED" -eq 1 ]] || fail "Remote database replacement requires component-specific destructive approval"
+  row="$(database_row "$COMPONENT")"; IFS=$'\t' read -r label path service artifact mode uid gid <<<"$row"
+  [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "Unsafe database label"
+  [[ "$artifact" == "databases/$label.sqlite" ]] || fail "Unsafe database artifact path"
+  validate_remote_path "$path"
+  [[ "$service" =~ ^(systemd|docker):[A-Za-z0-9@_.-]+$ && "$mode" =~ ^[0-7]{3,4}$ && "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] \
+    || fail "Unsafe database restoration metadata"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'Would safety-copy %s, stop %s, replace the database, verify it, and restart the service.\n' "$path" "$service"
+    return 0
+  fi
+  remote_ready || fail "Remote server is unavailable: $HOST"
+  upload="/tmp/backup-home-restore-$$-$label.sqlite"
+  scp -q -- "$ARTIFACT_DIR/bundle/$artifact" "$HOST:$upload" || fail "Could not upload database artifact"
+  if ! ssh "$HOST" sudo bash -s -- "$path" "$service" "$upload" "$label" "$mode" "$uid" "$gid" <<'REMOTE'
+set -Eeuo pipefail
+path="$1"
+service="$2"
+upload="$3"
+label="$4"
+mode="$5"
+uid="$6"
+gid="$7"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+safety="/var/backups/backup-home/$stamp/$label"
+install -d -m 0700 "$safety"
+if [[ -e "$path" ]]; then
+  cp -a -- "$path" "$safety/database"
+  mode="$(stat -c %a -- "$path")"
+  uid="$(stat -c %u -- "$path")"
+  gid="$(stat -c %g -- "$path")"
+fi
+for sidecar in "$path-wal" "$path-shm"; do
+  [[ ! -e "$sidecar" ]] || cp -a -- "$sidecar" "$safety/"
+done
+control_kind="${service%%:*}"
+control_name="${service#*:}"
+stop_control() {
+  if [[ "$control_kind" == systemd ]]; then systemctl stop "$control_name"; else docker stop "$control_name" >/dev/null; fi
+}
+start_control() {
+  if [[ "$control_kind" == systemd ]]; then systemctl start "$control_name"; else docker start "$control_name" >/dev/null; fi
+}
+stop_control
+restart=1
+trap '[[ ${restart:-0} -eq 0 ]] || start_control >/dev/null 2>&1 || true; rm -f -- "$upload"' EXIT
+rm -f -- "$path-wal" "$path-shm"
+install -o "$uid" -g "$gid" -m "$mode" -- "$upload" "$path.new-backup-home"
+mv -f -- "$path.new-backup-home" "$path"
+start_control
+restart=0
+rm -f -- "$upload"
+trap - EXIT
+REMOTE
+  then
+    ssh "$HOST" rm -f -- "$upload" >/dev/null 2>&1 || true
+    fail "Remote database replacement failed; inspect the remote safety directory"
+  fi
+  ssh "$HOST" sudo python3 - check "$path" <"$SQLITE_HELPER" >/dev/null \
+    || fail "Remote SQLite quick_check failed after restoration"
+}
+
+stage_guided_artifact() {
+  local target="$SESSION_DIR/server-guided/$COMPONENT"
+  mkdir -p -- "$target"
+  case "$COMPONENT" in
+    server.logs) rsync -a "$ARTIFACT_DIR/bundle/logs/" "$target/" ;;
+    server.joplin) printf '%s\n' "$TARGET_HOME/$JOPLIN_BACKUP_RELATIVE" >"$target/joplin-backup-location.txt" ;;
+    *) cp -a -- "$ARTIFACT_DIR/bundle/server-config.tar" "$target/" ;;
+  esac
+  printf 'Guided server artifacts: %s\n' "$target"
+  return 20
+}
+
+apply() {
+  case "$COMPONENT" in
+    server.gateway-monitor|server.gh-proxy) apply_database ;;
+    server.foundation|server.secrets|server.wireguard|server.proxy-router|server.joplin|server.logs) stage_guided_artifact ;;
+    *) fail "Unknown server recovery component: $COMPONENT" ;;
+  esac
+}
+
+verify() {
+  local row label path service artifact mode uid gid control_kind control_name
+  case "$COMPONENT" in
+    server.gateway-monitor|server.gh-proxy)
+      row="$(database_row "$COMPONENT")"; IFS=$'\t' read -r label path service artifact mode uid gid <<<"$row"
+      ssh "$HOST" sudo python3 - check "$path" <"$SQLITE_HELPER" >/dev/null
+      control_kind="${service%%:*}"; control_name="${service#*:}"
+      if [[ "$control_kind" == systemd ]]; then
+        ssh "$HOST" sudo systemctl is-active --quiet "$control_name"
+      else
+        [[ "$(ssh "$HOST" sudo docker container inspect --format '{{.State.Running}}' "$control_name")" == true ]]
+      fi
+      ;;
+    *) return 20 ;;
+  esac
+}
+
+guide() {
+  case "$COMPONENT" in
+    server.foundation) printf '%s\n' 'Inspect the configuration archive with `tar -tvf`. Rebuild from a trusted checkout, then selectively install reviewed service units and configuration; never execute code from the snapshot.' ;;
+    server.secrets) printf '%s\n' 'Compare secret file names, modes, and ownership. Restore values only into the intended service, rotate exposed or obsolete credentials, and never print them.' ;;
+    server.wireguard) printf '%s\n' 'Keep the current SSH session open. Compare provider firewall rules, nftables, routes, DNS, and WireGuard peers before applying anything; validate a second session before closing the first.' ;;
+    server.proxy-router) printf '%s\n' 'Deploy code from a trusted repository checkout, then restore only reviewed router, sing-box, certificate, and client-state files. Validate routing and health checks before enabling traffic.' ;;
+    server.gateway-monitor|server.gh-proxy) printf '%s\n' 'The previous remote database and sidecars are retained under `/var/backups/backup-home/TIMESTAMP/COMPONENT`. Keep them until service health and representative queries pass.' ;;
+    server.joplin) printf '%s\n' 'Use the trusted `joplin-vps` helper or documented Compose workflow to restore the latest checksum-verified custom-format PostgreSQL dump. Do not restore physical PostgreSQL files.' ;;
+    server.logs) printf '%s\n' 'Use bounded logs only for diagnosis; do not replay commands or secret-looking values copied from logs.' ;;
+    *) fail "Unknown server recovery component: $COMPONENT" ;;
+  esac
+}
+
+[[ -d "$ARTIFACT_DIR/bundle" && -n "$TARGET_HOME" && -n "$SESSION_DIR" ]] || fail "Restore environment is incomplete"
+load_config
+case "$ACTION" in
+  describe) describe ;;
+  preflight) preflight ;;
+  apply) apply ;;
+  verify) verify ;;
+  guide) guide ;;
+  *) fail "Unknown restore handler action: $ACTION" ;;
+esac

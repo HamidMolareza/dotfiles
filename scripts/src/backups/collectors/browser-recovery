@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+CONFIG_FILE="${BACKUP_HOME_BROWSER_CONFIG:-$PROJECT_DIR/config/browser-recovery/local.conf}"
+SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
+BROWSER_HELPER="$PROJECT_DIR/lib/browser-export.py"
+FIREFOX_ROOT=""
+CHROMIUM_ROOT=""
+declare -a EXTENSION_LABELS=()
+declare -a EXTENSION_IDS=()
+declare -a EXTENSION_MODES=()
+
+load_config() {
+  local line kind first second third extra
+  [[ -f "$CONFIG_FILE" ]] || collector_fail "Browser recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r kind first second third extra <<<"$line"
+    case "$kind" in
+      firefox-root|chromium-root)
+        [[ -n "$first" && -z "${second:-}${third:-}${extra:-}" ]] || collector_fail "Invalid browser root entry: $line"
+        collector_validate_relative_path "$first"
+        if [[ "$kind" == firefox-root ]]; then FIREFOX_ROOT="$first"; else CHROMIUM_ROOT="$first"; fi
+        ;;
+      firefox-extension)
+        collector_validate_name "$first"
+        [[ -n "$second" && ( "$third" == required || "$third" == optional ) && -z "${extra:-}" ]] \
+          || collector_fail "Invalid Firefox extension entry: $line"
+        EXTENSION_LABELS+=("$first"); EXTENSION_IDS+=("$second"); EXTENSION_MODES+=("$third")
+        ;;
+      *) collector_fail "Unknown browser recovery config record: $kind" ;;
+    esac
+  done <"$CONFIG_FILE"
+  [[ -n "$FIREFOX_ROOT" || -n "$CHROMIUM_ROOT" ]] || collector_fail "No browser roots are configured"
+}
+
+copy_tree_stable() {
+  local source_root="$1" target_root="$2" source relative target
+  [[ -d "$source_root" ]] || return 0
+  while IFS= read -r -d '' source; do
+    relative="${source#"$source_root"/}"
+    [[ "$relative" != "$source" ]] || continue
+    [[ "$source" != *-wal && "$source" != *-shm ]] || continue
+    target="$target_root/$relative"
+    if [[ "$source" == *.sqlite || "$source" == *.db || "$source" == *.sqlite3 ]]; then
+      mkdir -p -- "$(dirname -- "$target")"
+      python3 "$SQLITE_HELPER" backup "$source" "$target" \
+        || collector_fail "Could not back up browser SQLite state: $relative"
+    else
+      collector_copy_stable_file "$source" "$target" \
+        || collector_fail "Browser file changed repeatedly while being copied: $source"
+    fi
+  done < <(find "$source_root" -type f -print0)
+}
+
+backup_firefox() {
+  local root="$COLLECTOR_SOURCE_HOME/$FIREFOX_ROOT"
+  local profile
+  local profile_name
+  local target
+  local source
+  local index label extension_id mode uuid origin
+
+  [[ -d "$root" ]] || collector_fail "Firefox root does not exist: $FIREFOX_ROOT"
+  profile="$(python3 "$BROWSER_HELPER" firefox-profile "$root")" \
+    || collector_fail "Could not resolve the default Firefox profile"
+  [[ "$profile" == "$root"/* ]] || collector_fail "Firefox profile resolved outside the configured root"
+  profile_name="$(basename -- "$profile")"
+  printf 'firefox\t%s\t%s\n' "$profile_name" "$FIREFOX_ROOT" >>"$COLLECTOR_STAGE_DIR/profiles.tsv"
+
+  if [[ -d "$profile/bookmarkbackups" ]]; then
+    target="$COLLECTOR_STAGE_DIR/firefox/$profile_name/bookmarkbackups"
+    copy_tree_stable "$profile/bookmarkbackups" "$target"
+    collector_index bookmarks "$FIREFOX_ROOT/$profile_name/bookmarkbackups" "firefox/$profile_name/bookmarkbackups" success firefox
+  else
+    collector_warn "Firefox bookmark backups were not found"
+  fi
+  if [[ -d "$profile/sessionstore-backups" ]]; then
+    target="$COLLECTOR_STAGE_DIR/firefox/$profile_name/sessionstore-backups"
+    copy_tree_stable "$profile/sessionstore-backups" "$target"
+    collector_index sessions "$FIREFOX_ROOT/$profile_name/sessionstore-backups" "firefox/$profile_name/sessionstore-backups" success firefox
+  else
+    collector_warn "Firefox session backups were not found"
+  fi
+  if [[ -f "$profile/extensions.json" ]]; then
+    mkdir -p -- "$COLLECTOR_STAGE_DIR/firefox/$profile_name"
+    python3 "$BROWSER_HELPER" firefox-inventory "$profile/extensions.json" \
+      "$COLLECTOR_STAGE_DIR/firefox/$profile_name/extensions-inventory.json"
+    collector_index inventory "$FIREFOX_ROOT/$profile_name/extensions.json" "firefox/$profile_name/extensions-inventory.json" success firefox
+  fi
+
+  printf 'label\textension_id\tmode\tsource_profile\tsource_uuid\n' >"$COLLECTOR_STAGE_DIR/extensions.tsv"
+  for index in "${!EXTENSION_LABELS[@]}"; do
+    label="${EXTENSION_LABELS[$index]}"; extension_id="${EXTENSION_IDS[$index]}"; mode="${EXTENSION_MODES[$index]}"
+    if ! uuid="$(python3 "$BROWSER_HELPER" firefox-uuid "$profile/prefs.js" "$extension_id" 2>/dev/null)"; then
+      if [[ "$mode" == required ]]; then collector_fail "Required Firefox extension is not installed: $extension_id"; fi
+      collector_warn "Optional Firefox extension is not installed: $extension_id"
+      continue
+    fi
+    origin="$profile/storage/default/moz-extension+++$uuid"
+    if [[ ! -d "$origin" ]]; then
+      if [[ "$mode" == required ]]; then collector_fail "Required Firefox extension storage is missing: $extension_id"; fi
+      collector_warn "Optional Firefox extension storage is missing: $extension_id"
+      continue
+    fi
+    target="$COLLECTOR_STAGE_DIR/firefox/extensions/$label/storage"
+    copy_tree_stable "$origin" "$target"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$extension_id" "$mode" "$profile_name" "$uuid" >>"$COLLECTOR_STAGE_DIR/extensions.tsv"
+    collector_index extension "$extension_id" "firefox/extensions/$label/storage" success "$label;$mode"
+  done
+}
+
+backup_chromium() {
+  local root="$COLLECTOR_SOURCE_HOME/$CHROMIUM_ROOT"
+  local profile profile_name target
+  [[ -n "$CHROMIUM_ROOT" ]] || return 0
+  [[ -d "$root" ]] || { collector_warn "Chromium root does not exist: $CHROMIUM_ROOT"; return 0; }
+  while IFS= read -r -d '' profile; do
+    profile_name="$(basename -- "$profile")"
+    printf 'chromium\t%s\t%s\n' "$profile_name" "$CHROMIUM_ROOT" >>"$COLLECTOR_STAGE_DIR/profiles.tsv"
+    if [[ -f "$profile/Bookmarks" ]]; then
+      target="$COLLECTOR_STAGE_DIR/chromium/$profile_name/Bookmarks"
+      collector_copy_stable_file "$profile/Bookmarks" "$target" \
+        || collector_fail "Chromium bookmarks changed repeatedly: $profile_name"
+      collector_index bookmarks "$CHROMIUM_ROOT/$profile_name/Bookmarks" "chromium/$profile_name/Bookmarks" success chromium
+    fi
+    if [[ -d "$profile/Sessions" ]]; then
+      copy_tree_stable "$profile/Sessions" "$COLLECTOR_STAGE_DIR/chromium/$profile_name/Sessions"
+      collector_index sessions "$CHROMIUM_ROOT/$profile_name/Sessions" "chromium/$profile_name/Sessions" success chromium
+    fi
+    if [[ -f "$profile/Preferences" ]]; then
+      mkdir -p -- "$COLLECTOR_STAGE_DIR/chromium/$profile_name"
+      if python3 "$BROWSER_HELPER" chromium-inventory "$profile/Preferences" \
+        "$COLLECTOR_STAGE_DIR/chromium/$profile_name/extensions-inventory.json"; then
+        collector_index inventory "$CHROMIUM_ROOT/$profile_name/Preferences" "chromium/$profile_name/extensions-inventory.json" success chromium
+      else
+        collector_warn "Could not export sanitized Chromium extension inventory: $profile_name"
+      fi
+    fi
+  done < <(find -L "$root" -mindepth 1 -maxdepth 1 -type d \( -name Default -o -name 'Profile *' \) -print0)
+}
+
+main() {
+  local command
+  for command in cp find mkdir python3 sha256sum sort stat xargs; do collector_require_command "$command"; done
+  collector_init
+  load_config
+  printf 'browser\tprofile\tconfigured_root\n' >"$COLLECTOR_STAGE_DIR/profiles.tsv"
+  [[ -z "$FIREFOX_ROOT" ]] || backup_firefox
+  backup_chromium
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# Browser recovery
+
+This artifact intentionally excludes browser history, cookies, saved passwords, and
+complete raw profiles. It contains bookmark backups, open-session state, a sanitized
+extension inventory, and explicitly allowlisted Firefox extension storage. Close all
+browsers before recovery. Install extensions from their official stores first so the
+handler can map stable extension IDs to the new profile UUIDs.
+EOF
+  collector_finalize
+}
+
+main "$@"
