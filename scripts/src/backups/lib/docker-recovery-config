@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2034 # Values are consumed by the scripts that source this file.
+
+docker_recovery_config_error() {
+  printf 'Error: %s\n' "$*" >&2
+  return 1
+}
+
+validate_docker_recovery_relative_path() {
+  local key="$1"
+  local value="$2"
+  [[ -n "$value" && "$value" != /* ]] \
+    || docker_recovery_config_error "$key must be a non-empty home-relative path"
+  [[ ! "$value" =~ (^|/)\.\.?(/|$) ]] \
+    || docker_recovery_config_error "$key must not contain dot path segments"
+}
+
+load_docker_recovery_config() {
+  local config_file="$1"
+  local line
+  local key
+  local value
+  local extra
+  local variable
+  local -A seen=()
+  local -a required=(
+    TASKSORTER_SOURCE_RELATIVE
+    TASKSORTER_POSTGRES_CONTAINER
+    TASKSORTER_POSTGRES_VOLUME
+    TASKSORTER_KEYS_VOLUME
+    TASKSORTER_POSTGRES_IMAGE
+    MSSQL_CONTAINER
+    MSSQL_DATA_RELATIVE
+    MSSQL_LOG_RELATIVE
+    JOPLIN_SERVICE_RELATIVE
+    JOPLIN_DATA_RELATIVE
+    JOPLIN_COMPOSE_PROJECT
+    JOPLIN_POSTGRES_IMAGE
+    ADGUARD_SERVICE_RELATIVE
+    ADGUARD_CONF_RELATIVE
+    ADGUARD_WORK_RELATIVE
+    ADGUARD_COMPOSE_PROJECT
+    ADGUARD_COMPOSE_SERVICE
+    ARCHIVE_HELPER_IMAGE
+  )
+
+  [[ -f "$config_file" ]] \
+    || docker_recovery_config_error "Docker recovery config not found: $config_file" \
+    || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='=' read -r key value extra <<<"$line"
+    [[ -n "$key" && -n "$value" && -z "${extra:-}" ]] \
+      || docker_recovery_config_error "Invalid Docker recovery config entry: $line" \
+      || return 1
+    [[ "$key" =~ ^[a-z][a-z0-9_]*$ ]] \
+      || docker_recovery_config_error "Invalid Docker recovery config key: $key" \
+      || return 1
+    [[ -z "${seen[$key]:-}" ]] \
+      || docker_recovery_config_error "Duplicate Docker recovery config key: $key" \
+      || return 1
+    seen[$key]=1
+    case "$key" in
+      tasksorter_source_relative) TASKSORTER_SOURCE_RELATIVE="$value" ;;
+      tasksorter_postgres_container) TASKSORTER_POSTGRES_CONTAINER="$value" ;;
+      tasksorter_postgres_volume) TASKSORTER_POSTGRES_VOLUME="$value" ;;
+      tasksorter_keys_volume) TASKSORTER_KEYS_VOLUME="$value" ;;
+      tasksorter_postgres_image) TASKSORTER_POSTGRES_IMAGE="$value" ;;
+      mssql_container) MSSQL_CONTAINER="$value" ;;
+      mssql_data_relative) MSSQL_DATA_RELATIVE="$value" ;;
+      mssql_log_relative) MSSQL_LOG_RELATIVE="$value" ;;
+      joplin_service_relative) JOPLIN_SERVICE_RELATIVE="$value" ;;
+      joplin_data_relative) JOPLIN_DATA_RELATIVE="$value" ;;
+      joplin_compose_project) JOPLIN_COMPOSE_PROJECT="$value" ;;
+      joplin_postgres_image) JOPLIN_POSTGRES_IMAGE="$value" ;;
+      adguard_service_relative) ADGUARD_SERVICE_RELATIVE="$value" ;;
+      adguard_conf_relative) ADGUARD_CONF_RELATIVE="$value" ;;
+      adguard_work_relative) ADGUARD_WORK_RELATIVE="$value" ;;
+      adguard_compose_project) ADGUARD_COMPOSE_PROJECT="$value" ;;
+      adguard_compose_service) ADGUARD_COMPOSE_SERVICE="$value" ;;
+      archive_helper_image) ARCHIVE_HELPER_IMAGE="$value" ;;
+      unsupported_containers) UNSUPPORTED_CONTAINERS="$value" ;;
+      *) docker_recovery_config_error "Unknown Docker recovery config key: $key" || return 1 ;;
+    esac
+  done <"$config_file"
+
+  for variable in "${required[@]}"; do
+    [[ -n "${!variable:-}" ]] \
+      || docker_recovery_config_error "Missing Docker recovery config value: ${variable,,}" \
+      || return 1
+  done
+
+  validate_docker_recovery_relative_path tasksorter_source_relative "$TASKSORTER_SOURCE_RELATIVE" || return 1
+  validate_docker_recovery_relative_path mssql_data_relative "$MSSQL_DATA_RELATIVE" || return 1
+  validate_docker_recovery_relative_path mssql_log_relative "$MSSQL_LOG_RELATIVE" || return 1
+  validate_docker_recovery_relative_path joplin_service_relative "$JOPLIN_SERVICE_RELATIVE" || return 1
+  validate_docker_recovery_relative_path joplin_data_relative "$JOPLIN_DATA_RELATIVE" || return 1
+  validate_docker_recovery_relative_path adguard_service_relative "$ADGUARD_SERVICE_RELATIVE" || return 1
+  validate_docker_recovery_relative_path adguard_conf_relative "$ADGUARD_CONF_RELATIVE" || return 1
+  validate_docker_recovery_relative_path adguard_work_relative "$ADGUARD_WORK_RELATIVE" || return 1
+}

@@ -1,3 +1,5 @@
-# mode|required name|collector command
+# mode|unique-name|collector-command
+# All collectors are disabled in this sample until the operator reviews them.
 # required|system-inventory|builtin:system-inventory
+# required|docker-recovery|/absolute/path/to/collectors/docker-recovery
 # optional|repository-export|/absolute/path/to/repository-export-wrapper

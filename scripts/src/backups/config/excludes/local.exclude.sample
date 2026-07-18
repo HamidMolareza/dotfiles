@@ -1,2 +1,16 @@
-# Machine-specific absolute paths or patterns.
-/home/home/Desktop/temp
+# Machine-specific absolute paths or patterns. Replace alice before enabling entries.
+# /home/alice/Desktop/temp
+# /home/alice/virtual-box
+# /home/alice/Programs
+
+# Rebuildable user caches and extensions.
+# /home/alice/.nuget/packages
+# /home/alice/.vscode/extensions
+# /home/alice/.gradle/caches
+# /home/alice/.npm/_cacache
+# /home/alice/.local/share/Trash
+
+# Exclude live database storage only when a required application-aware collector
+# creates a verified logical or native backup for it.
+# /home/alice/.dotfiles/docker-services/joplin/data/joplin-db
+# /home/alice/.dotfiles/docker-services/data/mssql/data

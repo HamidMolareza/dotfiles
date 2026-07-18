@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/docker-recovery-config
+source "$PROJECT_DIR/lib/docker-recovery-config"
+
+STAGE_DIR="${BACKUP_HOME_STAGE_DIR:-}"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+WARNINGS_FILE=""
+MSSQL_CONTAINER_TEMP_DIR=""
+MSSQL_CONTAINER_SCRIPT=""
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'Warning: %s\n' "$*" >&2
+  printf '%s\n' "$*" >>"$WARNINGS_FILE"
+}
+
+cleanup() {
+  if [[ -n "$MSSQL_CONTAINER_TEMP_DIR" ]] && container_running "$MSSQL_CONTAINER"; then
+    docker exec --user 0:0 "$MSSQL_CONTAINER" rm -rf -- "$MSSQL_CONTAINER_TEMP_DIR" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$MSSQL_CONTAINER_SCRIPT" ]] && container_running "$MSSQL_CONTAINER"; then
+    docker exec --user 0:0 "$MSSQL_CONTAINER" rm -f -- "$MSSQL_CONTAINER_SCRIPT" >/dev/null 2>&1 || true
+  fi
+}
+
+handle_signal() {
+  exit 130
+}
+
+trap cleanup EXIT
+trap handle_signal INT TERM
+
+container_exists() {
+  docker container inspect "$1" >/dev/null 2>&1
+}
+
+container_running() {
+  [[ "$(docker container inspect --format '{{.State.Running}}' "$1" 2>/dev/null || true)" == "true" ]]
+}
+
+volume_exists() {
+  docker volume inspect "$1" >/dev/null 2>&1
+}
+
+require_image() {
+  docker image inspect "$1" >/dev/null 2>&1 \
+    || fail "Required local Docker image is unavailable: $1"
+}
+
+container_image_or_default() {
+  local container="$1"
+  local fallback="$2"
+  local candidate=""
+
+  if container_exists "$container"; then
+    candidate="$(docker container inspect --format '{{.Config.Image}}' "$container")"
+  fi
+  if [[ -n "$candidate" ]] && docker image inspect "$candidate" >/dev/null 2>&1; then
+    printf '%s\n' "$candidate"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+find_running_compose_container() {
+  local project="$1"
+  local service="$2"
+  docker ps \
+    --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.service=$service" \
+    --format '{{.Names}}' \
+    | head -n 1
+}
+
+find_running_container_for_mount() {
+  docker ps --filter "volume=$1" --format '{{.Names}}' | head -n 1
+}
+
+archive_bind_directory() {
+  local source_dir="$1"
+  local image="$2"
+  local output_file="$3"
+
+  [[ -d "$source_dir" ]] || fail "Docker bind source does not exist: $source_dir"
+  require_image "$image"
+  docker run --rm --network none --user 0:0 --entrypoint tar \
+    --mount "type=bind,source=$source_dir,target=/source,readonly" \
+    "$image" -C /source -cf - . >"$output_file"
+  [[ -s "$output_file" ]] || fail "Docker bind archive is empty: $source_dir"
+}
+
+archive_volume() {
+  local volume="$1"
+  local image="$2"
+  local output_file="$3"
+
+  volume_exists "$volume" || fail "Docker volume does not exist: $volume"
+  require_image "$image"
+  docker run --rm --network none --user 0:0 --entrypoint tar \
+    --mount "type=volume,source=$volume,target=/source,readonly" \
+    "$image" -C /source -cf - . >"$output_file"
+  [[ -s "$output_file" ]] || fail "Docker volume archive is empty: $volume"
+}
+
+dump_postgres_cluster() {
+  local container="$1"
+  local output_file="$2"
+
+  container_running "$container" || fail "PostgreSQL container is not running: $container"
+  docker exec "$container" sh -ceu '
+    : "${POSTGRES_USER:?POSTGRES_USER is required}"
+    export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+    exec pg_dumpall --clean --if-exists --username="$POSTGRES_USER"
+  ' >"$output_file"
+  [[ -s "$output_file" ]] || fail "PostgreSQL dump is empty: $container"
+}
+
+backup_tasksorter() {
+  local output_dir="$STAGE_DIR/tasksorter"
+  local image
+  local running_container=""
+
+  mkdir -p -- "$output_dir"
+  running_container="$(find_running_container_for_mount "$TASKSORTER_POSTGRES_VOLUME" || true)"
+  if [[ -z "$running_container" ]] && container_running "$TASKSORTER_POSTGRES_CONTAINER"; then
+    running_container="$TASKSORTER_POSTGRES_CONTAINER"
+  fi
+  if [[ -n "$running_container" ]]; then
+    TASKSORTER_POSTGRES_CONTAINER="$running_container"
+    dump_postgres_cluster "$TASKSORTER_POSTGRES_CONTAINER" "$output_dir/postgres-cluster.sql"
+    printf 'logical-dump\n' >"$output_dir/postgres-backup-mode.txt"
+  elif volume_exists "$TASKSORTER_POSTGRES_VOLUME"; then
+    image="$(container_image_or_default "$TASKSORTER_POSTGRES_CONTAINER" "$TASKSORTER_POSTGRES_IMAGE")"
+    archive_volume "$TASKSORTER_POSTGRES_VOLUME" "$image" "$output_dir/postgres-volume.tar"
+    printf 'offline-physical-volume\n' >"$output_dir/postgres-backup-mode.txt"
+  else
+    fail "TaskSorter PostgreSQL has neither a running container nor a data volume"
+  fi
+
+  if volume_exists "$TASKSORTER_KEYS_VOLUME"; then
+    archive_volume "$TASKSORTER_KEYS_VOLUME" "$ARCHIVE_HELPER_IMAGE" \
+      "$output_dir/data-protection-keys.tar"
+  else
+    warn "TaskSorter data-protection key volume was not found: $TASKSORTER_KEYS_VOLUME"
+  fi
+
+  cat >"$output_dir/RESTORE.md" <<'EOF'
+# TaskSorter recovery
+
+The preferred artifact is `postgres-cluster.sql`, created online with `pg_dumpall`.
+Restore it into a compatible PostgreSQL container with `psql` after reviewing the
+roles and database statements. If only `postgres-volume.tar` exists, stop every
+container using the volume and restore it only with the same PostgreSQL major version.
+
+Restore `data-protection-keys.tar` into the configured Data Protection key volume
+before starting the backend. The application source and Compose file are backed up
+separately through the active home profile.
+EOF
+}
+
+run_mssql_sqlcmd() {
+  local container="$1"
+  shift
+  docker exec "$container" sh -ceu '
+    tool=""
+    for candidate in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
+      if [ -x "$candidate" ]; then tool="$candidate"; break; fi
+    done
+    [ -n "$tool" ] || { printf "sqlcmd not found\n" >&2; exit 127; }
+    password="${MSSQL_SA_PASSWORD:-${SA_PASSWORD:-}}"
+    [ -n "$password" ] || { printf "SQL Server administrator password is unavailable\n" >&2; exit 1; }
+    exec "$tool" -S localhost -U sa -P "$password" -C -b "$@"
+  ' sh "$@"
+}
+
+backup_mssql_online() {
+  local output_dir="$1"
+  local host_script="$output_dir/.backup.sql"
+  local database_list_query
+
+  MSSQL_CONTAINER_TEMP_DIR="/var/opt/mssql/backup-home-$RUN_ID"
+  MSSQL_CONTAINER_SCRIPT="/tmp/backup-home-$RUN_ID.sql"
+  docker exec "$MSSQL_CONTAINER" mkdir -p -- "$MSSQL_CONTAINER_TEMP_DIR"
+
+  cat >"$host_script" <<SQL
+SET NOCOUNT ON;
+DECLARE @root nvarchar(260) = N'$MSSQL_CONTAINER_TEMP_DIR';
+DECLARE @database_id int;
+DECLARE @name sysname;
+DECLARE @path nvarchar(4000);
+DECLARE @command nvarchar(max);
+DECLARE databases CURSOR LOCAL FAST_FORWARD FOR
+    SELECT database_id, name
+    FROM sys.databases
+    WHERE state = 0 AND name <> N'tempdb'
+    ORDER BY database_id;
+
+OPEN databases;
+FETCH NEXT FROM databases INTO @database_id, @name;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @path = @root + N'/db-' + CONVERT(nvarchar(11), @database_id) + N'.bak';
+    SET @command = N'BACKUP DATABASE ' + QUOTENAME(@name)
+        + N' TO DISK = N''' + REPLACE(@path, N'''', N'''''')
+        + N''' WITH COPY_ONLY, INIT, CHECKSUM';
+    EXEC sys.sp_executesql @command;
+    SET @command = N'RESTORE VERIFYONLY FROM DISK = N'''
+        + REPLACE(@path, N'''', N'''''') + N''' WITH CHECKSUM';
+    EXEC sys.sp_executesql @command;
+    FETCH NEXT FROM databases INTO @database_id, @name;
+END;
+CLOSE databases;
+DEALLOCATE databases;
+SQL
+
+  docker cp "$host_script" "$MSSQL_CONTAINER:$MSSQL_CONTAINER_SCRIPT" >/dev/null
+  run_mssql_sqlcmd "$MSSQL_CONTAINER" -i "$MSSQL_CONTAINER_SCRIPT" >/dev/null
+  docker cp "$MSSQL_CONTAINER:$MSSQL_CONTAINER_TEMP_DIR/." "$output_dir/" >/dev/null
+
+  database_list_query="SET NOCOUNT ON; SELECT CONVERT(varchar(11), database_id) + '|' + name FROM sys.databases WHERE state = 0 AND name <> N'tempdb' ORDER BY database_id;"
+  run_mssql_sqlcmd "$MSSQL_CONTAINER" -h -1 -W -Q "$database_list_query" \
+    >"$output_dir/databases.txt"
+  rm -f -- "$host_script"
+  find "$output_dir" -maxdepth 1 -type f -name 'db-*.bak' -print -quit | grep -q . \
+    || fail "SQL Server produced no native backup files"
+
+  docker exec --user 0:0 "$MSSQL_CONTAINER" \
+    rm -rf -- "$MSSQL_CONTAINER_TEMP_DIR" "$MSSQL_CONTAINER_SCRIPT"
+  MSSQL_CONTAINER_TEMP_DIR=""
+  MSSQL_CONTAINER_SCRIPT=""
+}
+
+backup_mssql() {
+  local output_dir="$STAGE_DIR/mssql"
+  local running_container=""
+
+  mkdir -p -- "$output_dir"
+  running_container="$(find_running_container_for_mount "$MSSQL_DATA_DIR" || true)"
+  if [[ -z "$running_container" ]] && container_running "$MSSQL_CONTAINER"; then
+    running_container="$MSSQL_CONTAINER"
+  fi
+  if [[ -n "$running_container" ]]; then
+    MSSQL_CONTAINER="$running_container"
+    backup_mssql_online "$output_dir"
+    printf 'online-native-backups\n' >"$output_dir/backup-mode.txt"
+  elif [[ -d "$MSSQL_DATA_DIR" ]]; then
+    archive_bind_directory "$MSSQL_DATA_DIR" "$ARCHIVE_HELPER_IMAGE" "$output_dir/data.tar"
+    printf 'offline-physical-files\n' >"$output_dir/backup-mode.txt"
+  else
+    warn "SQL Server data directory was not found: $MSSQL_DATA_DIR"
+  fi
+
+  if [[ -d "$MSSQL_LOG_DIR" ]]; then
+    archive_bind_directory "$MSSQL_LOG_DIR" "$ARCHIVE_HELPER_IMAGE" "$output_dir/log.tar"
+  fi
+
+  cat >"$output_dir/RESTORE.md" <<'EOF'
+# SQL Server recovery
+
+When `backup-mode.txt` says `online-native-backups`, `db-*.bak` files were created
+with `BACKUP DATABASE ... WITH COPY_ONLY, CHECKSUM` and passed `RESTORE VERIFYONLY`.
+Use `databases.txt` to map database IDs to names, copy the selected file into a
+compatible SQL Server container, inspect logical file names, and run an explicit
+`RESTORE DATABASE` command.
+
+When the mode is `offline-physical-files`, the SQL Server container was stopped and
+the bind-mounted data directory was archived. Restore physical files only while the
+container is stopped and only into a compatible SQL Server version.
+EOF
+}
+
+backup_joplin() {
+  local output_dir="$STAGE_DIR/joplin"
+  local container=""
+
+  [[ -d "$JOPLIN_DB_DIR" ]] || {
+    warn "Joplin database directory was not found: $JOPLIN_DB_DIR"
+    return 0
+  }
+
+  mkdir -p -- "$output_dir"
+  container="$(find_running_container_for_mount "$JOPLIN_DB_DIR" || true)"
+  [[ -n "$container" ]] \
+    || container="$(find_running_compose_container "$JOPLIN_COMPOSE_PROJECT" db || true)"
+  if [[ -n "$container" ]]; then
+    dump_postgres_cluster "$container" "$output_dir/postgres-cluster.sql"
+    printf 'online-logical-dump\n' >"$output_dir/backup-mode.txt"
+  else
+    archive_bind_directory "$JOPLIN_DB_DIR" "$JOPLIN_POSTGRES_IMAGE" \
+      "$output_dir/postgres-data.tar"
+    printf 'offline-physical-files\n' >"$output_dir/backup-mode.txt"
+  fi
+
+  cat >"$output_dir/RESTORE.md" <<'EOF'
+# Joplin server recovery
+
+Use `postgres-cluster.sql` for a logical restore when it is present. A
+`postgres-data.tar` artifact is created only when the local Joplin database container
+is stopped; restore it only with PostgreSQL 15 while every Joplin container is down.
+
+The active home profile may also include independent Joplin Desktop JEX exports and
+an existing server dump directory.
+EOF
+}
+
+backup_adguard() {
+  local output_dir="$STAGE_DIR/adguard"
+  local running=""
+
+  [[ -d "$ADGUARD_CONF_DIR" || -d "$ADGUARD_WORK_DATA_DIR" ]] || return 0
+  mkdir -p -- "$output_dir"
+  running="$(find_running_container_for_mount "$ADGUARD_WORK_DIR" || true)"
+  [[ -n "$running" ]] \
+    || running="$(find_running_compose_container "$ADGUARD_COMPOSE_PROJECT" "$ADGUARD_COMPOSE_SERVICE" || true)"
+
+  if [[ -d "$ADGUARD_CONF_DIR" ]]; then
+    archive_bind_directory "$ADGUARD_CONF_DIR" "$ARCHIVE_HELPER_IMAGE" \
+      "$output_dir/config.tar"
+  fi
+  if [[ -d "$ADGUARD_WORK_DATA_DIR" ]]; then
+    archive_bind_directory "$ADGUARD_WORK_DATA_DIR" "$ARCHIVE_HELPER_IMAGE" \
+      "$output_dir/work-data.tar"
+  fi
+  if [[ -n "$running" ]]; then
+    warn "AdGuard bind-mounted state was archived while its container was running"
+  fi
+
+  cat >"$output_dir/RESTORE.md" <<'EOF'
+# AdGuard recovery
+
+Stop AdGuard before restoring either archive. Extract `config.tar` into the
+bind-mounted `confdir` and `work-data.tar` into `workdir/data`, preserving the
+stored ownership and modes, then start the container and validate DNS and the UI.
+EOF
+}
+
+write_docker_inventory() {
+  docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' \
+    >"$STAGE_DIR/containers.tsv"
+  docker volume ls --format '{{.Driver}}\t{{.Name}}' \
+    >"$STAGE_DIR/volumes.tsv"
+}
+
+reject_unsupported_running_services() {
+  local container
+  local -a unsupported=()
+
+  IFS=',' read -r -a unsupported <<<"${UNSUPPORTED_CONTAINERS:-}"
+
+  for container in "${unsupported[@]}"; do
+    if container_running "$container"; then
+      fail "Running stateful container has no application-aware backup handler: $container"
+    fi
+  done
+}
+
+write_checksums() {
+  (
+    cd -- "$STAGE_DIR"
+    find . -type f ! -name checksums.sha256 -print0 \
+      | sort -z \
+      | xargs -0 -r sha256sum
+  ) >"$STAGE_DIR/checksums.sha256"
+}
+
+main() {
+  local command
+  local config_file="${BACKUP_HOME_DOCKER_RECOVERY_CONFIG:-$PROJECT_DIR/config/docker-recovery/local.conf}"
+
+  load_docker_recovery_config "$config_file" || exit 1
+  MSSQL_DATA_DIR="${HOME:?HOME is required}/$MSSQL_DATA_RELATIVE"
+  MSSQL_LOG_DIR="$HOME/$MSSQL_LOG_RELATIVE"
+  JOPLIN_DB_DIR="$HOME/$JOPLIN_SERVICE_RELATIVE/$JOPLIN_DATA_RELATIVE"
+  ADGUARD_CONF_DIR="$HOME/$ADGUARD_SERVICE_RELATIVE/$ADGUARD_CONF_RELATIVE"
+  ADGUARD_WORK_DIR="$HOME/$ADGUARD_SERVICE_RELATIVE/$ADGUARD_WORK_RELATIVE"
+  ADGUARD_WORK_DATA_DIR="$ADGUARD_WORK_DIR/data"
+  [[ -n "$STAGE_DIR" && "$STAGE_DIR" == /* ]] \
+    || fail "BACKUP_HOME_STAGE_DIR must be an absolute path"
+  for command in docker date find grep head mkdir rm sha256sum sort xargs; do
+    command -v "$command" >/dev/null 2>&1 || fail "Required command is unavailable: $command"
+  done
+  docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
+
+  mkdir -p -- "$STAGE_DIR"
+  WARNINGS_FILE="$STAGE_DIR/warnings.txt"
+  reject_unsupported_running_services
+  backup_tasksorter
+  backup_mssql
+  backup_joplin
+  backup_adguard
+  write_docker_inventory
+  [[ -s "$WARNINGS_FILE" ]] || rm -f -- "$WARNINGS_FILE"
+  write_checksums
+}
+
+main "$@"

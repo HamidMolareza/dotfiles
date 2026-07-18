@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/docker-recovery-config
+source "$PROJECT_DIR/lib/docker-recovery-config"
+
+ACTION="${1:-}"
+COMPONENT="${2:-}"
+SNAPSHOT_DIR="${BACKUP_HOME_SNAPSHOT_DIR:-}"
+ARTIFACT_DIR="${BACKUP_HOME_ARTIFACT_DIR:-}"
+STAGING_DIR="${BACKUP_HOME_RESTORE_STAGING_DIR:-}"
+SESSION_DIR="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+SOURCE_HOME="${BACKUP_HOME_SOURCE_HOME:-${HOME:?HOME is required}}"
+TARGET_HOME="${BACKUP_HOME_TARGET_HOME:-}"
+DRY_RUN="${BACKUP_HOME_RESTORE_DRY_RUN:-0}"
+DESTRUCTIVE_APPROVED="${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}"
+
+TASKSORTER_SOURCE=""
+TASKSORTER_TARGET=""
+JOPLIN_SOURCE=""
+JOPLIN_TARGET=""
+JOPLIN_DATA_DIR=""
+ADGUARD_SOURCE=""
+ADGUARD_TARGET=""
+ADGUARD_CONF_DIR=""
+ADGUARD_WORK_DATA_DIR=""
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_env() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || fail "$name is required"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Required command is unavailable: $1"
+}
+
+docker_ready() {
+  command -v docker >/dev/null 2>&1 \
+    && docker info >/dev/null 2>&1 \
+    && docker compose version >/dev/null 2>&1
+}
+
+image_exists() {
+  docker image inspect "$1" >/dev/null 2>&1
+}
+
+volume_exists() {
+  docker volume inspect "$1" >/dev/null 2>&1
+}
+
+container_exists() {
+  docker container inspect "$1" >/dev/null 2>&1
+}
+
+path_has_entries() {
+  local path="$1"
+  [[ -d "$path" ]] && find "$path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .
+}
+
+print_component() {
+  printf 'component\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5"
+}
+
+describe_components() {
+  if [[ -d "$ARTIFACT_DIR/tasksorter" ]]; then
+    print_component docker.tasksorter "TaskSorter application and PostgreSQL state" automatic privileged recommended
+    printf 'path\tdocker.tasksorter\t%s\n' "$TASKSORTER_SOURCE"
+  fi
+  if [[ -d "$ARTIFACT_DIR/joplin" ]]; then
+    print_component docker.joplin-server "Joplin Server PostgreSQL state" automatic privileged optional
+    printf 'path\tdocker.joplin-server\t%s\n' "$JOPLIN_SOURCE"
+  fi
+  if [[ -d "$ARTIFACT_DIR/adguard" ]]; then
+    print_component docker.adguard "AdGuard configuration and runtime state" automatic privileged optional
+    printf 'path\tdocker.adguard\t%s\n' "$ADGUARD_SOURCE"
+  fi
+  if [[ -d "$ARTIFACT_DIR/mssql" ]]; then
+    print_component docker.mssql "SQL Server native backup preparation" guided privileged optional
+  fi
+}
+
+preflight_common() {
+  if docker_ready; then
+    printf 'ok\tDocker daemon and Compose are available\n'
+  else
+    printf 'blocker\tDocker daemon or Docker Compose is unavailable\n'
+  fi
+}
+
+preflight_tasksorter() {
+  preflight_common
+  [[ -f "$SNAPSHOT_DIR$TASKSORTER_SOURCE/docker-compose.yml" ]] \
+    && printf 'ok\tTaskSorter Compose definition is present in the snapshot\n' \
+    || printf 'blocker\tTaskSorter docker-compose.yml is missing from the snapshot\n'
+  if [[ -s "$ARTIFACT_DIR/tasksorter/postgres-cluster.sql" || -s "$ARTIFACT_DIR/tasksorter/postgres-volume.tar" ]]; then
+    printf 'ok\tTaskSorter PostgreSQL recovery artifact is present\n'
+  else
+    printf 'blocker\tTaskSorter PostgreSQL recovery artifact is missing\n'
+  fi
+  [[ -s "$ARTIFACT_DIR/tasksorter/data-protection-keys.tar" ]] \
+    || printf 'warning\tTaskSorter Data Protection keys are missing\n'
+  if volume_exists "$TASKSORTER_POSTGRES_VOLUME" || volume_exists "$TASKSORTER_KEYS_VOLUME" \
+    || container_exists "$TASKSORTER_POSTGRES_CONTAINER"; then
+    printf 'risk\tdestructive\n'
+    printf 'warning\tExisting TaskSorter containers or volumes require a safety archive before replacement\n'
+  fi
+  image_exists "$ARCHIVE_HELPER_IMAGE" \
+    || printf 'blocker\tRequired local helper image is unavailable: %s\n' "$ARCHIVE_HELPER_IMAGE"
+  if [[ -s "$ARTIFACT_DIR/tasksorter/postgres-volume.tar" ]]; then
+    image_exists "$TASKSORTER_POSTGRES_IMAGE" \
+      || printf 'blocker\tRequired PostgreSQL image is unavailable: %s\n' "$TASKSORTER_POSTGRES_IMAGE"
+  fi
+}
+
+preflight_joplin() {
+  preflight_common
+  [[ -f "$SNAPSHOT_DIR$JOPLIN_SOURCE/docker-compose.yml" ]] \
+    && printf 'ok\tJoplin Compose definition is present in the snapshot\n' \
+    || printf 'blocker\tJoplin docker-compose.yml is missing from the snapshot\n'
+  if [[ -s "$ARTIFACT_DIR/joplin/postgres-cluster.sql" || -s "$ARTIFACT_DIR/joplin/postgres-data.tar" ]]; then
+    printf 'ok\tJoplin PostgreSQL recovery artifact is present\n'
+  else
+    printf 'blocker\tJoplin PostgreSQL recovery artifact is missing\n'
+  fi
+  if path_has_entries "$JOPLIN_DATA_DIR"; then
+    printf 'risk\tdestructive\n'
+    printf 'warning\tExisting Joplin database files require a safety archive before replacement\n'
+  fi
+  image_exists "$JOPLIN_POSTGRES_IMAGE" \
+    || printf 'blocker\tRequired PostgreSQL image is unavailable: %s\n' "$JOPLIN_POSTGRES_IMAGE"
+}
+
+preflight_adguard() {
+  preflight_common
+  [[ -f "$SNAPSHOT_DIR$ADGUARD_SOURCE/docker-compose.yml" ]] \
+    && printf 'ok\tAdGuard Compose definition is present in the snapshot\n' \
+    || printf 'blocker\tAdGuard docker-compose.yml is missing from the snapshot\n'
+  if [[ -s "$ARTIFACT_DIR/adguard/config.tar" || -s "$ARTIFACT_DIR/adguard/work-data.tar" ]]; then
+    printf 'ok\tAdGuard recovery artifact is present\n'
+  else
+    printf 'blocker\tAdGuard recovery artifacts are missing\n'
+  fi
+  if path_has_entries "$ADGUARD_CONF_DIR" || path_has_entries "$ADGUARD_WORK_DATA_DIR"; then
+    printf 'risk\tdestructive\n'
+    printf 'warning\tExisting AdGuard state requires a safety archive before replacement\n'
+  fi
+  image_exists "$ARCHIVE_HELPER_IMAGE" \
+    || printf 'blocker\tRequired local helper image is unavailable: %s\n' "$ARCHIVE_HELPER_IMAGE"
+}
+
+preflight_mssql() {
+  [[ -s "$ARTIFACT_DIR/mssql/databases.txt" ]] \
+    && printf 'ok\tSQL Server database mapping is present\n' \
+    || printf 'warning\tSQL Server database mapping is unavailable; inspect artifacts manually\n'
+  find "$ARTIFACT_DIR/mssql" -maxdepth 1 -type f -name 'db-*.bak' -print -quit | grep -q . \
+    && printf 'ok\tSQL Server native backup files are present\n' \
+    || printf 'blocker\tSQL Server native backup files are missing\n'
+}
+
+preflight_component() {
+  case "$COMPONENT" in
+    docker.tasksorter) preflight_tasksorter ;;
+    docker.joplin-server) preflight_joplin ;;
+    docker.adguard) preflight_adguard ;;
+    docker.mssql) preflight_mssql ;;
+    *) fail "Unknown Docker recovery component: $COMPONENT" ;;
+  esac
+}
+
+archive_volume() {
+  local volume="$1"
+  local output="$2"
+  docker run --rm --network none --user 0:0 --entrypoint tar \
+    --mount "type=volume,source=$volume,target=/source,readonly" \
+    "$ARCHIVE_HELPER_IMAGE" -C /source -cf - . >"$output"
+  [[ -s "$output" ]] || fail "Safety archive is empty for volume: $volume"
+}
+
+archive_bind() {
+  local source="$1"
+  local output="$2"
+  docker run --rm --network none --user 0:0 --entrypoint tar \
+    --mount "type=bind,source=$source,target=/source,readonly" \
+    "$ARCHIVE_HELPER_IMAGE" -C /source -cf - . >"$output"
+  [[ -s "$output" ]] || fail "Safety archive is empty for directory: $source"
+}
+
+clear_volume() {
+  local volume="$1"
+  docker run --rm --network none --user 0:0 \
+    --mount "type=volume,source=$volume,target=/target" \
+    --entrypoint sh "$ARCHIVE_HELPER_IMAGE" -ceu \
+    'find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'
+}
+
+clear_bind() {
+  local source="$1"
+  mkdir -p -- "$source"
+  docker run --rm --network none --user 0:0 \
+    --mount "type=bind,source=$source,target=/target" \
+    --entrypoint sh "$ARCHIVE_HELPER_IMAGE" -ceu \
+    'find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'
+}
+
+extract_to_volume() {
+  local archive="$1"
+  local volume="$2"
+  docker run --rm --network none --user 0:0 -i \
+    --mount "type=volume,source=$volume,target=/target" \
+    --entrypoint tar "$ARCHIVE_HELPER_IMAGE" -C /target -xf - <"$archive"
+}
+
+extract_to_bind() {
+  local archive="$1"
+  local target="$2"
+  mkdir -p -- "$target"
+  docker run --rm --network none --user 0:0 -i \
+    --mount "type=bind,source=$target,target=/target" \
+    --entrypoint tar "$ARCHIVE_HELPER_IMAGE" -C /target -xf - <"$archive"
+}
+
+wait_compose_service() {
+  local compose_dir="$1"
+  local service="$2"
+  local container_id=""
+  local running
+  local health
+  local attempt
+  for ((attempt = 1; attempt <= 90; attempt++)); do
+    container_id="$(docker compose -f "$compose_dir/docker-compose.yml" --project-directory "$compose_dir" ps -q "$service" 2>/dev/null || true)"
+    if [[ -n "$container_id" ]]; then
+      running="$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)"
+      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+      if [[ "$running" == "true" && ( -z "$health" || "$health" == "healthy" ) ]]; then
+        printf '%s\n' "$container_id"
+        return 0
+      fi
+      [[ "$health" != "unhealthy" ]] || return 1
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+ensure_destructive_approval() {
+  local exists="$1"
+  [[ "$exists" -eq 0 || "$DESTRUCTIVE_APPROVED" -eq 1 ]] \
+    || fail "Existing state requires component-specific destructive approval"
+}
+
+apply_tasksorter() {
+  local existing=0
+  local safety_dir="$SESSION_DIR/safety/docker.tasksorter"
+  local postgres_container
+
+  [[ -f "$TASKSORTER_TARGET/docker-compose.yml" ]] || fail "Restored TaskSorter Compose file is missing"
+  if volume_exists "$TASKSORTER_POSTGRES_VOLUME" || volume_exists "$TASKSORTER_KEYS_VOLUME" \
+    || container_exists "$TASKSORTER_POSTGRES_CONTAINER"; then
+    existing=1
+  fi
+  ensure_destructive_approval "$existing"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'Would restore TaskSorter PostgreSQL, Data Protection keys, and Compose services.\n'
+    return 0
+  fi
+
+  mkdir -p -- "$safety_dir"
+  if [[ "$existing" -eq 1 ]]; then
+    docker compose -f "$TASKSORTER_TARGET/docker-compose.yml" --project-directory "$TASKSORTER_TARGET" down || true
+    if volume_exists "$TASKSORTER_POSTGRES_VOLUME"; then
+      archive_volume "$TASKSORTER_POSTGRES_VOLUME" "$safety_dir/postgres-volume.tar"
+      clear_volume "$TASKSORTER_POSTGRES_VOLUME"
+    fi
+    if volume_exists "$TASKSORTER_KEYS_VOLUME"; then
+      archive_volume "$TASKSORTER_KEYS_VOLUME" "$safety_dir/data-protection-keys.tar"
+      clear_volume "$TASKSORTER_KEYS_VOLUME"
+    fi
+  fi
+  docker volume create "$TASKSORTER_POSTGRES_VOLUME" >/dev/null
+  docker volume create "$TASKSORTER_KEYS_VOLUME" >/dev/null
+
+  if [[ -s "$ARTIFACT_DIR/tasksorter/postgres-volume.tar" ]]; then
+    extract_to_volume "$ARTIFACT_DIR/tasksorter/postgres-volume.tar" "$TASKSORTER_POSTGRES_VOLUME"
+  fi
+  if [[ -s "$ARTIFACT_DIR/tasksorter/data-protection-keys.tar" ]]; then
+    extract_to_volume "$ARTIFACT_DIR/tasksorter/data-protection-keys.tar" "$TASKSORTER_KEYS_VOLUME"
+  fi
+  docker compose -f "$TASKSORTER_TARGET/docker-compose.yml" --project-directory "$TASKSORTER_TARGET" up -d postgres
+  postgres_container="$(wait_compose_service "$TASKSORTER_TARGET" postgres)" \
+    || fail "TaskSorter PostgreSQL did not become ready"
+  if [[ -s "$ARTIFACT_DIR/tasksorter/postgres-cluster.sql" ]]; then
+    docker exec -i "$postgres_container" sh -ceu '
+      : "${POSTGRES_USER:?POSTGRES_USER is required}"
+      export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+      exec psql --username="$POSTGRES_USER" --dbname=postgres
+    ' <"$ARTIFACT_DIR/tasksorter/postgres-cluster.sql" \
+      >"$SESSION_DIR/logs/docker.tasksorter-postgres-import.log" 2>&1
+  fi
+  docker compose -f "$TASKSORTER_TARGET/docker-compose.yml" --project-directory "$TASKSORTER_TARGET" up -d backend frontend
+  wait_compose_service "$TASKSORTER_TARGET" backend >/dev/null \
+    || fail "TaskSorter backend did not become ready"
+  wait_compose_service "$TASKSORTER_TARGET" frontend >/dev/null \
+    || fail "TaskSorter frontend did not become ready"
+}
+
+verify_tasksorter() {
+  local postgres_container
+  postgres_container="$(wait_compose_service "$TASKSORTER_TARGET" postgres)" || return 1
+  wait_compose_service "$TASKSORTER_TARGET" backend >/dev/null || return 1
+  wait_compose_service "$TASKSORTER_TARGET" frontend >/dev/null || return 1
+  docker exec "$postgres_container" sh -ceu '
+    : "${POSTGRES_USER:?POSTGRES_USER is required}"
+    export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+    psql --username="$POSTGRES_USER" --dbname=postgres --tuples-only --no-align \
+      --command="SELECT count(*) FROM pg_database WHERE datistemplate = false" \
+      | grep -Eq "^[1-9][0-9]*$"
+  '
+}
+
+apply_joplin() {
+  local existing=0
+  local safety_dir="$SESSION_DIR/safety/docker.joplin-server"
+  local db_container
+  [[ -f "$JOPLIN_TARGET/docker-compose.yml" ]] || fail "Restored Joplin Compose file is missing"
+  path_has_entries "$JOPLIN_DATA_DIR" && existing=1
+  ensure_destructive_approval "$existing"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'Would restore Joplin PostgreSQL and start its Compose services.\n'
+    return 0
+  fi
+  mkdir -p -- "$safety_dir"
+  docker compose -f "$JOPLIN_TARGET/docker-compose.yml" --project-directory "$JOPLIN_TARGET" down || true
+  if [[ "$existing" -eq 1 ]]; then
+    archive_bind "$JOPLIN_DATA_DIR" "$safety_dir/postgres-data.tar"
+    clear_bind "$JOPLIN_DATA_DIR"
+  else
+    mkdir -p -- "$JOPLIN_DATA_DIR"
+  fi
+  if [[ -s "$ARTIFACT_DIR/joplin/postgres-data.tar" ]]; then
+    extract_to_bind "$ARTIFACT_DIR/joplin/postgres-data.tar" "$JOPLIN_DATA_DIR"
+  fi
+  docker compose -f "$JOPLIN_TARGET/docker-compose.yml" --project-directory "$JOPLIN_TARGET" up -d db
+  db_container="$(wait_compose_service "$JOPLIN_TARGET" db)" || fail "Joplin PostgreSQL did not become ready"
+  if [[ -s "$ARTIFACT_DIR/joplin/postgres-cluster.sql" ]]; then
+    docker exec -i "$db_container" sh -ceu '
+      : "${POSTGRES_USER:?POSTGRES_USER is required}"
+      export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+      exec psql --username="$POSTGRES_USER" --dbname=postgres
+    ' <"$ARTIFACT_DIR/joplin/postgres-cluster.sql" \
+      >"$SESSION_DIR/logs/docker.joplin-postgres-import.log" 2>&1
+  fi
+  docker compose -f "$JOPLIN_TARGET/docker-compose.yml" --project-directory "$JOPLIN_TARGET" up -d
+  wait_compose_service "$JOPLIN_TARGET" db >/dev/null || fail "Joplin database health check failed"
+}
+
+verify_joplin() {
+  wait_compose_service "$JOPLIN_TARGET" db >/dev/null
+}
+
+apply_adguard() {
+  local existing=0
+  local safety_dir="$SESSION_DIR/safety/docker.adguard"
+  local service
+  path_has_entries "$ADGUARD_CONF_DIR" && existing=1
+  path_has_entries "$ADGUARD_WORK_DATA_DIR" && existing=1
+  ensure_destructive_approval "$existing"
+  [[ -f "$ADGUARD_TARGET/docker-compose.yml" ]] || fail "Restored AdGuard Compose file is missing"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'Would restore AdGuard configuration and runtime data.\n'
+    return 0
+  fi
+  mkdir -p -- "$safety_dir"
+  docker compose -f "$ADGUARD_TARGET/docker-compose.yml" --project-directory "$ADGUARD_TARGET" down || true
+  if path_has_entries "$ADGUARD_CONF_DIR"; then
+    archive_bind "$ADGUARD_CONF_DIR" "$safety_dir/config.tar"
+    clear_bind "$ADGUARD_CONF_DIR"
+  fi
+  if path_has_entries "$ADGUARD_WORK_DATA_DIR"; then
+    archive_bind "$ADGUARD_WORK_DATA_DIR" "$safety_dir/work-data.tar"
+    clear_bind "$ADGUARD_WORK_DATA_DIR"
+  fi
+  [[ ! -s "$ARTIFACT_DIR/adguard/config.tar" ]] \
+    || extract_to_bind "$ARTIFACT_DIR/adguard/config.tar" "$ADGUARD_CONF_DIR"
+  [[ ! -s "$ARTIFACT_DIR/adguard/work-data.tar" ]] \
+    || extract_to_bind "$ARTIFACT_DIR/adguard/work-data.tar" "$ADGUARD_WORK_DATA_DIR"
+  docker compose -f "$ADGUARD_TARGET/docker-compose.yml" --project-directory "$ADGUARD_TARGET" up -d
+  service="$(docker compose -f "$ADGUARD_TARGET/docker-compose.yml" --project-directory "$ADGUARD_TARGET" config --services | head -n 1)"
+  [[ -n "$service" ]] || fail "AdGuard Compose has no service"
+  wait_compose_service "$ADGUARD_TARGET" "$service" >/dev/null || fail "AdGuard did not become ready"
+}
+
+verify_adguard() {
+  local service
+  service="$(docker compose -f "$ADGUARD_TARGET/docker-compose.yml" --project-directory "$ADGUARD_TARGET" config --services | head -n 1)"
+  [[ -n "$service" ]] && wait_compose_service "$ADGUARD_TARGET" "$service" >/dev/null
+}
+
+apply_mssql_guide() {
+  local target="$STAGING_DIR/service-artifacts/mssql"
+  local script="$SESSION_DIR/commands/sql-server-restore-template.sql"
+  local id
+  local name
+  mkdir -p -- "$target"
+  rsync --archive "$ARTIFACT_DIR/mssql/" "$target/"
+  {
+    printf '%s\n' '-- Review logical file names and replace every placeholder before execution.'
+    printf '%s\n\n' '-- Run each RESTORE FILELISTONLY first; do not restore system databases blindly.'
+    if [[ -s "$target/databases.txt" ]]; then
+      while IFS='|' read -r id name; do
+        [[ "$id" =~ ^[0-9]+$ && -n "$name" ]] || continue
+        printf '%s\n' "-- Database: $name"
+        printf "RESTORE FILELISTONLY FROM DISK = N'/var/opt/mssql/backup/db-%s.bak';\n" "$id"
+        printf "-- RESTORE DATABASE [%s] FROM DISK = N'/var/opt/mssql/backup/db-%s.bak' WITH MOVE ...;\n\n" \
+          "${name//]/]]}" "$id"
+      done <"$target/databases.txt"
+    fi
+  } >"$script"
+  chmod 600 -- "$script"
+  printf 'SQL Server artifacts: %s\nT-SQL template: %s\n' "$target" "$script"
+  return 20
+}
+
+apply_component() {
+  require_env ARTIFACT_DIR
+  require_env TARGET_HOME
+  require_env STAGING_DIR
+  require_env SESSION_DIR
+  require_command rsync
+  case "$COMPONENT" in
+    docker.tasksorter) require_command docker; apply_tasksorter ;;
+    docker.joplin-server) require_command docker; apply_joplin ;;
+    docker.adguard) require_command docker; apply_adguard ;;
+    docker.mssql) apply_mssql_guide ;;
+    *) fail "Unknown Docker recovery component: $COMPONENT" ;;
+  esac
+}
+
+verify_component() {
+  case "$COMPONENT" in
+    docker.tasksorter) verify_tasksorter ;;
+    docker.joplin-server) verify_joplin ;;
+    docker.adguard) verify_adguard ;;
+    docker.mssql) return 20 ;;
+    *) fail "Unknown Docker recovery component: $COMPONENT" ;;
+  esac
+}
+
+guide_component() {
+  case "$COMPONENT" in
+    docker.tasksorter)
+      printf '%s\n' 'Review the handler log. On failure, keep services stopped and use the safety archives in the recovery session before retrying.'
+      ;;
+    docker.joplin-server)
+      printf '%s\n' 'Use the server database handler only for Joplin Server. Import JEX files into Joplin Desktop through its graphical import workflow.'
+      ;;
+    docker.adguard)
+      printf '%s\n' 'After startup, verify local DNS resolution and sign in to the AdGuard administration UI before removing staging data.'
+      ;;
+    docker.mssql)
+      printf '%s\n' 'Copy selected .bak files into a compatible SQL Server container, run RESTORE FILELISTONLY, review logical file mappings, and execute each generated RESTORE DATABASE statement manually.'
+      ;;
+    *) fail "Unknown Docker recovery component: $COMPONENT" ;;
+  esac
+}
+
+main() {
+  local config_file="${BACKUP_HOME_DOCKER_RECOVERY_CONFIG:-$PROJECT_DIR/config/docker-recovery/local.conf}"
+
+  require_env SNAPSHOT_DIR
+  require_env ARTIFACT_DIR
+  load_docker_recovery_config "$config_file" || exit 1
+  TASKSORTER_SOURCE="$SOURCE_HOME/$TASKSORTER_SOURCE_RELATIVE"
+  TASKSORTER_TARGET="$TARGET_HOME/$TASKSORTER_SOURCE_RELATIVE"
+  JOPLIN_SOURCE="$SOURCE_HOME/$JOPLIN_SERVICE_RELATIVE"
+  JOPLIN_TARGET="$TARGET_HOME/$JOPLIN_SERVICE_RELATIVE"
+  JOPLIN_DATA_DIR="$JOPLIN_TARGET/$JOPLIN_DATA_RELATIVE"
+  ADGUARD_SOURCE="$SOURCE_HOME/$ADGUARD_SERVICE_RELATIVE"
+  ADGUARD_TARGET="$TARGET_HOME/$ADGUARD_SERVICE_RELATIVE"
+  ADGUARD_CONF_DIR="$ADGUARD_TARGET/$ADGUARD_CONF_RELATIVE"
+  ADGUARD_WORK_DATA_DIR="$ADGUARD_TARGET/$ADGUARD_WORK_RELATIVE/data"
+  case "$ACTION" in
+    describe) describe_components ;;
+    preflight) [[ -n "$COMPONENT" ]] || fail "preflight requires a component"; preflight_component ;;
+    apply) [[ -n "$COMPONENT" ]] || fail "apply requires a component"; apply_component ;;
+    verify) [[ -n "$COMPONENT" ]] || fail "verify requires a component"; verify_component ;;
+    guide) [[ -n "$COMPONENT" ]] || fail "guide requires a component"; guide_component ;;
+    *) fail "Unknown restore handler action: $ACTION" ;;
+  esac
+}
+
+main "$@"

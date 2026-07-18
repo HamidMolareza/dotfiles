@@ -1,6 +1,6 @@
 # AGENTS.md
 
-These instructions apply to all files under `/home/home/scripts/src/backups`.
+These instructions apply to all files under this backup-tool directory.
 
 ## Scope
 
@@ -14,7 +14,8 @@ If implementation details conflict with this file, update the requirements first
 
 ## Primary Goal
 
-Build and maintain a safe, inspectable backup tool for `/home/home` that:
+Build and maintain a safe, inspectable backup tool for explicitly configured user
+paths that:
 
 - uses Bash as the implementation language for v1
 - uses `rsync` as the backup engine
@@ -42,7 +43,8 @@ Build and maintain a safe, inspectable backup tool for `/home/home` that:
 ## Safety Rules
 
 - Do not design the tool to write backups into the source tree.
-- Do not allow dangerous destinations such as `/`, `/home/home`, or paths inside the backed-up source unless requirements explicitly change.
+- Do not allow dangerous destinations such as `/`, the current user's home, or paths
+  inside a backed-up source unless requirements explicitly change.
 - Dry-run support is mandatory for write-capable operations.
 - Restore behavior must not silently overwrite data.
 - Sensitive paths such as `.ssh` and `.gnupg` must remain opt-in, not default.

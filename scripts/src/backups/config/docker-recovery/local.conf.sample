@@ -1,0 +1,29 @@
+# Copy to local.conf and review every value before enabling docker-recovery.
+# Paths are relative to the source or target user's home directory.
+
+tasksorter_source_relative=Projects/TaskSorter
+tasksorter_postgres_container=tasksorter-postgres-1
+tasksorter_postgres_volume=tasksorter_postgres-data
+tasksorter_keys_volume=tasksorter_data-protection-keys
+tasksorter_postgres_image=postgres:18-alpine
+
+mssql_container=sql-server-db
+mssql_data_relative=.local/share/docker-services/mssql/data
+mssql_log_relative=.local/share/docker-services/mssql/log
+
+joplin_service_relative=.local/share/docker-services/joplin
+joplin_data_relative=data/postgres
+joplin_compose_project=joplin
+joplin_postgres_image=postgres:15
+
+adguard_service_relative=.local/share/docker-services/adguard
+adguard_conf_relative=data/conf
+adguard_work_relative=data/work
+adguard_compose_project=adguard
+adguard_compose_service=adguardhome
+
+archive_helper_image=postgres:15
+
+# Comma-separated running stateful containers that must block a backup until an
+# application-aware collector is configured for them.
+unsupported_containers=postgres,mysql,mongodb,redis,rabbitmq

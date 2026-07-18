@@ -1,5 +1,6 @@
 # Format: Title | Description
 
-# OTP
-# Mobile Contacts
-# Passwords | Important passwords such as browser or account recovery data
+# Password manager | Export recovery material not already covered by selected paths
+# Mobile data | Confirm contacts, photos, and application exports are current
+# Browser data | Export bookmarks or sessions that are not synchronized
+# Offline recovery codes | Store them through an approved encrypted process

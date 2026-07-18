@@ -5,8 +5,8 @@
 unchanged files with hard links, and keeps restore possible with ordinary filesystem
 tools.
 
-The behavior source of truth is `app-requirements.md`. The manifest wire format is
-documented in `docs/manifest-v1.md`.
+The behavior source of truth is `app-requirements.md`. New snapshots use the
+`docs/manifest-v2.md` wire format; schema v1 remains readable for compatibility.
 
 ## Design boundaries
 
@@ -17,8 +17,9 @@ documented in `docs/manifest-v1.md`.
   delete data.
 - Repository exports are handled by explicit external wrappers, not clone/API logic
   inside this tool.
-- Compression, GPG, cloud backends, database dumps, and automatic restore scripts
-  are intentionally outside the tool.
+- Compression, GPG, cloud backends, and database logic inside the core are outside
+  the tool. Explicit collectors may create application-aware database recovery
+  artifacts, and only trusted local restore handlers may apply them.
 
 ## Requirements
 
@@ -32,6 +33,12 @@ GNU core utilities. Optional inventory tools include `dconf`, `apt-mark`, `dpkg`
 ```text
 .
 ├── backup-home
+├── collectors
+│   └── docker-recovery
+├── restore-handlers
+│   └── docker-recovery
+├── lib
+│   └── docker-recovery-config
 ├── app-requirements.md
 ├── config
 │   ├── profiles
@@ -47,17 +54,28 @@ GNU core utilities. Optional inventory tools include `dconf`, `apt-mark`, `dpkg`
 │   ├── collectors
 │   │   ├── enabled.conf       # ignored local config
 │   │   └── enabled.conf.sample
+│   ├── docker-recovery
+│   │   ├── local.conf         # ignored local config
+│   │   └── local.conf.sample
+│   ├── restore
+│   │   ├── handlers.local.conf        # ignored local config
+│   │   └── handlers.local.conf.sample
+│   ├── README.md
 │   └── retention
 │       └── default.conf
 ├── docs
-│   └── manifest-v1.md
+│   ├── docker-recovery.md
+│   ├── manifest-v1.md
+│   ├── manifest-v2.md
+│   ├── new-machine-recovery.md
+│   └── restore-handler-contract.md
 └── tests
     └── integration.sh
 ```
 
 The old top-level `backup-home.rules` and `backup-home.manual` paths are no longer
-runtime fallbacks. Existing local values were migrated into `config/`; ignored legacy
-copies may be kept under `config/migration/` only for rollback.
+runtime fallbacks. Active configuration lives only in the documented `config/`
+subdirectories.
 
 For a fresh checkout, create the ignored local files from the tracked samples:
 
@@ -66,9 +84,17 @@ cp config/profiles/home.conf.sample config/profiles/home.conf
 cp config/excludes/local.exclude.sample config/excludes/local.exclude
 cp config/manual/home.manual.sample config/manual/home.manual
 cp config/collectors/enabled.conf.sample config/collectors/enabled.conf
+cp config/restore/handlers.local.conf.sample config/restore/handlers.local.conf
 ```
 
-Review every include, exclude, manual task, and collector before the first run.
+When enabling Docker recovery, also copy and review its local layout:
+
+```bash
+cp config/docker-recovery/local.conf.sample config/docker-recovery/local.conf
+```
+
+Review every include, exclude, manual task, collector, and handler before the first
+run. See `config/README.md` for the tracked-versus-local policy.
 
 ## Configuration
 
@@ -77,14 +103,15 @@ Review every include, exclude, manual task, and collector before the first run.
 The default profile is `config/profiles/home.conf`:
 
 ```text
-include=/home/home/Downloads
-include=/home/home/my-files
+include=/home/alice/Downloads
+include=/home/alice/Projects
 exclude_file=../excludes/common.exclude
 exclude_file=../excludes/local.exclude
 ```
 
 An include must be an absolute path or glob. `/` is rejected. `exclude_file` may be
-absolute or relative to the profile file. Pass a different profile with
+absolute or relative to the profile file. Exclude files are optional; omitting every
+`exclude_file` entry copies all matched paths. Pass a different profile with
 `--config-file PATH`.
 
 ### Excludes
@@ -93,7 +120,7 @@ Exclude files contain one pattern per line without the old `!` prefix:
 
 ```text
 # Absolute path
-/home/home/Desktop/temp
+/home/alice/Desktop/temp
 
 # Name matched below any included root
 node_modules
@@ -155,6 +182,40 @@ crontab, selected Nautilus data, OS metadata, tool versions, and a conservative
 `RESTORE.md`. It never runs with `sudo` and never applies settings or installs
 packages.
 
+The optional tracked `collectors/docker-recovery` wrapper creates a logical
+TaskSorter PostgreSQL dump while the
+container is running, preserves its Data Protection keys, creates SQL Server native
+backups with checksums and `RESTORE VERIFYONLY`, and handles Joplin PostgreSQL as a
+logical online dump or a physical archive only while stopped. Excluded AdGuard
+configuration and runtime data are archived separately. See
+`docs/docker-recovery.md` for the exact coverage and restore boundaries.
+
+Machine-specific service paths, container and volume names, Compose identifiers, and
+image tags live only in ignored `config/docker-recovery/local.conf`. The collector and
+handler fail clearly when that file is missing or invalid. Set
+`BACKUP_HOME_DOCKER_RECOVERY_CONFIG` only when an alternate reviewed absolute config
+path is needed.
+
+The Docker collector requires the Docker daemon and its referenced images to already
+be available. Its artifacts contain database content and credentials or keys, so the
+destination must be encrypted. Large collector outputs are staged below `TMPDIR`
+before being copied into the snapshot; point `TMPDIR` at a filesystem with enough
+temporary space when the default `/tmp` is too small.
+
+### Restore handlers
+
+Restore handlers are optional trusted local executables listed in the ignored
+`config/restore/handlers.local.conf`:
+
+```text
+docker-recovery|/absolute/path/to/trusted/docker-recovery-handler
+```
+
+The first field must match a collector name. The second field must be an absolute
+executable path. The default local file may be absent; the tracked Docker handler is
+registered automatically when present. The tool never executes a script from a
+snapshot. See `docs/restore-handler-contract.md` before adding a custom handler.
+
 ### Retention
 
 `config/retention/default.conf` currently contains:
@@ -179,6 +240,9 @@ backup-home [global-options] <command> [command-options]
   `legacy` status.
 - `verify`: perform basic verification; `--deep` also validates recorded checksums.
 - `restore`: dry-run or apply a full/partial restore.
+- `restore-plan`: inspect snapshot and target recovery readiness without changing
+  the target.
+- `recover`: run a staged, component-aware, resumable recovery session.
 - `prune`: preview or apply keep-last retention.
 - `drill`: restore one selected path to a temporary directory and compare it.
 - `help`: show CLI usage.
@@ -189,6 +253,7 @@ Common options:
 - `--config-file PATH`
 - `--manual-file PATH`
 - `--collectors-file PATH`
+- `--handlers-file PATH`
 - `--retention-file PATH`
 - `--dry-run`
 - `--verbose`
@@ -205,25 +270,25 @@ code zero.
 Inspect the active configuration:
 
 ```bash
-./backup-home --dest /media/home/backup-drive plan
+./backup-home --dest /mnt/backup-drive/backups plan
 ```
 
 Preview rsync without collectors or staging:
 
 ```bash
-./backup-home --dest /media/home/backup-drive run --dry-run
+./backup-home --dest /mnt/backup-drive/backups run --dry-run
 ```
 
 Create a real snapshot after the confirmation prompt:
 
 ```bash
-./backup-home --dest /media/home/backup-drive run
+./backup-home --dest /mnt/backup-drive/backups run
 ```
 
 For intentional unattended execution without manual checklist items:
 
 ```bash
-./backup-home --dest /media/home/backup-drive run --yes
+./backup-home --dest /mnt/backup-drive/backups run --yes
 ```
 
 A real run uses this transaction:
@@ -257,21 +322,22 @@ log plus `*.failure.tsv` and `*.failure.txt` remain under `<dest>/logs/`.
 ```
 
 Real `run` and `prune --yes` operations use an exclusive `flock`. `list`, `verify`,
-`restore`, `drill`, and previews use a shared lock. A lock conflict returns exit code
-75 and prints available owner metadata. A stale file alone cannot hold a lock.
+`restore`, `restore-plan`, `recover`, `drill`, and previews use a shared lock. A lock
+conflict returns exit code 75 and prints available owner metadata. A stale file alone
+cannot hold a lock.
 
 ## Verify
 
 Verify the latest finalized snapshot:
 
 ```bash
-./backup-home --dest /media/home/backup-drive verify
+./backup-home --dest /mnt/backup-drive/backups verify
 ```
 
 Verify one snapshot and its recorded checksum sample:
 
 ```bash
-./backup-home --dest /media/home/backup-drive \
+./backup-home --dest /mnt/backup-drive/backups \
   verify 2026-07-17_12-00-00 --deep
 ```
 
@@ -289,19 +355,19 @@ Deep verification is unavailable for them.
 Preview snapshots older than the newest configured count:
 
 ```bash
-./backup-home --dest /media/home/backup-drive prune
+./backup-home --dest /mnt/backup-drive/backups prune
 ```
 
 Preview a one-off policy:
 
 ```bash
-./backup-home --dest /media/home/backup-drive prune --keep-last 5
+./backup-home --dest /mnt/backup-drive/backups prune --keep-last 5
 ```
 
 Apply exactly the displayed candidates:
 
 ```bash
-./backup-home --dest /media/home/backup-drive prune --keep-last 5 --yes
+./backup-home --dest /mnt/backup-drive/backups prune --keep-last 5 --yes
 ```
 
 Prune considers only timestamp-named directories, requires at least one retained
@@ -315,24 +381,24 @@ Restore defaults to dry-run. Partial restore now preserves the original absolute
 layout below the alternate destination.
 
 ```bash
-./backup-home --dest /media/home/backup-drive \
+./backup-home --dest /mnt/backup-drive/backups \
   restore 2026-07-17_12-00-00 \
-  --path /home/home/.dotfiles \
+  --path /home/alice/.dotfiles \
   --restore-to /tmp/restore-dotfiles
 ```
 
 The corresponding real restore writes to:
 
 ```text
-/tmp/restore-dotfiles/home/home/.dotfiles
+/tmp/restore-dotfiles/home/alice/.dotfiles
 ```
 
 Apply after reviewing the dry-run:
 
 ```bash
-./backup-home --dest /media/home/backup-drive \
+./backup-home --dest /mnt/backup-drive/backups \
   restore 2026-07-17_12-00-00 \
-  --path /home/home/.dotfiles \
+  --path /home/alice/.dotfiles \
   --restore-to /tmp/restore-dotfiles \
   --yes
 ```
@@ -344,22 +410,91 @@ metadata from the restored payload.
 Exercise one path without keeping restored files:
 
 ```bash
-./backup-home --dest /media/home/backup-drive \
+./backup-home --dest /mnt/backup-drive/backups \
   drill 2026-07-17_12-00-00 \
-  --path /home/home/.dotfiles
+  --path /home/alice/.dotfiles
 ```
 
 The drill copies the selected path to `mktemp -d`, compares it with checksum-aware
 rsync, reports differences as failure, and cleans the temporary tree on every exit.
 
-## Joplin and server artifacts
+## Guided recovery on a new machine
 
-If the active profile includes `/home/home/backups/joplin`, restore it into staging:
+Start with a read-only plan. Deep verification is enabled by default:
 
 ```bash
-./backup-home --dest /media/home/backup-drive \
+./backup-home --dest /mnt/encrypted-backup/backups \
+  restore-plan 2026-07-17_12-00-00 \
+  --target-user home
+```
+
+The report checks the manifest and snapshot checksums, source and target identities,
+free space, path mappings, collector artifacts, trusted handlers, component risks,
+and application prerequisites. It returns non-zero when recovery is blocked. Use
+`--skip-deep-verify` only when the cost is understood; use `--allow-legacy` only for
+an intentionally selected pre-manifest or incomplete-metadata snapshot.
+
+Run the interactive workflow after the plan is clean:
+
+```bash
+./backup-home --dest /mnt/encrypted-backup/backups \
+  recover 2026-07-17_12-00-00 \
+  --target-user home
+```
+
+Recovery presents each filesystem, inventory, and application component separately.
+Selected files are copied into staging and checksum-compared before merge. Existing
+targets are compared without deletion; conflicts remain `manual-pending` unless the
+exact destructive component is approved. Before an approved replacement, the
+current target is copied into the session's `pre-restore/` safety area.
+
+For unattended recovery, `--all --yes` applies safe and privileged components but
+skips anything whose effective risk is destructive:
+
+```bash
+./backup-home --dest /mnt/encrypted-backup/backups \
+  recover 2026-07-17_12-00-00 \
+  --all --yes
+```
+
+Approve a reviewed destructive component by its exact ID:
+
+```bash
+./backup-home --dest /mnt/encrypted-backup/backups \
+  recover 2026-07-17_12-00-00 \
+  --component docker.tasksorter \
+  --approve-destructive docker.tasksorter \
+  --yes
+```
+
+If the new account or layout differs, use `--target-user`, `--target-home`, and one
+or more `--map-path SOURCE=TARGET` arguments. The manifest v2 source identity is the
+default mapping source. Recovery sessions are private and resumable under:
+
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/backup-home/recovery/SESSION_ID/
+```
+
+Continue an interrupted or manual-pending session with:
+
+```bash
+./backup-home --dest /mnt/encrypted-backup/backups \
+  recover --resume SESSION_ID
+```
+
+Each session keeps `plan.txt`, append-only `state.tsv`, component logs, reviewable
+commands, `manual-steps.md`, staged data, and any safety copies. Keep the staging and
+session directories until every selected component is verified. The complete
+bare-machine sequence is in `docs/new-machine-recovery.md`.
+
+## Joplin and server artifacts
+
+If the active profile includes `/home/alice/backups/joplin`, restore it into staging:
+
+```bash
+./backup-home --dest /mnt/backup-drive/backups \
   restore 2026-07-17_12-00-00 \
-  --path /home/home/backups/joplin \
+  --path /home/alice/backups/joplin \
   --restore-to /tmp/restore-joplin \
   --yes
 ```
@@ -367,14 +502,15 @@ If the active profile includes `/home/home/backups/joplin`, restore it into stag
 The files are then under:
 
 ```text
-/tmp/restore-joplin/home/home/backups/joplin
+/tmp/restore-joplin/home/alice/backups/joplin
 ```
 
-Verify service-specific `.sha256` files and follow the Joplin PostgreSQL restore
-procedure separately. `backup-home` restores files; it does not stop services or run
-`pg_restore`.
+Verify service-specific `.sha256` files before using them. The low-level `restore`
+command restores files only. In guided `recover`, the trusted Docker handler can
+restore Joplin Server PostgreSQL and start Compose on a fresh target, or after exact
+approval when existing state would be replaced.
 
-The same distinction applies to `/home/home/backups/server`: it contains local
+The same distinction applies to `/home/alice/backups/server`: it contains local
 artifacts pulled from servers, not the live servers. Restore them to staging, inspect
 their manifests/checksums/readmes, and use each service's documented recovery flow.
 
@@ -383,12 +519,16 @@ their manifests/checksums/readmes, and use each service's documented recovery fl
 Run the complete isolated suite:
 
 ```bash
-bash -n backup-home tests/integration.sh
-shellcheck -x backup-home tests/integration.sh
+bash -n backup-home tests/integration.sh collectors/docker-recovery \
+  restore-handlers/docker-recovery lib/docker-recovery-config
+shellcheck -x backup-home tests/integration.sh collectors/docker-recovery \
+  restore-handlers/docker-recovery lib/docker-recovery-config
 tests/integration.sh
 ```
 
 The suite uses only temporary sources and destinations. It covers dry-run, two linked
 snapshots, manifests, required/optional collectors, system inventory, rsync failure,
 signal cleanup, lock conflicts, retention, basic/deep verification, checksum
-tampering, legacy snapshots, safe partial restore, traversal rejection, and drill.
+tampering, legacy snapshots, safe partial restore, traversal rejection, drill,
+manifest v2 identity, read-only recovery planning, staged merge conflicts, resumable
+sessions, trusted handlers, destructive approval, and collector fallbacks.

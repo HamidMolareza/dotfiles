@@ -1,7 +1,10 @@
 config/profiles/*.conf
 !config/profiles/*.conf.sample
-config/excludes/local.exclude
+config/excludes/*.exclude
+!config/excludes/common.exclude
 config/manual/*.manual
 !config/manual/*.manual.sample
-config/collectors/enabled.conf
-config/migration/
+config/collectors/*.conf
+config/docker-recovery/*.conf
+config/restore/*.conf
+!config/restore/handlers.local.conf.sample

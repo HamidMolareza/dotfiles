@@ -1,0 +1,4 @@
+# collector-name|/absolute/path/to/restore-handler
+# Built-in docker-recovery support is loaded relative to the backup-home script.
+# It also requires reviewed config/docker-recovery/local.conf on the recovery machine.
+# Register only trusted local executables here. Snapshot scripts are never executed.

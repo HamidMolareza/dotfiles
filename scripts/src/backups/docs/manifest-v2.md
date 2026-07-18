@@ -1,9 +1,6 @@
-# Backup Home Manifest Schema v1
+# Backup Home Manifest Schema v2
 
-This document describes the previous manifest format. New snapshots use schema v2,
-documented in `manifest-v2.md`; schema v1 remains readable for compatibility.
-
-Every finalized snapshot created by `backup-home` contains:
+Every finalized snapshot created by the current `backup-home` contains:
 
 ```text
 .backup-home/manifest.tsv
@@ -13,7 +10,8 @@ Every finalized snapshot created by `backup-home` contains:
 ```
 
 `report.txt` is the human summary. `manifest.tsv` is the stable machine-readable
-record used by `verify` and `list`.
+record used by verification, listing, recovery planning, and source-to-target path
+mapping.
 
 ## Encoding
 
@@ -21,16 +19,15 @@ The manifest is UTF-8 text with tab-separated fields and one record per line. Th
 first field is the record type. Backslash, tab, newline, and carriage-return
 characters in scalar values are represented as `\\`, `\t`, `\n`, and `\r`.
 
-Configuration paths and collector names reject control characters before a run, so
-their manifest values are unambiguous without shell evaluation. Consumers must not
-source the manifest as shell code.
+Configuration paths and collector names reject control characters before a run.
+Consumers must parse records and must never source the manifest as shell code.
 
 ## Scalar records
 
 Scalar records have two fields: type and value.
 
 ```text
-schema_version       1
+schema_version       2
 snapshot             YYYY-MM-DD_HH-mm-ss
 status               success | success-with-warnings
 started_at           ISO-8601 timestamp
@@ -38,6 +35,10 @@ ended_at             ISO-8601 timestamp
 hostname             snapshot producer hostname
 os_id                /etc/os-release ID
 os_version_id        /etc/os-release VERSION_ID
+source_user          source account name
+source_uid           numeric source user ID
+source_gid           numeric source primary group ID
+source_home          canonical source home path
 profile_name         profile basename only
 config_digest        SHA-256 over profile/exclude/collector config inputs
 previous_snapshot    timestamp or none
@@ -49,13 +50,17 @@ file_count           total regular files in the finalized snapshot
 checksum_count       records in checksums.sha256
 ```
 
-The digest identifies config without embedding full config contents. Resolved roots
-and applied excludes are recorded separately because they are needed to interpret and
-verify the snapshot.
+The four source identity fields are the schema v2 addition. `restore-plan` reports
+them, and `recover` uses `source_home` as the default mapping prefix. A different
+target account or layout may be selected explicitly without rewriting the snapshot.
+
+The configuration digest identifies inputs without embedding their contents. The
+manifest must not contain tokens, environment dumps, connection strings, or raw
+authentication diagnostics.
 
 ## Repeated records
 
-Resolved roots and excludes use two fields:
+Resolved roots, applied excludes, and warnings use two fields:
 
 ```text
 root       /absolute/resolved/path
@@ -81,28 +86,16 @@ to the snapshot root. It contains:
 - every regular file under `.backup-home/artifacts/`
 - up to 16 sampled payload files smaller than 16 MiB
 
-`verify --deep` runs `sha256sum -c --strict --quiet` from the snapshot root. The
-manifest itself is not part of the checksum set because it records the checksum count
-and is written last.
-
-## Failure reports
-
-Failed runs do not publish snapshot manifests. After temporary and incomplete data
-are removed, the destination log directory retains:
-
-```text
-backup-home-TIMESTAMP.log
-backup-home-TIMESTAMP.failure.tsv
-backup-home-TIMESTAMP.failure.txt
-```
-
-The failure TSV contains schema version, planned snapshot, status, start/end times,
-exit code, and a sanitized reason. It is a run diagnostic, not a valid snapshot
-manifest.
+`verify --deep`, `restore-plan`, and guided `recover` validate the recorded set by
+default where applicable. The manifest itself is not part of the checksum set because
+it records the checksum count and is written last.
 
 ## Compatibility
 
-Directories with timestamp names but without `.backup-home/manifest.tsv` are treated
-as legacy snapshots. They remain available for list, restore, link-dest reuse, prune,
-and current-profile basic verification. They cannot pass schema or deep checksum
-verification.
+Schema v1 manifests remain listable, verifiable, and restorable. Guided recovery
+infers their source identity and warns that the identity was not recorded. Timestamp
+directories without a manifest are `legacy`: low-level restore remains available,
+while guided recovery requires `--allow-legacy`, cannot provide recorded checksum
+assurance, and refuses a snapshot with a matching failed-run report.
+
+See `manifest-v1.md` for the previous wire format.

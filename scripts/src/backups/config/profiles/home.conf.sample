@@ -1,6 +1,13 @@
 # Backup sources. Values must be absolute paths or glob patterns.
-include=/home/home/Downloads
-include=/home/home/Desktop
+# Replace alice with the local account name before copying this sample.
+include=/home/alice/Downloads
+include=/home/alice/Desktop
+
+# Common optional sources. Enable only after reviewing their sensitivity and size.
+# include=/home/alice/Documents
+# include=/home/alice/Projects
+# include=/home/alice/.dotfiles
+# include=/home/alice/Private
 
 # Exclude files may be relative to this profile.
 exclude_file=../excludes/common.exclude

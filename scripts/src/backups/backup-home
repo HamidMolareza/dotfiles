@@ -8,6 +8,7 @@ DEFAULT_PROFILE_FILE="$SCRIPT_DIR/config/profiles/home.conf"
 DEFAULT_MANUAL_FILE="$SCRIPT_DIR/config/manual/home.manual"
 DEFAULT_COLLECTORS_FILE="$SCRIPT_DIR/config/collectors/enabled.conf"
 DEFAULT_RETENTION_FILE="$SCRIPT_DIR/config/retention/default.conf"
+DEFAULT_HANDLERS_FILE="$SCRIPT_DIR/config/restore/handlers.local.conf"
 
 COMMAND=""
 DEST_ROOT=""
@@ -16,6 +17,7 @@ PROFILE_FILE="$DEFAULT_PROFILE_FILE"
 MANUAL_FILE="$DEFAULT_MANUAL_FILE"
 COLLECTORS_FILE="$DEFAULT_COLLECTORS_FILE"
 RETENTION_FILE="$DEFAULT_RETENTION_FILE"
+HANDLERS_FILE="$DEFAULT_HANDLERS_FILE"
 DRY_RUN=0
 VERBOSE=0
 ASSUME_YES=0
@@ -27,6 +29,24 @@ SNAPSHOT_NAME=""
 RESTORE_PATH=""
 RESTORE_DEST=""
 KEEP_LAST_OVERRIDE=""
+TARGET_USER=""
+TARGET_HOME=""
+STAGING_DIR=""
+RESUME_SESSION=""
+RECOVERY_SESSION_ID=""
+RECOVERY_SESSION_DIR=""
+RECOVERY_SNAPSHOT_DIR=""
+RECOVERY_MANIFEST=""
+RECOVERY_SCHEMA=""
+RECOVERY_SOURCE_USER=""
+RECOVERY_SOURCE_UID=""
+RECOVERY_SOURCE_GID=""
+RECOVERY_SOURCE_HOME=""
+RECOVERY_TARGET_UID=""
+RECOVERY_TARGET_GID=""
+RECOVERY_ALL=0
+SKIP_DEEP_VERIFY=0
+ALLOW_LEGACY=0
 
 RUN_STAGE_DIR=""
 INCOMPLETE_SNAPSHOT_DIR=""
@@ -59,6 +79,24 @@ declare -a COLLECTOR_STATUSES=()
 declare -a COLLECTOR_EXIT_CODES=()
 declare -a COLLECTOR_STARTED_AT=()
 declare -a COLLECTOR_ENDED_AT=()
+declare -a SELECTED_COMPONENTS=()
+declare -a APPROVED_DESTRUCTIVE=()
+declare -a PATH_MAPPINGS=()
+declare -a RESTORE_HANDLER_NAMES=()
+declare -a RESTORE_HANDLER_COMMANDS=()
+declare -a COMPONENT_IDS=()
+declare -a COMPONENT_LABELS=()
+declare -a COMPONENT_KINDS=()
+declare -a COMPONENT_CAPABILITIES=()
+declare -a COMPONENT_RISKS=()
+declare -a COMPONENT_RECOMMENDED=()
+declare -a COMPONENT_HANDLERS=()
+declare -a COMPONENT_SOURCE_PATHS=()
+declare -a COMPONENT_DEPENDENCIES=()
+declare -a RECOVERY_BLOCKERS=()
+declare -a RECOVERY_WARNINGS=()
+declare -a RECOVERY_PREFLIGHT_LINES=()
+declare -A COMPONENT_INDEX=()
 
 SIZE_REPORT_TOTAL=0
 SIZE_REPORT_READY=0
@@ -75,6 +113,8 @@ Commands:
   list       List finalized snapshots and their status
   verify     Validate a snapshot; add --deep for recorded checksums
   restore    Restore a full snapshot or one absolute path
+  restore-plan  Inspect recovery readiness without changing the target
+  recover    Run or resume a guided recovery session
   prune      Preview retention candidates; add --yes to delete
   drill      Restore one path to a temporary directory and compare it
   help       Show this help text
@@ -85,6 +125,7 @@ Global options:
   --manual-file PATH      Manual checklist (default: $DEFAULT_MANUAL_FILE)
   --collectors-file PATH  Collector config (default: $DEFAULT_COLLECTORS_FILE)
   --retention-file PATH   Retention config (default: $DEFAULT_RETENTION_FILE)
+  --handlers-file PATH    Local restore handler config (default: $DEFAULT_HANDLERS_FILE)
   --dry-run               Preview write-capable work
   --verbose               Show detailed command output
   --yes                   Confirm real run, restore, or prune operations
@@ -95,16 +136,26 @@ Global options:
 Command options:
   verify [SNAPSHOT] [--deep]
   restore SNAPSHOT --restore-to PATH [--path ABSOLUTE_PATH] [--yes]
+  restore-plan [SNAPSHOT] [--target-user NAME] [--target-home PATH]
+               [--staging-dir PATH] [--map-path SOURCE=TARGET]
+               [--skip-deep-verify] [--allow-legacy]
+  recover [SNAPSHOT] [--component ID ... | --all] [--yes]
+          [--approve-destructive ID ...] [--resume SESSION_ID]
+          [--target-user NAME] [--target-home PATH] [--staging-dir PATH]
+          [--map-path SOURCE=TARGET] [--allow-legacy]
   prune [--keep-last N] [--yes]
   drill SNAPSHOT --path ABSOLUTE_PATH [--dry-run]
 
 Profile format:
-  include=/home/home/my-files
+  include=/home/alice/Projects
   exclude_file=../excludes/common.exclude
 
 Collector format:
   required|system-inventory|builtin:system-inventory
   optional|repository-export|/absolute/path/to/wrapper
+
+Restore handler format:
+  collector-name|/absolute/path/to/restore-handler
 EOF
 }
 
@@ -364,7 +415,6 @@ parse_profile_file() {
   done <"$PROFILE_FILE"
 
   [[ "${#INCLUDE_RULES[@]}" -gt 0 ]] || die "Profile has no include entries: $PROFILE_FILE"
-  [[ "${#EXCLUDE_FILES[@]}" -gt 0 ]] || die "Profile has no exclude_file entries: $PROFILE_FILE"
 }
 
 parse_exclude_files() {
@@ -574,13 +624,19 @@ ensure_dest_required() {
 }
 
 ensure_safe_destination() {
+  local current_home=""
   ensure_dest_required
   DEST_ROOT_REAL="$(canonicalize_path "$DEST_ROOT")"
+  if [[ -n "${HOME:-}" ]]; then
+    current_home="$(canonicalize_path "$HOME")"
+  fi
   case "$DEST_ROOT_REAL" in
-    /|/home/home)
+    /)
       die "Dangerous backup destination is not allowed: $DEST_ROOT_REAL"
       ;;
   esac
+  [[ -z "$current_home" || "$DEST_ROOT_REAL" != "$current_home" ]] \
+    || die "Dangerous backup destination is not allowed: $DEST_ROOT_REAL"
 }
 
 ensure_dest_access() {
@@ -950,7 +1006,7 @@ inventory_warning() {
 
 collector_system_inventory() {
   local output_dir="$1"
-  local user_home="${HOME:-/home/home}"
+  local user_home="${HOME:?HOME is required for system inventory}"
   local crontab_temp
   local source_path
 
@@ -1193,7 +1249,7 @@ write_snapshot_manifest() {
   script_hash="$(sha256sum "$SCRIPT_DIR/backup-home" | awk '{print $1}')"
 
   {
-    printf 'schema_version\t1\n'
+    printf 'schema_version\t2\n'
     printf 'snapshot\t%s\n' "$(manifest_escape "$SNAPSHOT_NAME")"
     printf 'status\t%s\n' "$status"
     printf 'started_at\t%s\n' "$(manifest_escape "$RUN_STARTED_AT")"
@@ -1201,6 +1257,10 @@ write_snapshot_manifest() {
     printf 'hostname\t%s\n' "$(manifest_escape "$(hostname)")"
     printf 'os_id\t%s\n' "$(manifest_escape "$(os_release_value ID)")"
     printf 'os_version_id\t%s\n' "$(manifest_escape "$(os_release_value VERSION_ID)")"
+    printf 'source_user\t%s\n' "$(manifest_escape "$(id -un)")"
+    printf 'source_uid\t%s\n' "$(id -u)"
+    printf 'source_gid\t%s\n' "$(id -g)"
+    printf 'source_home\t%s\n' "$(manifest_escape "$(canonicalize_path "${HOME:?HOME is required}")")"
     printf 'profile_name\t%s\n' "$(manifest_escape "$(basename "$PROFILE_FILE")")"
     printf 'config_digest\t%s\n' "$(profile_digest)"
     printf 'previous_snapshot\t%s\n' "$(manifest_escape "${previous_snapshot:-none}")"
@@ -1247,7 +1307,10 @@ self_verify_snapshot() {
   local rest
 
   [[ -s "$manifest" ]] || return 1
-  [[ "$(manifest_value "$manifest" schema_version)" == "1" ]] || return 1
+  case "$(manifest_value "$manifest" schema_version)" in
+    1|2) ;;
+    *) return 1 ;;
+  esac
   [[ "$(manifest_value "$manifest" snapshot)" == "$expected_name" ]] || return 1
   [[ "$(manifest_value "$manifest" status)" == success* ]] || return 1
   while IFS=$'\t' read -r key value rest; do
@@ -1308,7 +1371,11 @@ show_plan() {
   printf '\nInclude entries:\n'
   printf '  - %s\n' "${INCLUDE_RULES[@]}"
   printf '\nExclude files:\n'
-  printf '  - %s\n' "${EXCLUDE_FILES[@]}"
+  if [[ "${#EXCLUDE_FILES[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+  else
+    printf '  - %s\n' "${EXCLUDE_FILES[@]}"
+  fi
   printf '\nApplied excludes:\n'
   if [[ "${#EXCLUDE_RULES[@]}" -eq 0 ]]; then
     printf '  - none\n'
@@ -1394,7 +1461,7 @@ run_backup() {
   local payload_bytes
   local ended_at
 
-  require_commands rsync find du df date mkdir mktemp readlink sort wc awk sed dirname cut tr \
+  require_commands rsync find du df date mkdir mktemp readlink sort wc awk sed dirname cut tr id \
     sha256sum shuf flock hostname mv rm cp tee
   ensure_dest_access "check"
   load_backup_selection
@@ -1563,7 +1630,10 @@ verify_snapshot() {
       fi
     done
   else
-    [[ "$(manifest_value "$manifest" schema_version)" == "1" ]] || errors=$((errors + 1))
+    case "$(manifest_value "$manifest" schema_version)" in
+      1|2) ;;
+      *) errors=$((errors + 1)) ;;
+    esac
     [[ "$(manifest_value "$manifest" snapshot)" == "$snapshot" ]] || errors=$((errors + 1))
     status="$(manifest_value "$manifest" status)"
     [[ "$status" == success* ]] || errors=$((errors + 1))
@@ -1761,6 +1831,1144 @@ drill_snapshot() {
   printf 'Restore drill succeeded for %s.\n' "$RESTORE_PATH"
 }
 
+array_contains() {
+  local wanted="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+validate_component_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid recovery component ID: $1"
+}
+
+register_restore_handler() {
+  local name="$1"
+  local command_path="$2"
+  local index
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid restore handler name: $name"
+  [[ "$command_path" == /* ]] || die "Restore handler must be absolute: $command_path"
+  [[ -x "$command_path" ]] || die "Restore handler is not executable: $command_path"
+  for index in "${!RESTORE_HANDLER_NAMES[@]}"; do
+    [[ "${RESTORE_HANDLER_NAMES[$index]}" != "$name" ]] \
+      || die "Duplicate restore handler: $name"
+  done
+  RESTORE_HANDLER_NAMES+=("$name")
+  RESTORE_HANDLER_COMMANDS+=("$command_path")
+}
+
+parse_restore_handlers() {
+  local line
+  local name
+  local command_path
+  local extra
+  local builtin="$SCRIPT_DIR/restore-handlers/docker-recovery"
+  local has_docker=0
+
+  RESTORE_HANDLER_NAMES=()
+  RESTORE_HANDLER_COMMANDS=()
+  if [[ -f "$HANDLERS_FILE" ]]; then
+    HANDLERS_FILE="$(canonicalize_path "$HANDLERS_FILE")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(normalize_config_line "$line")"
+      [[ -n "$line" ]] || continue
+      IFS='|' read -r name command_path extra <<<"$line"
+      name="$(trim_whitespace "${name:-}")"
+      command_path="$(trim_whitespace "${command_path:-}")"
+      [[ -z "${extra:-}" && -n "$name" && -n "$command_path" ]] \
+        || die "Invalid restore handler entry: $line"
+      register_restore_handler "$name" "$(canonicalize_path "$command_path")"
+    done <"$HANDLERS_FILE"
+  elif [[ "$HANDLERS_FILE" != "$DEFAULT_HANDLERS_FILE" ]]; then
+    die "Restore handler file not found: $HANDLERS_FILE"
+  fi
+
+  for name in "${RESTORE_HANDLER_NAMES[@]}"; do
+    [[ "$name" == "docker-recovery" ]] && has_docker=1
+  done
+  if [[ "$has_docker" -eq 0 && -x "$builtin" ]]; then
+    register_restore_handler "docker-recovery" "$builtin"
+  fi
+}
+
+restore_handler_command() {
+  local wanted="$1"
+  local index
+  for index in "${!RESTORE_HANDLER_NAMES[@]}"; do
+    if [[ "${RESTORE_HANDLER_NAMES[$index]}" == "$wanted" ]]; then
+      printf '%s\n' "${RESTORE_HANDLER_COMMANDS[$index]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+reset_recovery_components() {
+  COMPONENT_IDS=()
+  COMPONENT_LABELS=()
+  COMPONENT_KINDS=()
+  COMPONENT_CAPABILITIES=()
+  COMPONENT_RISKS=()
+  COMPONENT_RECOMMENDED=()
+  COMPONENT_HANDLERS=()
+  COMPONENT_SOURCE_PATHS=()
+  COMPONENT_DEPENDENCIES=()
+  COMPONENT_INDEX=()
+}
+
+add_recovery_component() {
+  local id="$1"
+  local label="$2"
+  local kind="$3"
+  local capability="$4"
+  local risk="$5"
+  local recommended="$6"
+  local handler="${7:-}"
+  local source_path="${8:-}"
+  local dependencies="${9:-}"
+  local index
+
+  validate_component_id "$id"
+  [[ -z "${COMPONENT_INDEX[$id]+x}" ]] || die "Duplicate recovery component ID: $id"
+  case "$capability" in automatic|guided|files-only) ;; *) die "Invalid component capability: $capability" ;; esac
+  case "$risk" in safe|privileged|destructive|manual) ;; *) die "Invalid component risk: $risk" ;; esac
+  case "$recommended" in recommended|optional) ;; *) die "Invalid component recommendation: $recommended" ;; esac
+  reject_control_characters "$label" "Component label"
+  [[ -z "$source_path" || "$source_path" == /* ]] || die "Component source path must be absolute: $source_path"
+
+  index="${#COMPONENT_IDS[@]}"
+  COMPONENT_INDEX["$id"]="$index"
+  COMPONENT_IDS+=("$id")
+  COMPONENT_LABELS+=("$label")
+  COMPONENT_KINDS+=("$kind")
+  COMPONENT_CAPABILITIES+=("$capability")
+  COMPONENT_RISKS+=("$risk")
+  COMPONENT_RECOMMENDED+=("$recommended")
+  COMPONENT_HANDLERS+=("$handler")
+  COMPONENT_SOURCE_PATHS+=("${source_path%/}")
+  COMPONENT_DEPENDENCIES+=("$dependencies")
+}
+
+set_component_source_path() {
+  local id="$1"
+  local path="$2"
+  local index="${COMPONENT_INDEX[$id]:-}"
+  [[ -n "$index" ]] || die "Handler referenced an unknown component: $id"
+  [[ "$path" == /* ]] || die "Handler component path must be absolute: $path"
+  COMPONENT_SOURCE_PATHS[index]="${path%/}"
+}
+
+add_component_dependency() {
+  local id="$1"
+  local dependency="$2"
+  local index="${COMPONENT_INDEX[$id]:-}"
+  [[ -n "$index" ]] || die "Handler referenced an unknown component: $id"
+  validate_component_id "$dependency"
+  if [[ -n "${COMPONENT_DEPENDENCIES[$index]}" ]]; then
+    COMPONENT_DEPENDENCIES[index]+=",$dependency"
+  else
+    COMPONENT_DEPENDENCIES[index]="$dependency"
+  fi
+}
+
+infer_source_home_from_snapshot() {
+  local inferred=""
+  if [[ -s "$RECOVERY_MANIFEST" ]]; then
+    inferred="$(awk -F '\t' '$1 == "root" && $2 ~ /^\/home\/[A-Za-z0-9._-]+(\/|$)/ {split($2, p, "/"); print "/home/" p[3]; exit}' "$RECOVERY_MANIFEST")"
+  elif [[ -d "$RECOVERY_SNAPSHOT_DIR/home" ]]; then
+    inferred="$(find "$RECOVERY_SNAPSHOT_DIR/home" -mindepth 1 -maxdepth 1 -type d -printf '/home/%f\n' | sort | head -n 1)"
+  fi
+  printf '%s\n' "${inferred:-${HOME:-/home/unknown}}"
+}
+
+validate_path_mappings() {
+  local mapping
+  local source
+  local target
+  local -a normalized=()
+  for mapping in "${PATH_MAPPINGS[@]}"; do
+    [[ "$mapping" == *=* ]] || die "--map-path must be SOURCE=TARGET: $mapping"
+    source="${mapping%%=*}"
+    target="${mapping#*=}"
+    [[ "$source" == /* && "$target" == /* ]] || die "Mapped paths must be absolute: $mapping"
+    source="$(canonicalize_path "$source")"
+    target="$(canonicalize_path "$target")"
+    [[ "$source" != "/" && "$target" != "/" ]] || die "Mapping / is not allowed: $mapping"
+    reject_control_characters "$source" "Mapped source"
+    reject_control_characters "$target" "Mapped target"
+    normalized+=("$source=$target")
+  done
+  PATH_MAPPINGS=("${normalized[@]}")
+}
+
+map_recovery_target_path() {
+  local source_path="$1"
+  local mapping
+  local source
+  local target
+  for mapping in "${PATH_MAPPINGS[@]}"; do
+    source="${mapping%%=*}"
+    target="${mapping#*=}"
+    if [[ "$source_path" == "$source" ]]; then
+      printf '%s\n' "$target"
+      return 0
+    fi
+    if [[ "$source_path" == "$source"/* ]]; then
+      printf '%s\n' "$target/${source_path#"$source"/}"
+      return 0
+    fi
+  done
+  if [[ "$source_path" == "$RECOVERY_SOURCE_HOME" ]]; then
+    printf '%s\n' "$TARGET_HOME"
+  elif [[ "$source_path" == "$RECOVERY_SOURCE_HOME"/* ]]; then
+    printf '%s\n' "$TARGET_HOME/${source_path#"$RECOVERY_SOURCE_HOME"/}"
+  fi
+}
+
+load_recovery_snapshot_context() {
+  local snapshot
+  local passwd_entry=""
+  local owner_path
+  local source_owner=""
+  local failed_log
+
+  snapshot="$(resolve_snapshot_name)"
+  RECOVERY_SNAPSHOT_DIR="$(snapshot_path_for "$snapshot")"
+  [[ -d "$RECOVERY_SNAPSHOT_DIR" ]] || die "Snapshot not found: $RECOVERY_SNAPSHOT_DIR"
+  SNAPSHOT_NAME="$snapshot"
+  RECOVERY_MANIFEST="$RECOVERY_SNAPSHOT_DIR/.backup-home/manifest.tsv"
+  RECOVERY_BLOCKERS=()
+  RECOVERY_WARNINGS=()
+
+  if [[ -s "$RECOVERY_MANIFEST" ]]; then
+    RECOVERY_SCHEMA="$(manifest_value "$RECOVERY_MANIFEST" schema_version)"
+  else
+    RECOVERY_SCHEMA="legacy"
+  fi
+
+  RECOVERY_SOURCE_HOME="$(manifest_value "$RECOVERY_MANIFEST" source_home 2>/dev/null || true)"
+  [[ -n "$RECOVERY_SOURCE_HOME" ]] || RECOVERY_SOURCE_HOME="$(infer_source_home_from_snapshot)"
+  RECOVERY_SOURCE_USER="$(manifest_value "$RECOVERY_MANIFEST" source_user 2>/dev/null || true)"
+  [[ -n "$RECOVERY_SOURCE_USER" ]] || RECOVERY_SOURCE_USER="$(basename "$RECOVERY_SOURCE_HOME")"
+  RECOVERY_SOURCE_UID="$(manifest_value "$RECOVERY_MANIFEST" source_uid 2>/dev/null || true)"
+  RECOVERY_SOURCE_GID="$(manifest_value "$RECOVERY_MANIFEST" source_gid 2>/dev/null || true)"
+  owner_path="$RECOVERY_SNAPSHOT_DIR$RECOVERY_SOURCE_HOME"
+  if [[ -e "$owner_path" ]]; then
+    source_owner="$(stat -c '%u:%g' "$owner_path" 2>/dev/null || true)"
+  fi
+  [[ -n "$RECOVERY_SOURCE_UID" ]] || RECOVERY_SOURCE_UID="${source_owner%%:*}"
+  [[ -n "$RECOVERY_SOURCE_GID" ]] || RECOVERY_SOURCE_GID="${source_owner#*:}"
+  [[ "$RECOVERY_SCHEMA" == "2" ]] \
+    || RECOVERY_WARNINGS+=("Source identity was inferred because the snapshot has no manifest v2 identity fields")
+
+  [[ -n "$TARGET_USER" ]] || TARGET_USER="$(id -un)"
+  passwd_entry="$(getent passwd "$TARGET_USER" || true)"
+  if [[ -n "$passwd_entry" ]]; then
+    IFS=':' read -r _ _ RECOVERY_TARGET_UID RECOVERY_TARGET_GID _ passwd_home _ <<<"$passwd_entry"
+    [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$passwd_home"
+  else
+    RECOVERY_TARGET_UID=""
+    RECOVERY_TARGET_GID=""
+    RECOVERY_BLOCKERS+=("Target user does not exist: $TARGET_USER")
+    [[ -n "$TARGET_HOME" ]] || TARGET_HOME="/home/$TARGET_USER"
+  fi
+  [[ "$TARGET_HOME" == /* ]] || die "Target home must be absolute: $TARGET_HOME"
+  TARGET_HOME="$(canonicalize_path "$TARGET_HOME")"
+  [[ "$TARGET_HOME" != "/" ]] || die "Target home / is not allowed"
+
+  validate_path_mappings
+  if [[ -z "$STAGING_DIR" ]]; then
+    STAGING_DIR="$TARGET_HOME/.backup-home-restore/${RECOVERY_SESSION_ID:-plan-$SNAPSHOT_NAME}"
+  fi
+  [[ "$STAGING_DIR" == /* ]] || die "Staging directory must be absolute: $STAGING_DIR"
+  STAGING_DIR="$(canonicalize_path "$STAGING_DIR")"
+  [[ "$STAGING_DIR" != "/" && "$STAGING_DIR" != "$TARGET_HOME" ]] \
+    || die "Unsafe staging directory: $STAGING_DIR"
+  case "$STAGING_DIR" in
+    "$DEST_ROOT_REAL"|"$DEST_ROOT_REAL"/*) die "Staging directory must not be inside the backup destination" ;;
+  esac
+
+  if [[ "$RECOVERY_SCHEMA" == "legacy" ]]; then
+    RECOVERY_WARNINGS+=("Legacy snapshot has no manifest or recorded artifact checksums")
+    while IFS= read -r failed_log; do
+      if grep -q '^status=failed$' "$failed_log" 2>/dev/null; then
+        RECOVERY_BLOCKERS+=("A matching failed backup log exists: $failed_log")
+      fi
+    done < <(find "$(logs_root_dir)" -maxdepth 1 -type f \
+      \( -name "backup-home-$SNAPSHOT_NAME.log" -o -name "backup-home-$SNAPSHOT_NAME.failure.tsv" \) \
+      -print 2>/dev/null || true)
+    [[ "$ALLOW_LEGACY" -eq 1 ]] || RECOVERY_BLOCKERS+=("Guided recovery of a legacy snapshot requires --allow-legacy")
+  fi
+}
+
+validate_recovery_snapshot() {
+  local key
+  local value
+  local rest
+  local name
+  local mode
+  local status
+  local expected_count
+  local actual_count
+
+  [[ "$RECOVERY_SCHEMA" != "legacy" ]] || return 0
+  case "$RECOVERY_SCHEMA" in
+    1|2) ;;
+    *) RECOVERY_BLOCKERS+=("Unsupported manifest schema: $RECOVERY_SCHEMA"); return 0 ;;
+  esac
+  [[ "$(manifest_value "$RECOVERY_MANIFEST" snapshot)" == "$SNAPSHOT_NAME" ]] \
+    || RECOVERY_BLOCKERS+=("Manifest snapshot name does not match the selected directory")
+  status="$(manifest_value "$RECOVERY_MANIFEST" status)"
+  [[ "$status" == success* ]] || RECOVERY_BLOCKERS+=("Snapshot status is not successful: $status")
+  [[ "$status" != "success-with-warnings" ]] \
+    || RECOVERY_WARNINGS+=("The snapshot completed with collector or backup warnings")
+
+  while IFS=$'\t' read -r key value rest; do
+    case "$key" in
+      root)
+        [[ -e "$RECOVERY_SNAPSHOT_DIR$value" || -L "$RECOVERY_SNAPSHOT_DIR$value" ]] \
+          || RECOVERY_BLOCKERS+=("Snapshot root is missing: $value")
+        ;;
+      collector)
+        name="$value"
+        mode="${rest%%$'\t'*}"
+        rest="${rest#*$'\t'}"
+        status="${rest%%$'\t'*}"
+        if [[ "$mode" == "required" && "$status" != "success" && "$status" != "warning" ]]; then
+          RECOVERY_BLOCKERS+=("Required collector is not usable: $name ($status)")
+        fi
+        [[ -d "$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/$name" ]] \
+          || RECOVERY_BLOCKERS+=("Collector artifacts are missing: $name")
+        ;;
+      warning)
+        RECOVERY_WARNINGS+=("Snapshot warning: $value")
+        ;;
+    esac
+  done <"$RECOVERY_MANIFEST"
+
+  expected_count="$(manifest_value "$RECOVERY_MANIFEST" file_count)"
+  actual_count="$(find "$RECOVERY_SNAPSHOT_DIR" -type f | wc -l | awk '{print $1}')"
+  [[ "$expected_count" == "$actual_count" ]] \
+    || RECOVERY_BLOCKERS+=("Snapshot file count mismatch: expected=$expected_count actual=$actual_count")
+
+  if [[ "$SKIP_DEEP_VERIFY" -eq 1 ]]; then
+    RECOVERY_WARNINGS+=("Deep verification was skipped by request")
+  elif [[ ! -s "$RECOVERY_SNAPSHOT_DIR/.backup-home/checksums.sha256" ]]; then
+    RECOVERY_BLOCKERS+=("Recorded checksum set is missing")
+  elif ! (cd "$RECOVERY_SNAPSHOT_DIR" && sha256sum -c --strict --quiet .backup-home/checksums.sha256); then
+    RECOVERY_BLOCKERS+=("Recorded artifact or payload checksum verification failed")
+  fi
+}
+
+invoke_restore_handler() {
+  local handler="$1"
+  local action="$2"
+  local component="${3:-}"
+  local command_path
+  local destructive_approved=0
+  command_path="$(restore_handler_command "$handler")" || return 127
+  if [[ -n "$component" ]] && array_contains "$component" "${APPROVED_DESTRUCTIVE[@]}"; then
+    destructive_approved=1
+  fi
+  BACKUP_HOME_RESTORE_ACTION="$action" \
+  BACKUP_HOME_SNAPSHOT_DIR="$RECOVERY_SNAPSHOT_DIR" \
+  BACKUP_HOME_ARTIFACT_DIR="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/$handler" \
+  BACKUP_HOME_RESTORE_STAGING_DIR="$STAGING_DIR" \
+  BACKUP_HOME_RESTORE_SESSION_DIR="$RECOVERY_SESSION_DIR" \
+  BACKUP_HOME_SOURCE_HOME="$RECOVERY_SOURCE_HOME" \
+  BACKUP_HOME_TARGET_USER="$TARGET_USER" \
+  BACKUP_HOME_TARGET_UID="$RECOVERY_TARGET_UID" \
+  BACKUP_HOME_TARGET_GID="$RECOVERY_TARGET_GID" \
+  BACKUP_HOME_TARGET_HOME="$TARGET_HOME" \
+  BACKUP_HOME_RESTORE_DRY_RUN="$DRY_RUN" \
+  BACKUP_HOME_RESTORE_ASSUME_YES="$ASSUME_YES" \
+  BACKUP_HOME_DESTRUCTIVE_APPROVED="$destructive_approved" \
+    "$command_path" "$action" ${component:+"$component"}
+}
+
+discover_handler_components() {
+  local handler="$1"
+  local output
+  local rc
+  local record
+  local id
+  local label
+  local capability
+  local risk
+  local recommended
+  local extra
+  local before_count="${#COMPONENT_IDS[@]}"
+
+  if output="$(invoke_restore_handler "$handler" describe)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    RECOVERY_WARNINGS+=("Restore handler describe failed: $handler (rc=$rc)")
+    return 1
+  fi
+  while IFS=$'\t' read -r record id label capability risk recommended extra; do
+    [[ -n "$record" ]] || continue
+    case "$record" in
+      component)
+        [[ -z "${extra:-}" && -n "$id" && -n "$label" && -n "$capability" && -n "$risk" && -n "$recommended" ]] \
+          || die "Invalid component record from handler $handler"
+        add_recovery_component "$id" "$label" handler "$capability" "$risk" "$recommended" "$handler"
+        ;;
+      path)
+        [[ -n "$id" && -n "$label" && -z "${capability:-}${risk:-}${recommended:-}${extra:-}" ]] \
+          || die "Invalid path record from handler $handler"
+        set_component_source_path "$id" "$label"
+        ;;
+      dependency)
+        [[ -n "$id" && -n "$label" && -z "${capability:-}${risk:-}${recommended:-}${extra:-}" ]] \
+          || die "Invalid dependency record from handler $handler"
+        add_component_dependency "$id" "$label"
+        ;;
+      *) die "Unknown record from restore handler $handler: $record" ;;
+    esac
+  done <<<"$output"
+  [[ "${#COMPONENT_IDS[@]}" -gt "$before_count" ]]
+}
+
+discover_recovery_components() {
+  local root
+  local collector
+  local handler
+  local id
+  local index=0
+  local -a collectors=()
+
+  reset_recovery_components
+  if [[ "$RECOVERY_SCHEMA" == "legacy" ]]; then
+    root="$RECOVERY_SOURCE_HOME"
+    if [[ -e "$RECOVERY_SNAPSHOT_DIR$root" || -L "$RECOVERY_SNAPSHOT_DIR$root" ]]; then
+      add_recovery_component "files.1" "$root" filesystem automatic safe recommended "" "$root"
+    else
+      RECOVERY_BLOCKERS+=("Could not infer a restorable home root from the legacy snapshot")
+    fi
+    return 0
+  fi
+
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    index=$((index + 1))
+    add_recovery_component "files.$index" "$root" filesystem automatic safe recommended "" "$root"
+  done < <(awk -F '\t' '$1 == "root" {print $2}' "$RECOVERY_MANIFEST")
+
+  mapfile -t collectors < <(awk -F '\t' '$1 == "collector" {print $2}' "$RECOVERY_MANIFEST")
+  for collector in "${collectors[@]}"; do
+    if [[ "$collector" == "system-inventory" ]]; then
+      add_recovery_component "system.inventory" "System inventory and rebuild guidance" \
+        system-inventory guided manual recommended "$collector"
+      continue
+    fi
+    handler="$(restore_handler_command "$collector" || true)"
+    if [[ -n "$handler" ]] && discover_handler_components "$collector"; then
+      continue
+    fi
+    id="collector.$(sanitize_name "$collector").artifacts"
+    add_recovery_component "$id" "$collector recovery artifacts" fallback files-only manual optional "$collector"
+  done
+}
+
+preflight_recovery_components() {
+  local index
+  local id
+  local kind
+  local handler
+  local source_path
+  local target_path
+  local output
+  local rc
+  local level
+  local message
+  local extra
+
+  RECOVERY_PREFLIGHT_LINES=()
+  for index in "${!COMPONENT_IDS[@]}"; do
+    id="${COMPONENT_IDS[$index]}"
+    kind="${COMPONENT_KINDS[$index]}"
+    handler="${COMPONENT_HANDLERS[$index]}"
+    source_path="${COMPONENT_SOURCE_PATHS[$index]}"
+    if [[ -n "$source_path" ]]; then
+      if [[ ! -e "$RECOVERY_SNAPSHOT_DIR$source_path" && ! -L "$RECOVERY_SNAPSHOT_DIR$source_path" ]]; then
+        RECOVERY_BLOCKERS+=("Component $id source is missing: $source_path")
+      else
+        target_path="$(map_recovery_target_path "$source_path")"
+        if [[ -z "$target_path" ]]; then
+          RECOVERY_WARNINGS+=("Component $id has no final path mapping and will remain in staging")
+        elif [[ -e "$target_path" || -L "$target_path" ]]; then
+          RECOVERY_WARNINGS+=("Component $id has an existing target that requires conflict review: $target_path")
+        fi
+      fi
+    fi
+    [[ "$kind" == "handler" ]] || continue
+    if output="$(invoke_restore_handler "$handler" preflight "$id")"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      RECOVERY_BLOCKERS+=("Handler preflight failed for $id (rc=$rc)")
+      continue
+    fi
+    while IFS=$'\t' read -r level message extra; do
+      [[ -n "$level" ]] || continue
+      case "$level" in
+        ok) RECOVERY_PREFLIGHT_LINES+=("$id|OK|$message") ;;
+        warning) RECOVERY_WARNINGS+=("$id: $message") ;;
+        blocker) RECOVERY_BLOCKERS+=("$id: $message") ;;
+        risk)
+          case "$message" in safe|privileged|destructive|manual) COMPONENT_RISKS[index]="$message" ;; *) die "Invalid dynamic risk from handler $handler: $message" ;; esac
+          ;;
+        *) die "Invalid preflight record from handler $handler: $level" ;;
+      esac
+      [[ -z "${extra:-}" ]] || die "Invalid preflight record from handler $handler"
+    done <<<"$output"
+  done
+}
+
+existing_ancestor() {
+  local path="$1"
+  while [[ ! -e "$path" && "$path" != "/" ]]; do path="$(dirname "$path")"; done
+  printf '%s\n' "$path"
+}
+
+print_recovery_plan() {
+  local index
+  local entry
+  local payload_bytes="unknown"
+  local free_bytes
+  local stage_anchor
+
+  [[ "$RECOVERY_SCHEMA" == "legacy" ]] \
+    || payload_bytes="$(manifest_value "$RECOVERY_MANIFEST" payload_bytes)"
+  stage_anchor="$(existing_ancestor "$STAGING_DIR")"
+  free_bytes="$(df -B1 --output=avail "$stage_anchor" | awk 'NR==2 {print $1}')"
+
+  print_heading "Recovery plan"
+  print_label_value "Snapshot:" "$SNAPSHOT_NAME"
+  print_label_value "Manifest schema:" "$RECOVERY_SCHEMA"
+  print_label_value "Source identity:" "$RECOVERY_SOURCE_USER uid=$RECOVERY_SOURCE_UID gid=$RECOVERY_SOURCE_GID home=$RECOVERY_SOURCE_HOME"
+  print_label_value "Target identity:" "$TARGET_USER uid=${RECOVERY_TARGET_UID:-missing} gid=${RECOVERY_TARGET_GID:-missing} home=$TARGET_HOME"
+  print_label_value "Staging directory:" "$STAGING_DIR"
+  if [[ "$payload_bytes" == "unknown" ]]; then
+    print_label_value "Snapshot payload:" "unknown (legacy)"
+  else
+    print_label_value "Snapshot payload:" "$(format_bytes_human "$payload_bytes")"
+  fi
+  print_label_value "Available staging space:" "$(format_bytes_human "$free_bytes")"
+
+  printf '\nComponents:\n'
+  for index in "${!COMPONENT_IDS[@]}"; do
+    printf '  - %s | %s | %s | %s | %s\n' \
+      "${COMPONENT_IDS[$index]}" "${COMPONENT_CAPABILITIES[$index]}" \
+      "${COMPONENT_RISKS[$index]}" "${COMPONENT_RECOMMENDED[$index]}" \
+      "${COMPONENT_LABELS[$index]}"
+  done
+
+  printf '\nPreflight:\n'
+  if [[ "${#RECOVERY_PREFLIGHT_LINES[@]}" -eq 0 ]]; then
+    printf '  - no handler-specific checks\n'
+  else
+    for entry in "${RECOVERY_PREFLIGHT_LINES[@]}"; do
+      IFS='|' read -r id level message <<<"$entry"
+      printf '  - %s %s: %s\n' "$level" "$id" "$message"
+    done
+  fi
+
+  printf '\nWarnings:\n'
+  if [[ "${#RECOVERY_WARNINGS[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+  else
+    printf '  - %s\n' "${RECOVERY_WARNINGS[@]}"
+  fi
+  printf '\nBlockers:\n'
+  if [[ "${#RECOVERY_BLOCKERS[@]}" -eq 0 ]]; then
+    printf '  - none\n'
+  else
+    printf '  - %s\n' "${RECOVERY_BLOCKERS[@]}"
+  fi
+}
+
+prepare_recovery_plan() {
+  require_commands rsync find du df date mkdir readlink sort awk sed dirname cut tr \
+    sha256sum flock hostname id getent stat grep
+  ensure_dest_access "check"
+  acquire_lock "shared"
+  parse_restore_handlers
+  load_recovery_snapshot_context
+  validate_recovery_snapshot
+  discover_recovery_components
+  preflight_recovery_components
+}
+
+restore_plan() {
+  prepare_recovery_plan
+  print_recovery_plan
+  if [[ "${#RECOVERY_BLOCKERS[@]}" -gt 0 ]]; then
+    printf '\nRecovery plan is blocked by %s problem(s).\n' "${#RECOVERY_BLOCKERS[@]}"
+    return 1
+  fi
+  printf '\nRecovery plan is ready. Run recover with the same target options.\n'
+}
+
+recovery_session_base() {
+  printf '%s\n' "${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/backup-home/recovery"
+}
+
+validate_session_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid recovery session ID: $1"
+}
+
+recovery_state_file() {
+  printf '%s\n' "$RECOVERY_SESSION_DIR/state.tsv"
+}
+
+recovery_state_value() {
+  local key="$1"
+  awk -F '\t' -v wanted="$key" '$1 == wanted {print $2; exit}' "$(recovery_state_file)"
+}
+
+recovery_component_status() {
+  local id="$1"
+  awk -F '\t' -v wanted="$id" '$1 == "component" && $2 == wanted {status=$3} END {print status}' \
+    "$(recovery_state_file)"
+}
+
+record_recovery_status() {
+  local id="$1"
+  local status="$2"
+  local message="${3:-}"
+  printf 'component\t%s\t%s\t%s\t%s\n' "$id" "$status" "$(iso_now)" \
+    "$(manifest_escape "$message")" >>"$(recovery_state_file)"
+}
+
+load_recovery_session() {
+  local base
+  local state
+  local recorded_dest
+  local mapping
+
+  validate_session_id "$RESUME_SESSION"
+  base="$(recovery_session_base)"
+  RECOVERY_SESSION_ID="$RESUME_SESSION"
+  RECOVERY_SESSION_DIR="$base/$RECOVERY_SESSION_ID"
+  state="$(recovery_state_file)"
+  [[ -s "$state" ]] || die "Recovery session not found: $RECOVERY_SESSION_ID"
+  [[ "$(recovery_state_value schema_version)" == "1" ]] || die "Unsupported recovery session schema"
+
+  recorded_dest="$(recovery_state_value destination)"
+  if [[ -n "$DEST_ROOT" ]]; then
+    [[ "$(canonicalize_path "$DEST_ROOT")" == "$recorded_dest" ]] \
+      || die "--dest does not match the recovery session destination"
+  else
+    DEST_ROOT="$recorded_dest"
+  fi
+  SNAPSHOT_NAME="$(recovery_state_value snapshot)"
+  TARGET_USER="$(recovery_state_value target_user)"
+  TARGET_HOME="$(recovery_state_value target_home)"
+  STAGING_DIR="$(recovery_state_value staging_dir)"
+  mapfile -t SELECTED_COMPONENTS < <(awk -F '\t' '$1 == "selected" {print $2}' "$state")
+  PATH_MAPPINGS=()
+  while IFS= read -r mapping; do [[ -n "$mapping" ]] && PATH_MAPPINGS+=("$mapping"); done \
+    < <(awk -F '\t' '$1 == "mapping" {print $2}' "$state")
+}
+
+create_recovery_session() {
+  local base
+  local mapping
+  local id
+
+  base="$(recovery_session_base)"
+  mkdir -p -- "$base"
+  chmod 700 -- "$base"
+  RECOVERY_SESSION_DIR="$base/$RECOVERY_SESSION_ID"
+  [[ ! -e "$RECOVERY_SESSION_DIR" ]] || die "Recovery session already exists: $RECOVERY_SESSION_ID"
+  mkdir -p -- "$RECOVERY_SESSION_DIR/logs" "$RECOVERY_SESSION_DIR/commands"
+  chmod 700 -- "$RECOVERY_SESSION_DIR" "$RECOVERY_SESSION_DIR/logs" "$RECOVERY_SESSION_DIR/commands"
+  {
+    printf 'schema_version\t1\n'
+    printf 'session\t%s\n' "$RECOVERY_SESSION_ID"
+    printf 'created_at\t%s\n' "$(iso_now)"
+    printf 'destination\t%s\n' "$DEST_ROOT_REAL"
+    printf 'snapshot\t%s\n' "$SNAPSHOT_NAME"
+    printf 'target_user\t%s\n' "$TARGET_USER"
+    printf 'target_home\t%s\n' "$TARGET_HOME"
+    printf 'staging_dir\t%s\n' "$STAGING_DIR"
+    for mapping in "${PATH_MAPPINGS[@]}"; do printf 'mapping\t%s\n' "$mapping"; done
+    for id in "${SELECTED_COMPONENTS[@]}"; do printf 'selected\t%s\n' "$id"; done
+  } >"$(recovery_state_file)"
+  chmod 600 -- "$(recovery_state_file)"
+  : >"$RECOVERY_SESSION_DIR/manual-steps.md"
+  chmod 600 -- "$RECOVERY_SESSION_DIR/manual-steps.md"
+}
+
+select_recovery_components() {
+  local index
+  local id
+  local reply
+  local -a selected=()
+
+  if [[ "${#SELECTED_COMPONENTS[@]}" -gt 0 ]]; then
+    for id in "${SELECTED_COMPONENTS[@]}"; do
+      [[ -n "${COMPONENT_INDEX[$id]+x}" ]] || die "Unknown recovery component: $id"
+      array_contains "$id" "${selected[@]}" || selected+=("$id")
+    done
+    SELECTED_COMPONENTS=("${selected[@]}")
+    return 0
+  fi
+  if [[ "$RECOVERY_ALL" -eq 1 ]]; then
+    SELECTED_COMPONENTS=("${COMPONENT_IDS[@]}")
+    return 0
+  fi
+  [[ -t 0 ]] || die "Non-interactive recovery requires --component or --all"
+
+  printf '\nSelect recovery components:\n'
+  for index in "${!COMPONENT_IDS[@]}"; do
+    id="${COMPONENT_IDS[$index]}"
+    if [[ "${COMPONENT_RECOMMENDED[$index]}" == "recommended" ]]; then
+      printf 'Restore %s (%s) [Y/n]: ' "${COMPONENT_LABELS[$index]}" "$id"
+      read -r reply
+      case "$reply" in n|N|no|NO) ;; *) selected+=("$id") ;; esac
+    else
+      printf 'Restore %s (%s) [y/N]: ' "${COMPONENT_LABELS[$index]}" "$id"
+      read -r reply
+      case "$reply" in y|Y|yes|YES) selected+=("$id") ;; esac
+    fi
+  done
+  [[ "${#selected[@]}" -gt 0 ]] || die "No recovery components were selected"
+  SELECTED_COMPONENTS=("${selected[@]}")
+}
+
+approve_recovery_component() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local risk="${COMPONENT_RISKS[$index]}"
+  local reply
+
+  if [[ "$risk" == "destructive" ]]; then
+    if array_contains "$id" "${APPROVED_DESTRUCTIVE[@]}"; then return 0; fi
+    [[ -t 0 ]] || return 1
+    printf 'Destructive recovery for %s may replace existing state. Type the component ID to approve: ' "$id"
+    read -r reply
+    [[ "$reply" == "$id" ]] || return 1
+    APPROVED_DESTRUCTIVE+=("$id")
+    return 0
+  fi
+  [[ "$ASSUME_YES" -eq 0 ]] || return 0
+  [[ -t 0 ]] || return 1
+  printf 'Apply recovery component %s (%s) [y/N]: ' "${COMPONENT_LABELS[$index]}" "$id"
+  read -r reply
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+approve_existing_target_replace() {
+  local id="$1"
+  local target="$2"
+  local reply
+  if array_contains "$id" "${APPROVED_DESTRUCTIVE[@]}"; then return 0; fi
+  [[ -t 0 ]] || return 1
+  printf 'Target differs: %s. Type the component ID to preserve it and replace from backup: ' "$target"
+  read -r reply
+  [[ "$reply" == "$id" ]] || return 1
+  APPROVED_DESTRUCTIVE+=("$id")
+}
+
+print_shell_command() {
+  printf '  command:'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+run_target_command() {
+  if [[ -n "$RECOVERY_TARGET_UID" && "$RECOVERY_TARGET_UID" != "$(id -u)" ]]; then
+    require_commands sudo
+    print_shell_command sudo "$@"
+    sudo "$@"
+  else
+    print_shell_command "$@"
+    "$@"
+  fi
+}
+
+stage_recovery_component() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local source_path="${COMPONENT_SOURCE_PATHS[$index]}"
+  local snapshot_source="$RECOVERY_SNAPSHOT_DIR$source_path"
+  local stage_payload="$STAGING_DIR/payload"
+  local staged_source="$stage_payload$source_path"
+  local comparison
+  local rc
+
+  [[ -n "$source_path" ]] || return 0
+  [[ -e "$snapshot_source" || -L "$snapshot_source" ]] || return 1
+  mkdir -p -- "$stage_payload"
+  rsync --archive --hard-links --relative "$RECOVERY_SNAPSHOT_DIR/./${source_path#/}" "$stage_payload/"
+  if [[ -d "$snapshot_source" && ! -L "$snapshot_source" ]]; then
+    if comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes \
+      "$snapshot_source/" "$staged_source/")"; then rc=0; else rc=$?; fi
+  else
+    if comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes \
+      "$snapshot_source" "$staged_source")"; then rc=0; else rc=$?; fi
+  fi
+  [[ "$rc" -eq 0 && -z "$comparison" ]] || return 1
+  record_recovery_status "$id" staged "$staged_source"
+}
+
+target_differs_from_stage() {
+  local staged_source="$1"
+  local target="$2"
+  local comparison
+  local rc
+  [[ -e "$target" || -L "$target" ]] || return 1
+  if [[ -d "$staged_source" && ! -L "$staged_source" && -d "$target" && ! -L "$target" ]]; then
+    if comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes \
+      "$staged_source/" "$target/")"; then rc=0; else rc=$?; fi
+  else
+    if comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes \
+      "$staged_source" "$target")"; then rc=0; else rc=$?; fi
+  fi
+  [[ "$rc" -eq 0 ]] || return 0
+  [[ -n "$comparison" ]]
+}
+
+preserve_existing_target() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local target="$2"
+  local safety_root="$RECOVERY_SESSION_DIR/pre-restore/$id"
+  local current_uid
+  local current_gid
+  current_uid="$(id -u)"
+  current_gid="$(id -g)"
+
+  mkdir -p -- "$safety_root"
+  if [[ -n "$RECOVERY_TARGET_UID" && "$RECOVERY_TARGET_UID" != "$current_uid" ]]; then
+    require_commands sudo
+    print_shell_command sudo rsync --archive --hard-links --relative "$target" "$safety_root/"
+    sudo rsync --archive --hard-links --relative "$target" "$safety_root/"
+    sudo chown -hR -- "$current_uid:$current_gid" "$safety_root"
+  else
+    rsync --archive --hard-links --relative "$target" "$safety_root/"
+  fi
+  [[ -e "$safety_root$target" || -L "$safety_root$target" ]] \
+    || die "Could not preserve existing target for $id"
+}
+
+verify_merged_component() {
+  local staged_source="$1"
+  local target="$2"
+  local comparison
+  local rc
+  if [[ -d "$staged_source" && ! -L "$staged_source" ]]; then
+    if comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes \
+      "$staged_source/" "$target/")"; then rc=0; else rc=$?; fi
+  else
+    if comparison="$(rsync --archive --hard-links --checksum --dry-run --itemize-changes \
+      "$staged_source" "$target")"; then rc=0; else rc=$?; fi
+  fi
+  [[ "$rc" -eq 0 && -z "$comparison" ]]
+}
+
+merge_staged_component() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local source_path="${COMPONENT_SOURCE_PATHS[$index]}"
+  local staged_source="$STAGING_DIR/payload$source_path"
+  local target
+
+  target="$(map_recovery_target_path "$source_path")"
+  if [[ -z "$target" ]]; then
+    printf 'No final mapping for %s; staged at %s\n' "$source_path" "$staged_source"
+    return 20
+  fi
+  if [[ -e "$target" || -L "$target" ]]; then
+    if ! target_differs_from_stage "$staged_source" "$target"; then
+      printf 'Target is already identical: %s\n' "$target"
+      return 0
+    fi
+    if ! approve_existing_target_replace "$id" "$target"; then
+      printf 'Conflict left for manual review: %s\n' "$target"
+      return 20
+    fi
+    preserve_existing_target "$index" "$target"
+  fi
+
+  if [[ -d "$staged_source" && ! -L "$staged_source" ]]; then
+    run_target_command mkdir -p -- "$target"
+    run_target_command rsync --archive --hard-links "$staged_source/" "$target/"
+  else
+    run_target_command mkdir -p -- "$(dirname "$target")"
+    run_target_command rsync --archive --hard-links "$staged_source" "$target"
+  fi
+  if [[ -n "$RECOVERY_TARGET_UID" && "$RECOVERY_TARGET_UID" != "$(id -u)" ]]; then
+    require_commands sudo
+    print_shell_command sudo chown -hR -- "$RECOVERY_TARGET_UID:$RECOVERY_TARGET_GID" "$target"
+    sudo chown -hR -- "$RECOVERY_TARGET_UID:$RECOVERY_TARGET_GID" "$target"
+  fi
+  verify_merged_component "$staged_source" "$target"
+}
+
+recover_filesystem_component() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local rc
+  if ! approve_recovery_component "$index"; then
+    record_recovery_status "$id" skipped "User did not approve the component"
+    return 0
+  fi
+  if ! stage_recovery_component "$index"; then
+    record_recovery_status "$id" failed "Staging or staging verification failed"
+    return 1
+  fi
+  if merge_staged_component "$index"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0) record_recovery_status "$id" verified "Filesystem merge verified" ;;
+    20) record_recovery_status "$id" manual-pending "Staged data requires mapping or conflict resolution" ;;
+    *) record_recovery_status "$id" failed "Filesystem merge or verification failed"; return "$rc" ;;
+  esac
+}
+
+append_handler_guide() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local handler="${COMPONENT_HANDLERS[$index]}"
+  local guide
+  guide="$(invoke_restore_handler "$handler" guide "$id" || true)"
+  [[ -n "$guide" ]] || return 0
+  {
+    printf '\n## %s\n\n' "${COMPONENT_LABELS[$index]}"
+    printf '%s\n' "$guide"
+  } >>"$RECOVERY_SESSION_DIR/manual-steps.md"
+  printf '%s\n' "$guide"
+}
+
+recover_handler_component() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local handler="${COMPONENT_HANDLERS[$index]}"
+  local source_path="${COMPONENT_SOURCE_PATHS[$index]}"
+  local log_file="$RECOVERY_SESSION_DIR/logs/$id.log"
+  local rc
+
+  if ! approve_recovery_component "$index"; then
+    append_handler_guide "$index"
+    record_recovery_status "$id" manual-pending "Handler execution was not approved"
+    return 0
+  fi
+  if [[ -n "$source_path" ]]; then
+    if ! stage_recovery_component "$index"; then
+      record_recovery_status "$id" failed "Handler source staging failed"
+      return 1
+    fi
+    if merge_staged_component "$index"; then rc=0; else rc=$?; fi
+    if [[ "$rc" -ne 0 ]]; then
+      append_handler_guide "$index"
+      if [[ "$rc" -eq 20 ]]; then
+        record_recovery_status "$id" manual-pending "Handler source needs manual merge"
+        return 0
+      fi
+      record_recovery_status "$id" failed "Handler source merge failed"
+      return "$rc"
+    fi
+  fi
+
+  if invoke_restore_handler "$handler" apply "$id" 2>&1 | tee -a "$log_file"; then
+    rc=0
+  else
+    rc="${PIPESTATUS[0]}"
+  fi
+  if [[ "$rc" -eq 20 ]]; then
+    append_handler_guide "$index"
+    record_recovery_status "$id" manual-pending "Handler prepared guided manual steps"
+    return 0
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    append_handler_guide "$index"
+    record_recovery_status "$id" failed "Handler apply failed with rc=$rc"
+    return "$rc"
+  fi
+
+  if invoke_restore_handler "$handler" verify "$id" 2>&1 | tee -a "$log_file"; then
+    rc=0
+  else
+    rc="${PIPESTATUS[0]}"
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    record_recovery_status "$id" verified "Handler verification succeeded"
+  elif [[ "$rc" -eq 20 ]]; then
+    append_handler_guide "$index"
+    record_recovery_status "$id" manual-pending "Handler verification requires manual work"
+  else
+    append_handler_guide "$index"
+    record_recovery_status "$id" failed "Handler verification failed with rc=$rc"
+    return "$rc"
+  fi
+}
+
+stage_collector_artifacts() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local collector="${COMPONENT_HANDLERS[$index]}"
+  local artifact_dir="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/$collector"
+  local target="$STAGING_DIR/artifacts/$collector"
+  [[ -d "$artifact_dir" ]] || return 1
+  mkdir -p -- "$target"
+  rsync --archive --hard-links "$artifact_dir/" "$target/"
+  {
+    printf '\n## %s\n\n' "${COMPONENT_LABELS[$index]}"
+    printf 'Artifacts were staged at %s.\n' "\`$target\`"
+    if [[ -s "$target/RESTORE.md" ]]; then
+      printf '\n'
+      sed -n '1,240p' "$target/RESTORE.md"
+      printf '\n'
+    fi
+  } >>"$RECOVERY_SESSION_DIR/manual-steps.md"
+  if [[ -s "$target/RESTORE.md" ]]; then
+    sed -n '1,240p' "$target/RESTORE.md"
+  fi
+  record_recovery_status "$id" manual-pending "Collector artifacts staged for manual recovery"
+}
+
+recover_system_inventory() {
+  local index="$1"
+  local id="${COMPONENT_IDS[$index]}"
+  local artifact_dir="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/system-inventory"
+  local target="$STAGING_DIR/artifacts/system-inventory"
+  local missing_apt="$RECOVERY_SESSION_DIR/commands/apt-missing.txt"
+
+  if ! approve_recovery_component "$index"; then
+    record_recovery_status "$id" skipped "System inventory guidance was not selected"
+    return 0
+  fi
+  [[ -d "$artifact_dir" ]] || { record_recovery_status "$id" failed "System inventory artifacts are missing"; return 1; }
+  mkdir -p -- "$target"
+  rsync --archive "$artifact_dir/" "$target/"
+  if [[ -s "$target/apt-manual.txt" ]] && command -v apt-mark >/dev/null 2>&1; then
+    comm -23 <(sort -u "$target/apt-manual.txt") <(apt-mark showmanual 2>/dev/null | sort -u) >"$missing_apt"
+  else
+    : >"$missing_apt"
+  fi
+  chmod 600 -- "$missing_apt"
+  {
+    printf '\n## System inventory\n\n'
+    printf 'Inventory artifacts were staged at %s.\n\n' "\`$target\`"
+    printf 'Review %s before installing packages. Package installation, dconf import, and crontab import are intentionally not automatic.\n\n' "\`$missing_apt\`"
+    printf 'Suggested commands after review:\n\n```bash\n'
+    printf 'xargs -r sudo apt install -- < %q\n' "$missing_apt"
+    [[ -s "$target/dconf.ini" ]] && printf 'dconf dump / > current-dconf.ini\ndconf load / < %q\n' "$target/dconf.ini"
+    [[ -s "$target/crontab.txt" ]] && printf 'crontab -l > current-crontab.txt\ncrontab %q\n' "$target/crontab.txt"
+    printf '```\n'
+  } >>"$RECOVERY_SESSION_DIR/manual-steps.md"
+  record_recovery_status "$id" manual-pending "System rebuild commands require review"
+}
+
+component_dependencies_ready() {
+  local index="$1"
+  local dependencies="${COMPONENT_DEPENDENCIES[$index]}"
+  local dependency
+  local status
+  local -a dependency_list=()
+  [[ -n "$dependencies" ]] || return 0
+  IFS=',' read -ra dependency_list <<<"$dependencies"
+  for dependency in "${dependency_list[@]}"; do
+    status="$(recovery_component_status "$dependency")"
+    [[ "$status" == "verified" ]] || return 1
+  done
+}
+
+print_recovery_session_summary() {
+  local id
+  local status
+  printf '\nRecovery session summary (%s):\n' "$RECOVERY_SESSION_ID"
+  for id in "${SELECTED_COMPONENTS[@]}"; do
+    status="$(recovery_component_status "$id")"
+    printf '  - %s: %s\n' "$id" "${status:-not-started}"
+  done
+  print_label_value "Session state:" "$(recovery_state_file)"
+  print_label_value "Manual steps:" "$RECOVERY_SESSION_DIR/manual-steps.md"
+  print_label_value "Staging directory:" "$STAGING_DIR"
+}
+
+execute_recovery_component() {
+  local kind="$1"
+  local index="$2"
+  case "$kind" in
+    filesystem) recover_filesystem_component "$index" ;;
+    handler) recover_handler_component "$index" ;;
+    system-inventory) recover_system_inventory "$index" ;;
+    fallback) stage_collector_artifacts "$index" ;;
+    *) printf 'Unknown component kind: %s\n' "$kind" >&2; return 1 ;;
+  esac
+}
+
+recover_snapshot() {
+  local id
+  local index
+  local kind
+  local status
+  local rc=0
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    restore_plan
+    return
+  fi
+  if [[ -n "$RESUME_SESSION" ]]; then
+    [[ "$RECOVERY_ALL" -eq 0 && "${#SELECTED_COMPONENTS[@]}" -eq 0 ]] \
+      || die "--resume cannot be combined with --all or --component"
+    load_recovery_session
+    ensure_safe_destination
+    prepare_recovery_plan
+  else
+    RECOVERY_SESSION_ID=""
+    prepare_recovery_plan
+    if [[ "${#RECOVERY_BLOCKERS[@]}" -gt 0 ]]; then
+      print_recovery_plan
+      die "Recovery is blocked by ${#RECOVERY_BLOCKERS[@]} problem(s)"
+    fi
+    RECOVERY_SESSION_ID="$SNAPSHOT_NAME-$(timestamp_now)-$$"
+    STAGING_DIR="${STAGING_DIR/plan-$SNAPSHOT_NAME/$RECOVERY_SESSION_ID}"
+    select_recovery_components
+    create_recovery_session
+    print_recovery_plan | tee "$RECOVERY_SESSION_DIR/plan.txt"
+    chmod 600 -- "$RECOVERY_SESSION_DIR/plan.txt"
+  fi
+
+  if [[ "${#RECOVERY_BLOCKERS[@]}" -gt 0 ]]; then
+    print_recovery_plan
+    die "Recovery is blocked by ${#RECOVERY_BLOCKERS[@]} problem(s)"
+  fi
+  mkdir -p -- "$STAGING_DIR"
+  chmod 700 -- "$STAGING_DIR"
+
+  for id in "${SELECTED_COMPONENTS[@]}"; do
+    index="${COMPONENT_INDEX[$id]:-}"
+    [[ -n "$index" ]] || die "Session references an unknown component: $id"
+    status="$(recovery_component_status "$id")"
+    case "$status" in verified|skipped) continue ;; esac
+    if ! component_dependencies_ready "$index"; then
+      record_recovery_status "$id" manual-pending "A declared dependency is not verified"
+      continue
+    fi
+    kind="${COMPONENT_KINDS[$index]}"
+    printf '\nRecovery component: %s (%s)\n' "${COMPONENT_LABELS[$index]}" "$id"
+    if execute_recovery_component "$kind" "$index"; then rc=0; else rc=$?; fi
+    if [[ "$rc" -ne 0 ]]; then
+      print_recovery_session_summary
+      die_with_code "$rc" "Recovery stopped at component $id; resume after resolving the failure"
+    fi
+  done
+  print_recovery_session_summary
+  printf 'Recovery session finished. Keep staging until every manual-pending component is completed.\n'
+}
+
 read_keep_last() {
   local line
   local key
@@ -1852,7 +3060,7 @@ prune_snapshots() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      plan|manual|run|list|verify|restore|prune|drill|help)
+      plan|manual|run|list|verify|restore|restore-plan|recover|prune|drill|help)
         if [[ -z "$COMMAND" ]]; then COMMAND="$1"; else POSITIONAL_ARGS+=("$1"); fi
         shift
         ;;
@@ -1861,6 +3069,7 @@ parse_args() {
       --manual-file) [[ $# -ge 2 ]] || die "--manual-file requires a value"; MANUAL_FILE="$2"; shift 2 ;;
       --collectors-file) [[ $# -ge 2 ]] || die "--collectors-file requires a value"; COLLECTORS_FILE="$2"; shift 2 ;;
       --retention-file) [[ $# -ge 2 ]] || die "--retention-file requires a value"; RETENTION_FILE="$2"; shift 2 ;;
+      --handlers-file) [[ $# -ge 2 ]] || die "--handlers-file requires a value"; HANDLERS_FILE="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       --verbose) VERBOSE=1; shift ;;
       --yes) ASSUME_YES=1; shift ;;
@@ -1871,6 +3080,16 @@ parse_args() {
       --path) [[ $# -ge 2 ]] || die "--path requires a value"; RESTORE_PATH="$2"; shift 2 ;;
       --restore-to) [[ $# -ge 2 ]] || die "--restore-to requires a value"; RESTORE_DEST="$2"; shift 2 ;;
       --keep-last) [[ $# -ge 2 ]] || die "--keep-last requires a value"; KEEP_LAST_OVERRIDE="$2"; shift 2 ;;
+      --target-user) [[ $# -ge 2 ]] || die "--target-user requires a value"; TARGET_USER="$2"; shift 2 ;;
+      --target-home) [[ $# -ge 2 ]] || die "--target-home requires a value"; TARGET_HOME="$2"; shift 2 ;;
+      --staging-dir) [[ $# -ge 2 ]] || die "--staging-dir requires a value"; STAGING_DIR="$2"; shift 2 ;;
+      --map-path) [[ $# -ge 2 ]] || die "--map-path requires a value"; PATH_MAPPINGS+=("$2"); shift 2 ;;
+      --component) [[ $# -ge 2 ]] || die "--component requires a value"; SELECTED_COMPONENTS+=("$2"); shift 2 ;;
+      --approve-destructive) [[ $# -ge 2 ]] || die "--approve-destructive requires a value"; APPROVED_DESTRUCTIVE+=("$2"); shift 2 ;;
+      --resume) [[ $# -ge 2 ]] || die "--resume requires a value"; RESUME_SESSION="$2"; shift 2 ;;
+      --all) RECOVERY_ALL=1; shift ;;
+      --skip-deep-verify) SKIP_DEEP_VERIFY=1; shift ;;
+      --allow-legacy) ALLOW_LEGACY=1; shift ;;
       -h|--help) COMMAND="help"; shift ;;
       -*) die "Unknown option: $1" ;;
       *) POSITIONAL_ARGS+=("$1"); shift ;;
@@ -1880,7 +3099,7 @@ parse_args() {
 
 apply_positional_defaults() {
   case "$COMMAND" in
-    verify|restore|drill)
+    verify|restore|restore-plan|recover|drill)
       if [[ -z "$SNAPSHOT_NAME" && "${#POSITIONAL_ARGS[@]}" -gt 0 ]]; then
         SNAPSHOT_NAME="${POSITIONAL_ARGS[0]}"
         POSITIONAL_ARGS=("${POSITIONAL_ARGS[@]:1}")
@@ -1902,6 +3121,8 @@ main() {
     list) list_backups ;;
     verify) verify_snapshot ;;
     restore) restore_snapshot ;;
+    restore-plan) restore_plan ;;
+    recover) recover_snapshot ;;
     prune) prune_snapshots ;;
     drill) drill_snapshot ;;
     *) die "Unknown command: $COMMAND" ;;
