@@ -81,6 +81,100 @@ alias acc-intractive='agent-commit --interactive | clipboard'
 
 alias vpn-usage='(cd /home/home/my-files/projects/vpn-usage-tracker && watch -n 5 ./report.py)'
 
+_proxy_usage_report() {
+  local window="${1:-30d}"
+  local project_dir="/home/home/my-files/temp/adaptive-proxy"
+  local config_path="${project_dir}/config.json"
+  local binary_path="${project_dir}/bin/adaptive-proxy"
+  local report
+  local summary
+  local rows
+
+  if [ "$#" -gt 1 ]; then
+    echo "Usage: proxy-usage [1h|24h|7d|30d]" >&2
+    return 2
+  fi
+
+  case "$window" in
+    1h|24h|7d|30d) ;;
+    *)
+      echo "Usage: proxy-usage [1h|24h|7d|30d]" >&2
+      return 2
+      ;;
+  esac
+
+  if [ ! -r "$config_path" ]; then
+    echo "adaptive-proxy config is not readable: ${config_path}" >&2
+    return 1
+  fi
+  if [ ! -x "$binary_path" ]; then
+    echo "adaptive-proxy binary is not executable: ${binary_path}" >&2
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "proxy-usage requires jq" >&2
+    return 1
+  fi
+  if ! command -v column >/dev/null 2>&1; then
+    echo "proxy-usage requires column" >&2
+    return 1
+  fi
+
+  if ! report="$("$binary_path" -config "$config_path" -stats -stats-format json)"; then
+    echo "Failed to read adaptive-proxy statistics" >&2
+    return 1
+  fi
+
+  if ! summary="$(jq -r --arg window "$window" '
+    (.windows | map(select(.name == $window)) | first) as $selected
+    | (($selected.proxies // []) | map(.total.uses // 0) | add // 0) as $total
+    | ($selected.coverage_start // "no data") as $coverage
+    | "Window: \($selected.name) | Coverage: \($coverage) | Total uses: \($total)"
+  ' <<< "$report")"; then
+    echo "Failed to summarize adaptive-proxy statistics" >&2
+    return 1
+  fi
+
+  if ! rows="$(jq -r --arg window "$window" --slurpfile config "$config_path" '
+    def percent:
+      ((. * 100) | round) as $scaled
+      | ((($scaled / 100) | floor | tostring)
+        + "."
+        + (($scaled % 100) | tostring | if length == 1 then "0" + . else . end)
+        + "%");
+
+    ($config[0].upstreams // []) as $upstreams
+    | (.windows | map(select(.name == $window)) | first) as $selected
+    | (($selected.proxies // []) | map(.total.uses // 0) | add // 0) as $total
+    | (["PROXY", "TYPE", "ADDRESS", "USES", "USAGE", "STATUS"] | @tsv),
+      (($selected.proxies // [])
+        | map(
+            . as $proxy
+            | ($upstreams | map(select(.name == $proxy.name)) | first // {}) as $upstream
+            | {
+                name: $proxy.name,
+                type: ($upstream.type // "-"),
+                address: (if $upstream.host != null and $upstream.port != null then "\($upstream.host):\($upstream.port)" else "-" end),
+                uses: ($proxy.total.uses // 0),
+                usage: (if $total > 0 then (($proxy.total.uses // 0) * 100 / $total) else 0 end),
+                status: ($proxy.last_status.status // "-")
+              }
+          )
+        | sort_by([-.uses, .name])
+        | .[]
+        | [.name, .type, .address, (.uses | tostring), (.usage | percent), .status]
+        | @tsv)
+  ' <<< "$report")"; then
+    echo "Failed to format adaptive-proxy statistics" >&2
+    return 1
+  fi
+
+  echo "$summary"
+  printf '%s\n' "$rows" | column -t -s $'\t'
+}
+
+alias proxy-usage='_proxy_usage_report'
+
 alias projects-status='git-sync-status /home/home/my-files/projects --max-depth -1 --only-needs-action'
 
 alias sp-ssh='retry-until-success 10 "gh codespace ssh"'
