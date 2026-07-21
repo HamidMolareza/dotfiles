@@ -34,7 +34,7 @@ ACTIVE_NAME = "auth.json"
 AUTH_PATTERN = re.compile(r"^auth\.json(\d+)?$")
 CACHE_DIR = Path.home() / ".cache" / "codex-auth"
 CACHE_FILE = CACHE_DIR / "quota-cache.json"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_TTL_SECONDS = 300
 HTTP_TIMEOUT_SECONDS = 8.0
 HTTP_RETRY_ATTEMPTS = 3
@@ -46,6 +46,7 @@ PRIMARY_LEFT_WIDTH = 16
 PRIMARY_RESET_WIDTH = 11
 SECONDARY_LEFT_WIDTH = 8
 SECONDARY_RESET_WIDTH = 11
+RESET_COUNT_WIDTH = 6
 EMAIL_WIDTH = 28
 ACCOUNT_INFO_WIDTH = 52
 EMPTY_CELL = ""
@@ -115,14 +116,15 @@ class QuotaView:
     primary_reset: str = EMPTY_CELL
     secondary_left: str = EMPTY_CELL
     secondary_reset: str = EMPTY_CELL
+    reset_count: str = EMPTY_CELL
     primary_left_percent: int | None = None
     primary_reset_at: float | None = None
     secondary_left_percent: int | None = None
     secondary_reset_at: float | None = None
 
     @classmethod
-    def status(cls, value: str) -> "QuotaView":
-        return cls(primary_left=value)
+    def status(cls, value: str, *, reset_count: str = EMPTY_CELL) -> "QuotaView":
+        return cls(primary_left=value, reset_count=reset_count)
 
     @classmethod
     def from_cache_value(cls, value: object) -> "QuotaView | None":
@@ -132,7 +134,11 @@ class QuotaView:
         primary_reset = value.get("primary_reset", EMPTY_CELL)
         secondary_left = value.get("secondary_left", EMPTY_CELL)
         secondary_reset = value.get("secondary_reset", EMPTY_CELL)
-        if not all(isinstance(item, str) for item in (primary_left, primary_reset, secondary_left, secondary_reset)):
+        reset_count = value.get("reset_count", EMPTY_CELL)
+        if not all(
+            isinstance(item, str)
+            for item in (primary_left, primary_reset, secondary_left, secondary_reset, reset_count)
+        ):
             return None
         primary_left_percent = parse_remaining_percent(value.get("primary_left_percent", primary_left))
         primary_reset_at = parse_reset_timestamp_value(value.get("primary_reset_at"))
@@ -151,6 +157,7 @@ class QuotaView:
             secondary_reset=(
                 format_reset_timestamp(secondary_reset_at) if secondary_reset_at is not None else secondary_reset
             ),
+            reset_count=reset_count,
             primary_left_percent=primary_left_percent,
             primary_reset_at=primary_reset_at,
             secondary_left_percent=secondary_left_percent,
@@ -163,6 +170,7 @@ class QuotaView:
             "primary_reset": self.primary_reset,
             "secondary_left": self.secondary_left,
             "secondary_reset": self.secondary_reset,
+            "reset_count": self.reset_count,
         }
         if self.primary_left_percent is not None:
             value["primary_left_percent"] = self.primary_left_percent
@@ -184,6 +192,7 @@ class QuotaView:
             self,
             primary_left=mark(self.primary_left),
             secondary_left=mark(self.secondary_left),
+            reset_count=mark(self.reset_count),
         )
 
     def is_data_view(self) -> bool:
@@ -193,6 +202,7 @@ class QuotaView:
                 self.primary_reset,
                 self.secondary_left,
                 self.secondary_reset,
+                self.reset_count,
             )
         )
 
@@ -248,6 +258,7 @@ class AuthFile:
             f"{truncate_text(quota.primary_reset, PRIMARY_RESET_WIDTH):<{PRIMARY_RESET_WIDTH}} "
             f"{truncate_text(quota.secondary_left, SECONDARY_LEFT_WIDTH):<{SECONDARY_LEFT_WIDTH}} "
             f"{truncate_text(quota.secondary_reset, SECONDARY_RESET_WIDTH):<{SECONDARY_RESET_WIDTH}} "
+            f"{truncate_text(quota.reset_count, RESET_COUNT_WIDTH):<{RESET_COUNT_WIDTH}} "
             f"{truncate_text(self.email, EMAIL_WIDTH):<{EMAIL_WIDTH}} "
             f"{truncate_text(format_account_info(self.metadata), ACCOUNT_INFO_WIDTH):<{ACCOUNT_INFO_WIDTH}}"
         )
@@ -277,6 +288,8 @@ class AuthFile:
                 ),
                 " ",
                 format_plain_cell(quota.secondary_reset, SECONDARY_RESET_WIDTH),
+                " ",
+                format_plain_cell(quota.reset_count, RESET_COUNT_WIDTH),
                 " ",
                 format_plain_cell(self.email, EMAIL_WIDTH),
                 " ",
@@ -317,6 +330,8 @@ class AuthFile:
         )
         fragments.append(("", " "))
         fragments.extend(format_prompt_fragments(quota.secondary_reset, SECONDARY_RESET_WIDTH, expired_style))
+        fragments.append(("", " "))
+        fragments.extend(format_prompt_fragments(quota.reset_count, RESET_COUNT_WIDTH, expired_style))
         fragments.append(("", " "))
         fragments.extend(format_prompt_fragments(self.email, EMAIL_WIDTH, expired_style))
         fragments.append(("", " "))
@@ -528,7 +543,7 @@ Rules:
   - {ACTIVE_NAME} is the active file
   - auth.json<number> files are inactive candidates
   - at most one active file exists at a time
-  - the menu shows cached or live remaining quota and reset countdowns for each auth file
+  - the menu shows cached or live remaining quota, reset countdowns, and reset counts for each auth file
   - the menu shows each auth file's user email from the local id_token or cache when available
   - Edit Account Info stores seller, purchase date, validity days, and a note in {METADATA_STORE_NAME}
   - account info is keyed by email, so it follows auth files when codex-auth switches or archives them
@@ -984,6 +999,7 @@ def menu_header() -> str:
         f"{'5h in':<{PRIMARY_RESET_WIDTH}} "
         f"{'7d left':<{SECONDARY_LEFT_WIDTH}} "
         f"{'7d in':<{SECONDARY_RESET_WIDTH}} "
+        f"{'Resets':<{RESET_COUNT_WIDTH}} "
         f"{'Email':<{EMAIL_WIDTH}} "
         f"{'Account Info':<{ACCOUNT_INFO_WIDTH}}"
     )
@@ -1397,7 +1413,21 @@ def select_rate_limit_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     raise QuotaProbeError(BAD_RESPONSE, transient=True)
 
 
+def format_rate_limit_reset_count(payload: dict[str, Any]) -> str:
+    reset_credits = payload.get("rate_limit_reset_credits")
+    if not isinstance(reset_credits, dict):
+        return EMPTY_CELL
+
+    available_count = reset_credits.get("available_count")
+    if type(available_count) is int and available_count >= 0:
+        return str(available_count)
+
+    debug_log("usage payload had invalid reset count", available_count=available_count)
+    return EMPTY_CELL
+
+
 def format_quota_view(payload: dict[str, Any]) -> QuotaView:
+    reset_count = format_rate_limit_reset_count(payload)
     snapshot = select_rate_limit_snapshot(payload)
 
     primary_left = format_window_left(snapshot.get("primary"))
@@ -1423,21 +1453,22 @@ def format_quota_view(payload: dict[str, Any]) -> QuotaView:
             primary_reset_at=primary_reset_at if primary_left else None,
             secondary_left_percent=parse_remaining_percent(secondary_left),
             secondary_reset_at=secondary_reset_at if secondary_left else None,
+            reset_count=reset_count,
         )
 
     credits = snapshot.get("credits")
     if isinstance(credits, dict):
         if credits.get("unlimited") is True:
             debug_log("usage payload reported unlimited credits")
-            return QuotaView.status("unlimited")
+            return QuotaView.status("unlimited", reset_count=reset_count)
 
         balance = credits.get("balance")
         if isinstance(balance, str) and balance.strip() and balance.strip() not in {"0", "0.0"}:
             debug_log("usage payload reported credits balance", balance=balance.strip())
-            return QuotaView.status(f"credits {balance.strip()}")
+            return QuotaView.status(f"credits {balance.strip()}", reset_count=reset_count)
 
     debug_log("usage payload had no usable quota windows or credits", snapshot=snapshot)
-    return QuotaView.status(QUOTA_UNKNOWN)
+    return QuotaView.status(QUOTA_UNKNOWN, reset_count=reset_count)
 
 
 def load_auth_payload(auth_file: Path) -> dict[str, Any]:

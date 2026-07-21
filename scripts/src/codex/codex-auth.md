@@ -3,6 +3,18 @@
 `codex-auth` switches the active Codex auth file in `~/.codex` and shows quota,
 email, and account metadata for each candidate.
 
+## Quota And Reset Counts
+
+For each uncached account, the picker sends one read-only request to the existing
+Codex usage endpoint. The `Resets` column is populated from
+`rate_limit_reset_credits.available_count` in that same response; the separate
+reset-credit details endpoint is not requested.
+
+Quota data and the reset count share the same five-minute cache. Cache schema
+version 2 forces a one-time refresh of older entries that do not contain the
+reset count. A missing or invalid count is rendered as an empty cell, while a
+stale fallback value is marked with `*` like the existing quota columns.
+
 ## Sort Priority
 
 The picker sorts accounts in this order:
