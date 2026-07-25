@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Download a video from an authenticated LinkedIn post."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Iterator
+from urllib.parse import urlparse
+
+
+BROWSER_SPEC_RE = re.compile(
+    r"""
+    (?P<name>[^+:]+)
+    (?:\s*\+\s*(?P<keyring>[^:]+))?
+    (?:\s*:\s*(?!:)(?P<profile>.+?))?
+    (?:\s*::\s*(?P<container>.+))?
+    """,
+    re.VERBOSE,
+)
+CODE_JSON_RE = re.compile(r"<code\b[^>]*>(.*?)</code>", re.DOTALL | re.IGNORECASE)
+LINKEDIN_POST_ID_RE = re.compile(
+    r"(?:ugcPost-|activity-|urn:li:(?:activity|ugcPost):)(\d+)",
+    re.IGNORECASE,
+)
+REEXEC_MARKER = "LINKEDIN_DOWNLOAD_REEXECUTED"
+
+
+class LinkedInDownloadError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class VideoStream:
+    url: str
+    width: int
+    height: int
+    bitrate: int
+    media_type: str
+
+    @property
+    def quality(self) -> tuple[int, int]:
+        return (self.width * self.height, self.bitrate)
+
+    @property
+    def description(self) -> str:
+        bitrate_kbps = round(self.bitrate / 1000) if self.bitrate else 0
+        bitrate_text = f", {bitrate_kbps} kbps" if bitrate_kbps else ""
+        media_text = self.media_type or "video"
+        return f"{self.width}x{self.height}, {media_text}{bitrate_text}"
+
+
+@dataclass(frozen=True)
+class PostVideo:
+    post_id: str
+    author: str | None
+    streams: tuple[VideoStream, ...]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download the best progressive MP4 stream from a LinkedIn post. "
+            "The browser must already be signed in to LinkedIn."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  linkedin-download 'https://www.linkedin.com/posts/...'\n"
+            "  linkedin-download --browser 'chrome:Default' URL\n"
+            "  linkedin-download --cookies ~/cookies.txt -o ~/Videos URL\n\n"
+            "Proxy handling follows the current process environment."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument(
+        "--browser",
+        default="firefox",
+        metavar="BROWSER[:PROFILE]",
+        help=(
+            "browser cookie source in yt-dlp syntax "
+            "(default: firefox; example: chrome:Default)"
+        ),
+    )
+    auth.add_argument(
+        "--cookies",
+        metavar="FILE",
+        help="Netscape-format cookies file instead of browser cookies",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default=".",
+        metavar="DIR",
+        help="directory for downloaded videos (default: current working directory)",
+    )
+    parser.add_argument(
+        "--name",
+        metavar="BASENAME",
+        help="custom output filename without the extension",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="resolve the best stream and filename without downloading",
+    )
+    parser.add_argument("url", help="LinkedIn post URL")
+    return parser.parse_args()
+
+
+def fail(message: str) -> None:
+    raise LinkedInDownloadError(message)
+
+
+def yt_dlp_entrypoint() -> Path:
+    executable = shutil.which("yt-dlp")
+    if not executable:
+        fail("yt-dlp is required. Install it with: pipx install yt-dlp")
+    return Path(executable).resolve()
+
+
+def shebang_interpreter(entrypoint: Path) -> Path | None:
+    try:
+        with entrypoint.open("rb") as file:
+            first_line = file.readline(4096).decode("utf-8").rstrip("\r\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    if not first_line.startswith("#!"):
+        return None
+
+    try:
+        command = shlex.split(first_line[2:].strip())
+    except ValueError:
+        return None
+
+    if not command or Path(command[0]).name == "env":
+        return None
+
+    candidate = Path(command[0])
+    return candidate if candidate.is_file() else None
+
+
+def load_yt_dlp() -> ModuleType:
+    try:
+        import yt_dlp
+
+        return yt_dlp
+    except ModuleNotFoundError:
+        entrypoint = yt_dlp_entrypoint()
+
+        if os.environ.get(REEXEC_MARKER) != "1":
+            candidates = (
+                shebang_interpreter(entrypoint),
+                entrypoint.parent / "python",
+            )
+            for candidate in candidates:
+                if not candidate or not candidate.is_file():
+                    continue
+                if candidate.absolute() == Path(sys.executable).absolute():
+                    continue
+
+                environment = os.environ.copy()
+                environment[REEXEC_MARKER] = "1"
+                os.execve(
+                    candidate,
+                    [
+                        str(candidate),
+                        str(Path(__file__).resolve()),
+                        *sys.argv[1:],
+                    ],
+                    environment,
+                )
+
+        fail(
+            "the yt-dlp Python module is unavailable. "
+            "Install the pipx package with: pipx install --force yt-dlp"
+        )
+        raise AssertionError("unreachable")
+
+
+def validate_linkedin_url(value: str) -> tuple[str, str]:
+    parsed = urlparse(value)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"}:
+        fail("the URL must start with http:// or https://")
+    if hostname != "linkedin.com" and not hostname.endswith(".linkedin.com"):
+        fail("the URL must point to linkedin.com")
+
+    match = LINKEDIN_POST_ID_RE.search(value)
+    if not match:
+        fail("could not find a LinkedIn activity or ugcPost ID in the URL")
+
+    return value, match.group(1)
+
+
+def parse_browser_spec(value: str) -> tuple[str, str | None, str | None, str | None]:
+    match = BROWSER_SPEC_RE.fullmatch(value)
+    if not match:
+        fail(f"invalid browser cookie specification: {value}")
+
+    name, keyring, profile, container = match.group(
+        "name",
+        "keyring",
+        "profile",
+        "container",
+    )
+    return (
+        name.strip().lower(),
+        profile.strip() if profile else None,
+        keyring.strip().upper() if keyring else None,
+        container.strip() if container else None,
+    )
+
+
+def authentication_options(args: argparse.Namespace) -> dict[str, Any]:
+    if args.cookies:
+        cookie_path = Path(args.cookies).expanduser()
+        if not cookie_path.is_file():
+            fail(f"cookies file not found: {cookie_path}")
+        return {"cookiefile": str(cookie_path)}
+
+    return {"cookiesfrombrowser": parse_browser_spec(args.browser)}
+
+
+def fetch_page(
+    yt_dlp: ModuleType,
+    url: str,
+    auth_options: dict[str, Any],
+) -> str:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        **auth_options,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            response = downloader.urlopen(url)
+            return response.read().decode("utf-8", "replace")
+    except Exception as exc:
+        fail(f"failed to load the LinkedIn post: {exc}")
+        raise AssertionError("unreachable")
+
+
+def json_documents(page: str) -> list[Any]:
+    documents: list[Any] = []
+    for encoded in CODE_JSON_RE.findall(page):
+        value = html.unescape(encoded).strip()
+        if value.startswith("<!--") and value.endswith("-->"):
+            value = value[4:-3].strip()
+        try:
+            documents.append(json.loads(value))
+        except json.JSONDecodeError:
+            continue
+    return documents
+
+
+def walk(value: Any) -> Iterator[Any]:
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+
+
+def update_video_references(update: dict[str, Any]) -> set[str]:
+    references: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.endswith("videoPlayMetadata") and isinstance(child, str):
+                    references.add(child)
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(update)
+    return references
+
+
+def stream_url(value: dict[str, Any]) -> str | None:
+    locations = value.get("streamingLocations")
+    if isinstance(locations, list):
+        for location in locations:
+            if isinstance(location, dict) and isinstance(location.get("url"), str):
+                return location["url"]
+
+    url = value.get("url")
+    return url if isinstance(url, str) else None
+
+
+def parse_stream(value: Any) -> VideoStream | None:
+    if not isinstance(value, dict):
+        return None
+
+    url = stream_url(value)
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https":
+        return None
+    if hostname != "licdn.com" and not hostname.endswith(".licdn.com"):
+        return None
+
+    media_type = value.get("mediaType") or value.get("type") or ""
+    if media_type and not str(media_type).startswith("video/"):
+        return None
+
+    return VideoStream(
+        url=url,
+        width=int(value.get("width") or 0),
+        height=int(value.get("height") or 0),
+        bitrate=int(value.get("bitRate") or value.get("bitrate") or 0),
+        media_type=str(media_type),
+    )
+
+
+def actor_name(update: dict[str, Any]) -> str | None:
+    actor = update.get("actor")
+    if not isinstance(actor, dict):
+        return None
+    name = actor.get("name")
+    if not isinstance(name, dict):
+        return None
+    text = name.get("text")
+    return text.strip() if isinstance(text, str) and text.strip() else None
+
+
+def find_post_video(documents: list[Any], post_id: str) -> PostVideo:
+    updates: list[dict[str, Any]] = []
+    metadata_nodes: list[dict[str, Any]] = []
+
+    for document in documents:
+        for value in walk(document):
+            if not isinstance(value, dict):
+                continue
+
+            value_type = value.get("$type")
+            if value_type == "com.linkedin.voyager.dash.feed.Update":
+                if post_id in json.dumps(value, ensure_ascii=False):
+                    updates.append(value)
+
+            streams = value.get("progressiveStreams")
+            if isinstance(streams, list) and streams:
+                metadata_nodes.append(value)
+
+    video_references: set[str] = set()
+    author: str | None = None
+    for update in updates:
+        video_references.update(update_video_references(update))
+        author = author or actor_name(update)
+
+    referenced_nodes = [
+        node for node in metadata_nodes if node.get("entityUrn") in video_references
+    ]
+    candidates = referenced_nodes or metadata_nodes
+
+    unique_candidates: dict[str, dict[str, Any]] = {}
+    for index, node in enumerate(candidates):
+        key = str(node.get("entityUrn") or f"candidate-{index}")
+        unique_candidates[key] = node
+
+    if not unique_candidates:
+        fail(
+            "no progressive LinkedIn video stream was found. "
+            "Make sure the selected browser is signed in and can play the post."
+        )
+    if not referenced_nodes and len(unique_candidates) > 1:
+        fail("multiple unrelated LinkedIn videos were found on the page")
+
+    node = next(iter(unique_candidates.values()))
+    parsed_streams = tuple(
+        stream
+        for stream in (parse_stream(item) for item in node["progressiveStreams"])
+        if stream is not None
+    )
+    if not parsed_streams:
+        fail("the post did not expose a downloadable progressive MP4 stream")
+
+    return PostVideo(post_id=post_id, author=author, streams=parsed_streams)
+
+
+def safe_basename(value: str) -> str:
+    name = re.sub(r"[\x00-\x1f]+", " ", value)
+    name = re.sub(r'[\\/:*?"<>|]+', "-", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-_")
+    if not name:
+        fail("the output filename is empty")
+    return name[:150].rstrip(" .-_")
+
+
+def output_template(
+    args: argparse.Namespace,
+    post: PostVideo,
+) -> tuple[Path, Path, Path]:
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    default_name = f"{post.author or 'LinkedIn'} LinkedIn video [{post.post_id}]"
+    basename = safe_basename(args.name or default_name)
+    literal_basename = basename.replace("%", "%%")
+    return (
+        output_dir,
+        output_dir / f"{literal_basename}.%(ext)s",
+        output_dir / f"{basename}.mp4",
+    )
+
+
+def download(
+    args: argparse.Namespace,
+    page_url: str,
+    post: PostVideo,
+    selected: VideoStream,
+) -> int:
+    output_dir, template, expected_path = output_template(args, post)
+    print(f"Selected: {selected.description}", flush=True)
+    print(f"Output: {expected_path}", flush=True)
+
+    if args.dry_run:
+        print("Dry run complete; no file was downloaded.")
+        return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(yt_dlp_entrypoint()),
+        "--ignore-config",
+        "--quiet",
+        "--progress",
+        "--no-playlist",
+        "--continue",
+        "--no-overwrites",
+        "--referer",
+        page_url,
+        "--output",
+        str(template),
+        "--print",
+        "after_move:filepath",
+        selected.url,
+    ]
+    return subprocess.run(command, check=False).returncode
+
+
+def main() -> int:
+    args = parse_args()
+    page_url, post_id = validate_linkedin_url(args.url)
+    yt_dlp = load_yt_dlp()
+    page = fetch_page(yt_dlp, page_url, authentication_options(args))
+    post = find_post_video(json_documents(page), post_id)
+    selected = max(post.streams, key=lambda item: item.quality)
+    return download(args, page_url, post, selected)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except LinkedInDownloadError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
