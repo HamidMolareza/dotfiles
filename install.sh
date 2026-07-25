@@ -28,10 +28,6 @@ backup_and_link() {
         if [ -d "$dest" ]; then
             echo "📦 Backing up existing folder: $dest"
             mv "$dest" "$BACKUP_DIR/$name"
-
-            echo "📂 Copying old contents into dotfiles repo: $src"
-            mkdir -p "$src"
-            cp -r "$BACKUP_DIR/$name/." "$src" 2>/dev/null || true
         else
             echo "📦 Backing up existing file: $dest"
             mv "$dest" "$BACKUP_DIR/$name"
@@ -116,13 +112,11 @@ backup_and_link "$DOTFILES_DIR/docker-services" "$HOME/docker-services"
 backup_and_link "$DOTFILES_DIR/.icons" "$HOME/.icons"
 backup_and_link "$DOTFILES_DIR/Templates" "$HOME/Templates"
 backup_and_link "$DOTFILES_DIR/.config" "$HOME/.config"
-backup_and_link $DOTFILES_DIR/.local/share/applications $HOME/.local/share/applications
+backup_and_link "$DOTFILES_DIR/.local/share/applications" "$HOME/.local/share/applications"
 
 backup_and_link "$DOTFILES_DIR/scripts" "$HOME/scripts"
-chmod +x -R $HOME/scripts
 
-backup_and_link $DOTFILES_DIR/nautilus/scripts $HOME/.local/share/nautilus/scripts
-chmod +x -R $HOME/.local/share/nautilus/scripts
+backup_and_link "$DOTFILES_DIR/nautilus/scripts" "$HOME/.local/share/nautilus/scripts"
 
 # Agents
 
