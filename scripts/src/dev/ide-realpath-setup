@@ -1,0 +1,970 @@
+#!/usr/bin/env bash
+# ide-realpath-managed-runtime
+
+set -Eeuo pipefail
+
+PROGRAM_NAME="ide-realpath-setup"
+MANAGED_MARKER="ide-realpath-managed"
+ADAPTER_MARKER="ide-realpath-adapter"
+NAUTILUS_MARKER="ide-realpath-portable-nautilus"
+DESKTOP_MARKER="X-IdeRealpath-Managed=true"
+
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+XDG_BIN_HOME="${XDG_BIN_HOME:-$HOME/.local/bin}"
+XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+INSTALL_ROOT="$XDG_DATA_HOME/ide-realpath"
+RUNTIME_PATH="$INSTALL_ROOT/$PROGRAM_NAME"
+BACKEND_DIR="$XDG_CONFIG_HOME/ide-realpath/backends"
+STATE_DIR="$XDG_STATE_HOME/ide-realpath"
+BACKUP_ROOT="$STATE_DIR/backups"
+MANIFEST_PATH="$STATE_DIR/install-manifest.tsv"
+APPLICATIONS_DIR="$XDG_DATA_HOME/applications"
+NAUTILUS_DIR="$XDG_DATA_HOME/nautilus/scripts/open-with"
+
+DEFAULT_APPS=(rider webstorm pycharm datagrip code)
+CANONICAL_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage: ide-realpath-setup [options]
+
+Install canonical-path launchers for IDEs, Nautilus, desktop entries, and the
+Nautilus terminal action. Existing filesystem arguments are resolved through
+realpath before the target program is launched.
+
+Options:
+  --dry-run                  Preview discovery and filesystem changes.
+  --refresh                  Ignore saved backends and discover them again.
+  --app NAME=EXECUTABLE      Add an app or override its executable.
+  --desktop NAME=FILE        Use a specific desktop entry for an app.
+  --uninstall                Remove managed files and restore backups.
+  -h, --help                 Show this help text.
+
+Runtime modes used by installed integrations:
+  --run APP [--] ARGS...     Run a configured app with canonical paths.
+  --exec COMMAND ARGS...     Run a command with canonical paths.
+  --terminal [PATH]          Open GNOME Terminal at a canonical path.
+
+Examples:
+  ide-realpath-setup --dry-run
+  ide-realpath-setup
+  ide-realpath-setup --refresh
+  ide-realpath-setup --app rider=/path/to/rider
+  ide-realpath-setup --uninstall
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf 'Warning: %s\n' "$*" >&2
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+path_exists() {
+    [[ -e "$1" || -L "$1" ]]
+}
+
+validate_app_name() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+}
+
+canonicalize_file_uri() {
+    local uri="$1"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "$uri"
+        return
+    fi
+
+    python3 - "$uri" <<'PY'
+import os
+import pathlib
+import sys
+import urllib.parse
+
+uri = sys.argv[1]
+parsed = urllib.parse.urlparse(uri)
+if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+    print(uri)
+    raise SystemExit(0)
+
+path = urllib.parse.unquote(parsed.path)
+if not os.path.exists(path):
+    print(uri)
+    raise SystemExit(0)
+
+print(pathlib.Path(os.path.realpath(path)).as_uri())
+PY
+}
+
+canonicalize_argument() {
+    local argument="$1"
+    local option_name
+    local option_value
+    local resolved
+
+    if [[ "$argument" == file://* ]]; then
+        canonicalize_file_uri "$argument"
+        return
+    fi
+
+    if [[ "$argument" == --*=* ]]; then
+        option_name="${argument%%=*}"
+        option_value="${argument#*=}"
+        if [[ -e "$option_value" ]]; then
+            resolved="$(realpath -e -- "$option_value")"
+            printf '%s=%s\n' "$option_name" "$resolved"
+        else
+            printf '%s\n' "$argument"
+        fi
+        return
+    fi
+
+    if [[ "$argument" == -* || "$argument" == *://* ]]; then
+        printf '%s\n' "$argument"
+        return
+    fi
+
+    if [[ -e "$argument" ]]; then
+        realpath -e -- "$argument"
+    else
+        printf '%s\n' "$argument"
+    fi
+}
+
+canonicalize_arguments() {
+    local argument
+    local resolved
+
+    CANONICAL_ARGS=()
+    for argument in "$@"; do
+        resolved="$(canonicalize_argument "$argument")"
+        CANONICAL_ARGS+=("$resolved")
+
+        if [[ "${IDE_REALPATH_DEBUG:-0}" == "1" && "$argument" != "$resolved" ]]; then
+            printf 'ide-realpath: %s -> %s\n' "$argument" "$resolved" >&2
+        fi
+    done
+}
+
+read_backend() {
+    local app="$1"
+    local backend_file="$BACKEND_DIR/$app"
+
+    [[ -r "$backend_file" ]] || return 1
+    awk '!/^#/ && NF { print; exit }' "$backend_file"
+}
+
+resolve_executable() {
+    local candidate="$1"
+    local resolved
+
+    if [[ "$candidate" == */* ]]; then
+        [[ -x "$candidate" ]] || return 1
+        realpath -ms -- "$candidate"
+        return
+    fi
+
+    resolved="$(command -v -- "$candidate" 2>/dev/null)" || return 1
+    [[ -x "$resolved" ]] || return 1
+    realpath -ms -- "$resolved"
+}
+
+run_app() {
+    local app="$1"
+    shift
+
+    if [[ "${1:-}" == "--" ]]; then
+        shift
+    fi
+
+    local backend
+    backend="$(read_backend "$app")" || die "No configured backend for '$app'. Run $PROGRAM_NAME first."
+    [[ -x "$backend" ]] || die "Configured backend is not executable: $backend"
+
+    canonicalize_arguments "$@"
+    exec "$backend" "${CANONICAL_ARGS[@]}"
+}
+
+run_command() {
+    (($# > 0)) || die "--exec requires a command."
+
+    local command_name="$1"
+    shift
+
+    local executable
+    executable="$(resolve_executable "$command_name")" || die "Command is not executable: $command_name"
+    canonicalize_arguments "$@"
+    exec "$executable" "${CANONICAL_ARGS[@]}"
+}
+
+run_terminal() {
+    local target="${1:-}"
+
+    if [[ -z "$target" || ! -d "$target" ]]; then
+        target="$(pwd -P)"
+    else
+        target="$(realpath -e -- "$target")"
+    fi
+
+    command -v gnome-terminal >/dev/null 2>&1 || die "gnome-terminal is required for terminal integration."
+    exec gnome-terminal --working-directory="$target"
+}
+
+invoked_as="$(basename -- "$0")"
+if [[ "$invoked_as" != "$PROGRAM_NAME" && -r "$BACKEND_DIR/$invoked_as" ]]; then
+    run_app "$invoked_as" "$@"
+fi
+
+case "${1:-}" in
+    --run)
+        (($# >= 2)) || die "--run requires an app name."
+        app_name="$2"
+        shift 2
+        validate_app_name "$app_name" || die "Invalid app name: $app_name"
+        run_app "$app_name" "$@"
+        ;;
+    --exec)
+        shift
+        run_command "$@"
+        ;;
+    --terminal)
+        shift
+        run_terminal "$@"
+        ;;
+esac
+
+DRY_RUN=false
+REFRESH=false
+ACTION="install"
+declare -A APP_OVERRIDES=()
+declare -A DESKTOP_OVERRIDES=()
+declare -A REQUESTED_APPS=()
+declare -A BACKENDS=()
+
+parse_assignment() {
+    local value="$1"
+    local name="${value%%=*}"
+    local assigned="${value#*=}"
+
+    [[ "$value" == *=* && -n "$assigned" ]] || die "Expected NAME=VALUE, received: $value"
+    validate_app_name "$name" || die "Invalid app name: $name"
+    printf '%s\t%s\n' "$name" "$assigned"
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --refresh)
+            REFRESH=true
+            shift
+            ;;
+        --app)
+            (($# >= 2)) || die "--app requires NAME=EXECUTABLE."
+            assignment="$(parse_assignment "$2")"
+            name="${assignment%%$'\t'*}"
+            value="${assignment#*$'\t'}"
+            APP_OVERRIDES["$name"]="$value"
+            REQUESTED_APPS["$name"]=1
+            shift 2
+            ;;
+        --desktop)
+            (($# >= 2)) || die "--desktop requires NAME=FILE."
+            assignment="$(parse_assignment "$2")"
+            name="${assignment%%$'\t'*}"
+            value="${assignment#*$'\t'}"
+            DESKTOP_OVERRIDES["$name"]="$value"
+            REQUESTED_APPS["$name"]=1
+            shift 2
+            ;;
+        --uninstall)
+            ACTION="uninstall"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+SCRIPT_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
+BACKUP_SESSION="$BACKUP_ROOT/$(date +%Y-%m-%d_%H-%M-%S)-$$"
+
+manifest_backup_for() {
+    local target="$1"
+    [[ -r "$MANIFEST_PATH" ]] || return 1
+    awk -F '\t' -v target="$target" '$1 == target { print $2; found=1; exit } END { if (!found) exit 1 }' "$MANIFEST_PATH"
+}
+
+manifest_has_target() {
+    manifest_backup_for "$1" >/dev/null 2>&1
+}
+
+is_managed_target() {
+    local target="$1"
+
+    if [[ -L "$target" ]]; then
+        [[ "$(realpath -m -- "$target")" == "$(realpath -m -- "$RUNTIME_PATH")" ]]
+        return
+    fi
+
+    [[ -f "$target" ]] || return 1
+    grep -qE "$MANAGED_MARKER|$NAUTILUS_MARKER|$DESKTOP_MARKER" "$target" 2>/dev/null
+}
+
+backup_path() {
+    local target="$1"
+    local reason="$2"
+    local digest
+    local destination
+
+    digest="$(printf '%s' "$target" | sha256sum | awk '{ print $1 }')"
+    destination="$BACKUP_SESSION/${reason}-${digest}-$(basename -- "$target")"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        printf '%s\n' "$destination"
+        return
+    fi
+
+    mkdir -p -- "$BACKUP_SESSION"
+    cp -a -- "$target" "$destination"
+    printf '%s\n' "$destination"
+}
+
+register_target() {
+    local target="$1"
+    local original_backup=""
+
+    if manifest_has_target "$target"; then
+        if path_exists "$target" && ! is_managed_target "$target"; then
+            conflict_backup="$(backup_path "$target" "conflict")"
+            info "Backed up changed target: $target -> $conflict_backup"
+        fi
+        return
+    fi
+
+    if path_exists "$target"; then
+        original_backup="$(backup_path "$target" "original")"
+        info "Backed up existing target: $target -> $original_backup"
+    fi
+
+    if [[ "$DRY_RUN" == false ]]; then
+        mkdir -p -- "$STATE_DIR"
+        printf '%s\t%s\n' "$target" "$original_backup" >>"$MANIFEST_PATH"
+    fi
+}
+
+install_file() {
+    local source="$1"
+    local target="$2"
+    local mode="${3:-755}"
+
+    register_target "$target"
+    info "Installing $target"
+
+    if [[ "$DRY_RUN" == false ]]; then
+        mkdir -p -- "$(dirname -- "$target")"
+        install -m "$mode" -- "$source" "$target"
+    fi
+}
+
+install_symlink() {
+    local target="$1"
+
+    if [[ -L "$target" && "$(realpath -m -- "$target")" == "$(realpath -m -- "$RUNTIME_PATH")" ]]; then
+        info "Shim is current: $target"
+        return
+    fi
+
+    register_target "$target"
+    info "Installing CLI shim: $target -> $RUNTIME_PATH"
+
+    if [[ "$DRY_RUN" == false ]]; then
+        mkdir -p -- "$(dirname -- "$target")"
+        rm -f -- "$target"
+        ln -s -- "$RUNTIME_PATH" "$target"
+    fi
+}
+
+command_aliases() {
+    case "$1" in
+        rider) printf '%s\n' rider rider.sh ;;
+        webstorm) printf '%s\n' webstorm webstorm.sh ;;
+        pycharm) printf '%s\n' pycharm pycharm.sh pycharm-professional pycharm-community ;;
+        datagrip) printf '%s\n' datagrip datagrip.sh ;;
+        code) printf '%s\n' code ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+is_discovery_candidate() {
+    local candidate="$1"
+    local resolved
+
+    [[ -x "$candidate" ]] || return 1
+    resolved="$(realpath -e -- "$candidate")" || return 1
+    [[ "$resolved" != "$(realpath -m -- "$RUNTIME_PATH")" ]] || return 1
+
+    if grep -q "$ADAPTER_MARKER" "$resolved" 2>/dev/null; then
+        return 1
+    fi
+
+    return 0
+}
+
+discover_from_path() {
+    local app="$1"
+    local alias
+    local directory
+    local candidate
+    local resolved
+    local identity
+    declare -A found=()
+    local results=()
+    local aliases=()
+    local directories=()
+
+    mapfile -t aliases < <(command_aliases "$app")
+    IFS=':' read -r -a directories <<<"$PATH"
+
+    for alias in "${aliases[@]}"; do
+        for directory in "${directories[@]}"; do
+            [[ -n "$directory" ]] || directory="."
+            candidate="$directory/$alias"
+            is_discovery_candidate "$candidate" || continue
+            resolved="$(realpath -ms -- "$candidate")"
+            identity="$(realpath -e -- "$candidate")"
+            [[ -n "${found[$identity]:-}" ]] && continue
+            found["$identity"]=1
+            results+=("$resolved")
+        done
+    done
+
+    if ((${#results[@]} == 1)); then
+        printf '%s\n' "${results[0]}"
+        return 0
+    fi
+
+    if ((${#results[@]} > 1)); then
+        warn "Multiple PATH candidates found for '$app':"
+        printf '  %s\n' "${results[@]}" >&2
+        return 2
+    fi
+
+    return 1
+}
+
+desktop_directories() {
+    local directory
+    local data_dirs=()
+
+    printf '%s\n' "$APPLICATIONS_DIR"
+    IFS=':' read -r -a data_dirs <<<"$XDG_DATA_DIRS"
+    for directory in "${data_dirs[@]}"; do
+        [[ -n "$directory" ]] && printf '%s/applications\n' "${directory%/}"
+    done
+}
+
+desktop_matches_app() {
+    local app="$1"
+    local file="$2"
+    local filename
+
+    filename="$(basename -- "$file")"
+
+    case "$app" in
+        rider)
+            [[ "$filename" == *rider*.desktop ]] || grep -qiE "^Name=.*Rider|^Exec=.*rider([[:space:]\"%]|$)" "$file"
+            ;;
+        webstorm)
+            [[ "$filename" == *webstorm*.desktop ]] || grep -qiE '^Name=.*WebStorm|^Exec=.*webstorm' "$file"
+            ;;
+        pycharm)
+            [[ "$filename" == *pycharm*.desktop ]] || grep -qiE '^Name=.*PyCharm|^Exec=.*pycharm' "$file"
+            ;;
+        datagrip)
+            [[ "$filename" == *datagrip*.desktop ]] || grep -qiE '^Name=.*DataGrip|^Exec=.*datagrip' "$file"
+            ;;
+        code)
+            [[ "$filename" == code*.desktop || "$filename" == *visual-studio-code*.desktop ]] || grep -qiE '^Name=Visual Studio Code|^Exec=.*/code([[:space:]%]|$)' "$file"
+            ;;
+        *)
+            [[ "${filename,,}" == *"${app,,}"*.desktop ]] || grep -qiE "^Exec=.*(^|[/[:space:]])${app}([[:space:]%]|$)" "$file"
+            ;;
+    esac
+}
+
+find_desktop_entries() {
+    local app="$1"
+    local directory
+    local file
+    local id
+    local current
+    local directories=()
+    declare -A selected=()
+    local order=()
+
+    if [[ -n "${DESKTOP_OVERRIDES[$app]:-}" ]]; then
+        file="${DESKTOP_OVERRIDES[$app]}"
+        [[ -f "$file" ]] || die "Desktop override does not exist for '$app': $file"
+        realpath -e -- "$file"
+        return
+    fi
+
+    mapfile -t directories < <(desktop_directories)
+    shopt -s nullglob
+    for directory in "${directories[@]}"; do
+        [[ -d "$directory" ]] || continue
+        for file in "$directory"/*.desktop; do
+            desktop_matches_app "$app" "$file" || continue
+            id="$(basename -- "$file")"
+
+            if [[ -z "${selected[$id]:-}" ]]; then
+                selected["$id"]="$file"
+                order+=("$id")
+                continue
+            fi
+
+            current="${selected[$id]}"
+            if is_managed_target "$current" && ! is_managed_target "$file"; then
+                selected["$id"]="$file"
+            fi
+        done
+    done
+    shopt -u nullglob
+
+    for id in "${order[@]}"; do
+        printf '%s\n' "${selected[$id]}"
+    done
+}
+
+extract_first_exec_command() {
+    local desktop_file="$1"
+    local payload
+    local command_name
+    local resolved
+    local original_backup
+
+    if is_managed_target "$desktop_file"; then
+        original_backup="$(manifest_backup_for "$desktop_file" 2>/dev/null || true)"
+        if [[ -n "$original_backup" && -f "$original_backup" ]]; then
+            desktop_file="$original_backup"
+        fi
+    fi
+
+    payload="$(sed -n 's/^Exec=//p' "$desktop_file" | head -n 1)"
+    [[ -n "$payload" ]] || return 1
+
+    if [[ "$payload" == \"* ]]; then
+        payload="${payload#\"}"
+        command_name="${payload%%\"*}"
+    else
+        command_name="${payload%%[[:space:]]*}"
+        command_name="${command_name//\\ / }"
+    fi
+
+    [[ -n "$command_name" && "$command_name" != "env" ]] || return 1
+    resolved="$(resolve_executable "$command_name")" || return 1
+    is_discovery_candidate "$resolved" || return 1
+    printf '%s\n' "$resolved"
+}
+
+discover_from_desktop() {
+    local app="$1"
+    local desktop_file
+    local candidate
+    declare -A found=()
+    local results=()
+    local desktop_files=()
+
+    mapfile -t desktop_files < <(find_desktop_entries "$app")
+    for desktop_file in "${desktop_files[@]}"; do
+        candidate="$(extract_first_exec_command "$desktop_file" 2>/dev/null || true)"
+        [[ -n "$candidate" ]] || continue
+        [[ -n "${found[$candidate]:-}" ]] && continue
+        found["$candidate"]=1
+        results+=("$candidate")
+    done
+
+    if ((${#results[@]} == 1)); then
+        printf '%s\n' "${results[0]}"
+        return 0
+    fi
+
+    if ((${#results[@]} > 1)); then
+        warn "Multiple desktop candidates found for '$app':"
+        printf '  %s\n' "${results[@]}" >&2
+        return 2
+    fi
+
+    return 1
+}
+
+discover_backend() {
+    local app="$1"
+    local candidate=""
+    local saved=""
+
+    if [[ -n "${APP_OVERRIDES[$app]:-}" ]]; then
+        candidate="$(resolve_executable "${APP_OVERRIDES[$app]}")" || die "Invalid executable override for '$app': ${APP_OVERRIDES[$app]}"
+        is_discovery_candidate "$candidate" || die "The override for '$app' points to a managed launcher or adapter."
+        printf '%s\n' "$candidate"
+        return
+    fi
+
+    if [[ "$REFRESH" == false ]]; then
+        saved="$(read_backend "$app" 2>/dev/null || true)"
+        if [[ -n "$saved" && -x "$saved" ]] && is_discovery_candidate "$saved"; then
+            printf '%s\n' "$(realpath -ms -- "$saved")"
+            return
+        fi
+    fi
+
+    if candidate="$(discover_from_path "$app")"; then
+        printf '%s\n' "$candidate"
+        return
+    elif [[ $? -eq 2 ]]; then
+        die "Use --app $app=EXECUTABLE to select the intended command."
+    fi
+
+    if candidate="$(discover_from_desktop "$app")"; then
+        printf '%s\n' "$candidate"
+        return
+    elif [[ $? -eq 2 ]]; then
+        die "Use --app $app=EXECUTABLE to select the intended command."
+    fi
+
+    return 1
+}
+
+display_name_for() {
+    case "$1" in
+        rider) printf '%s\n' "JetBrains Rider" ;;
+        webstorm) printf '%s\n' "WebStorm" ;;
+        pycharm) printf '%s\n' "PyCharm" ;;
+        datagrip) printf '%s\n' "DataGrip" ;;
+        code) printf '%s\n' "Visual Studio Code" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+desktop_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "$value"
+}
+
+create_backend_file() {
+    local app="$1"
+    local backend="$2"
+    local target="$BACKEND_DIR/$app"
+    local temporary
+
+    temporary="$(mktemp)"
+    {
+        printf '# %s\n' "$MANAGED_MARKER"
+        printf '%s\n' "$backend"
+    } >"$temporary"
+    install_file "$temporary" "$target" 600
+    rm -f -- "$temporary"
+}
+
+create_nautilus_app_script() {
+    local app="$1"
+    local script_name="$app"
+    local target
+    local temporary
+
+    if [[ "$app" == "code" ]]; then
+        script_name="vscode"
+    fi
+    target="$NAUTILUS_DIR/$script_name"
+
+    if path_exists "$target" && grep -q "$NAUTILUS_MARKER" "$target" 2>/dev/null && ! manifest_has_target "$target"; then
+        info "Portable Nautilus script already supplied externally: $target"
+        return
+    fi
+
+    temporary="$(mktemp)"
+    cat >"$temporary" <<EOF
+#!/usr/bin/env bash
+# $NAUTILUS_MARKER
+
+set -Eeuo pipefail
+
+runtime="\${XDG_DATA_HOME:-\$HOME/.local/share}/ide-realpath/$PROGRAM_NAME"
+if [[ ! -x "\$runtime" ]]; then
+    message="ide-realpath is not installed. Run $PROGRAM_NAME first."
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --text="\$message" || true
+    fi
+    printf 'Error: %s\\n' "\$message" >&2
+    exit 127
+fi
+
+exec "\$runtime" --run "$app" "\$@"
+EOF
+    install_file "$temporary" "$target" 755
+    rm -f -- "$temporary"
+}
+
+create_nautilus_terminal_script() {
+    local target="$NAUTILUS_DIR/terminal"
+    local temporary
+
+    if path_exists "$target" && grep -q "$NAUTILUS_MARKER" "$target" 2>/dev/null && ! manifest_has_target "$target"; then
+        info "Portable Nautilus terminal script already supplied externally: $target"
+        return
+    fi
+
+    temporary="$(mktemp)"
+    cat >"$temporary" <<EOF
+#!/usr/bin/env bash
+# $NAUTILUS_MARKER
+
+set -Eeuo pipefail
+
+runtime="\${XDG_DATA_HOME:-\$HOME/.local/share}/ide-realpath/$PROGRAM_NAME"
+if [[ ! -x "\$runtime" ]]; then
+    printf 'Error: ide-realpath is not installed. Run $PROGRAM_NAME first.\\n' >&2
+    exit 127
+fi
+
+exec "\$runtime" --terminal "\${1:-}"
+EOF
+    install_file "$temporary" "$target" 755
+    rm -f -- "$temporary"
+}
+
+create_minimal_desktop() {
+    local app="$1"
+    local target="$APPLICATIONS_DIR/ide-realpath-$app.desktop"
+    local temporary
+    local runtime_quoted
+
+    runtime_quoted="$(desktop_quote "$RUNTIME_PATH")"
+    temporary="$(mktemp)"
+    cat >"$temporary" <<EOF
+[Desktop Entry]
+$DESKTOP_MARKER
+Version=1.0
+Type=Application
+Name=$(display_name_for "$app")
+Exec=$runtime_quoted --run $app %F
+Icon=$app
+Categories=Development;IDE;
+Terminal=false
+StartupNotify=true
+EOF
+    install_file "$temporary" "$target" 644
+    rm -f -- "$temporary"
+}
+
+create_desktop_override() {
+    local app="$1"
+    local source="$2"
+    local id
+    local target
+    local source_copy
+    local temporary
+    local runtime_quoted
+    local original_backup
+
+    id="$(basename -- "$source")"
+    target="$APPLICATIONS_DIR/$id"
+
+    if [[ "$source" == "$target" && "$REFRESH" == false ]] \
+        && is_managed_target "$source" \
+        && manifest_has_target "$target"; then
+        info "Desktop override is current: $target"
+        return
+    fi
+
+    source_copy="$(mktemp)"
+    if is_managed_target "$source"; then
+        original_backup="$(manifest_backup_for "$target" 2>/dev/null || true)"
+        if [[ -n "$original_backup" && -f "$original_backup" ]]; then
+            cp -- "$original_backup" "$source_copy"
+        else
+            cp -- "$source" "$source_copy"
+        fi
+    else
+        cp -- "$source" "$source_copy"
+    fi
+
+    runtime_quoted="$(desktop_quote "$RUNTIME_PATH")"
+    temporary="$(mktemp)"
+    awk -v marker="$DESKTOP_MARKER" -v prefix="$runtime_quoted --exec " '
+        $0 == marker { next }
+        /^Exec=/ {
+            sub(/^Exec=/, "")
+            print "Exec=" prefix $0
+            next
+        }
+        { print }
+    ' "$source_copy" >"$temporary"
+
+    awk -v marker="$DESKTOP_MARKER" '
+        BEGIN { inserted=0 }
+        /^\[Desktop Entry\]$/ && !inserted {
+            print
+            print marker
+            inserted=1
+            next
+        }
+        { print }
+    ' "$temporary" >"$temporary.marked"
+
+    install_file "$temporary.marked" "$target" 644
+    rm -f -- "$source_copy" "$temporary" "$temporary.marked"
+}
+
+update_desktop_cache() {
+    if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "$APPLICATIONS_DIR" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            info "Would update desktop database: $APPLICATIONS_DIR"
+        else
+            update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || warn "Could not update the desktop database."
+        fi
+    fi
+}
+
+uninstall_setup() {
+    if [[ ! -r "$MANIFEST_PATH" ]]; then
+        info "No managed ide-realpath installation was found."
+        return
+    fi
+
+    local target
+    local original_backup
+    local changed_backup
+
+    while IFS=$'\t' read -r target original_backup; do
+        [[ -n "$target" ]] || continue
+
+        if path_exists "$target"; then
+            if ! is_managed_target "$target"; then
+                changed_backup="$(backup_path "$target" "uninstall-changed")"
+                info "Backed up changed target before uninstall: $target -> $changed_backup"
+            fi
+
+            info "Removing managed target: $target"
+            if [[ "$DRY_RUN" == false ]]; then
+                rm -f -- "$target"
+            fi
+        fi
+
+        if [[ -n "$original_backup" && -e "$original_backup" ]]; then
+            info "Restoring original target: $target"
+            if [[ "$DRY_RUN" == false ]]; then
+                mkdir -p -- "$(dirname -- "$target")"
+                cp -a -- "$original_backup" "$target"
+            fi
+        fi
+    done < <(tac "$MANIFEST_PATH")
+
+    if [[ "$DRY_RUN" == false ]]; then
+        rm -f -- "$MANIFEST_PATH"
+        rmdir --ignore-fail-on-non-empty "$BACKEND_DIR" "$XDG_CONFIG_HOME/ide-realpath" "$INSTALL_ROOT" 2>/dev/null || true
+    fi
+
+    update_desktop_cache
+    info "Uninstall complete. Backups remain under: $BACKUP_ROOT"
+}
+
+if [[ "$ACTION" == "uninstall" ]]; then
+    uninstall_setup
+    exit 0
+fi
+
+APPS=("${DEFAULT_APPS[@]}")
+for name in "${!REQUESTED_APPS[@]}"; do
+    app_exists=false
+    for app_name in "${APPS[@]}"; do
+        if [[ "$app_name" == "$name" ]]; then
+            app_exists=true
+            break
+        fi
+    done
+    [[ "$app_exists" == true ]] || APPS+=("$name")
+done
+
+info "Discovering IDE backends..."
+for app_name in "${APPS[@]}"; do
+    if backend="$(discover_backend "$app_name")"; then
+        BACKENDS["$app_name"]="$backend"
+        info "  $app_name -> $backend"
+    elif [[ -n "${REQUESTED_APPS[$app_name]:-}" ]]; then
+        die "Could not discover the explicitly requested app '$app_name'."
+    else
+        warn "Skipping unavailable app: $app_name"
+    fi
+done
+
+((${#BACKENDS[@]} > 0)) || die "No supported IDE backend was discovered. Use --app NAME=EXECUTABLE."
+
+info "Installing ide-realpath runtime..."
+if [[ "$SCRIPT_PATH" == "$(realpath -m -- "$RUNTIME_PATH")" ]]; then
+    info "Runtime is already executing from its install location."
+else
+    install_file "$SCRIPT_PATH" "$RUNTIME_PATH" 755
+fi
+
+for app_name in "${!BACKENDS[@]}"; do
+    create_backend_file "$app_name" "${BACKENDS[$app_name]}"
+    install_symlink "$XDG_BIN_HOME/$app_name"
+done
+
+for app_name in "${APPS[@]}"; do
+    create_nautilus_app_script "$app_name"
+done
+
+if command -v gnome-terminal >/dev/null 2>&1; then
+    create_nautilus_terminal_script
+else
+    warn "Skipping Nautilus terminal integration because gnome-terminal is unavailable."
+fi
+
+for app_name in "${!BACKENDS[@]}"; do
+    mapfile -t matching_desktops < <(find_desktop_entries "$app_name")
+    if ((${#matching_desktops[@]} == 0)); then
+        create_minimal_desktop "$app_name"
+        continue
+    fi
+
+    for desktop_file in "${matching_desktops[@]}"; do
+        create_desktop_override "$app_name" "$desktop_file"
+    done
+done
+
+update_desktop_cache
+
+if [[ "$DRY_RUN" == true ]]; then
+    info "Dry run complete. No files were changed."
+    exit 0
+fi
+
+info "Installation complete."
+info "Restart Nautilus or sign out and back in if its Scripts menu still uses old launchers."
+if [[ ":$PATH:" != *":$XDG_BIN_HOME:"* ]]; then
+    warn "$XDG_BIN_HOME is not in PATH; graphical integrations work, but CLI shims require adding it to PATH."
+fi
+info "Close affected IDEs, remove stale bin/obj folders manually once, then restore and build from the canonical project path."

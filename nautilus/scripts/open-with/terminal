@@ -1,9 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ide-realpath-portable-nautilus
 
-if [ -d "$1" ]; then
-    path="$1"
-else
-    path="$PWD"
+set -Eeuo pipefail
+
+runtime="${XDG_DATA_HOME:-$HOME/.local/share}/ide-realpath/ide-realpath-setup"
+if [[ ! -x "$runtime" ]]; then
+    printf 'Error: ide-realpath is not installed. Run ide-realpath-setup first.\n' >&2
+    exit 127
 fi
 
-gnome-terminal --working-directory="$path"
+exec "$runtime" --terminal "${1:-}"

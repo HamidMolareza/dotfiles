@@ -26,6 +26,22 @@ This repository contains configuration files and scripts to set up and manage a 
    ```
 3. Review and customize configuration files as needed.
 
+## Canonical IDE Paths
+
+Desktop symlinks can expose the same project through multiple logical paths.
+Use the portable IDE setup command to ensure Nautilus, desktop launchers, and
+CLI commands resolve existing project paths before opening them:
+
+```sh
+ide-realpath-setup --dry-run
+ide-realpath-setup
+```
+
+The command supports Rider, WebStorm, PyCharm, DataGrip, VS Code, and the
+Nautilus terminal action. Run `ide-realpath-setup --help` for executable
+overrides, refresh, and uninstall options. The script is self-contained and can
+also be copied and run directly on another Ubuntu system.
+
 ## Customization
 
 - Edit `.aliases`, `.bashrc`, `.zshrc`, and `.exports` to add or modify shell settings.

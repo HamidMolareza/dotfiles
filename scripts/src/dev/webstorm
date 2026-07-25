@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
+# ide-realpath-adapter
 
 set -Eeuo pipefail
 
-IDE="/home/home/Programs/WebStorm/bin/webstorm"
+RUNTIME="${XDG_DATA_HOME:-$HOME/.local/share}/ide-realpath/ide-realpath-setup"
 
-if [[ ! -x "$IDE" ]]; then
-    echo "Error: WebStorm launcher is not executable: $IDE" >&2
+if [[ ! -x "$RUNTIME" ]]; then
+    echo "Error: ide-realpath is not installed. Run ide-realpath-setup first." >&2
     exit 127
 fi
 
-if command -v setsid >/dev/null 2>&1; then
-    setsid -f "$IDE" "$@" >/dev/null 2>&1
-else
-    nohup "$IDE" "$@" >/dev/null 2>&1 &
-fi
+exec "$RUNTIME" --run webstorm "$@"

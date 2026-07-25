@@ -1,11 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ide-realpath-portable-nautilus
 
-# Check if 'webstorm' exists
-if command -v rider >/dev/null 2>&1; then
-    rider "$1"
-elif command -v rider.sh >/dev/null 2>&1; then
-    rider.sh "$1"
-else
-    zenity --error --text="Neither 'rider' nor 'rider.sh' commands exist."
-    echo 
+set -Eeuo pipefail
+
+runtime="${XDG_DATA_HOME:-$HOME/.local/share}/ide-realpath/ide-realpath-setup"
+if [[ ! -x "$runtime" ]]; then
+    message="ide-realpath is not installed. Run ide-realpath-setup first."
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --text="$message" || true
+    fi
+    printf 'Error: %s\n' "$message" >&2
+    exit 127
 fi
+
+exec "$runtime" --run rider "$@"

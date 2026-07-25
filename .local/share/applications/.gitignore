@@ -1,4 +1,6 @@
 chrome-*
+code_*.desktop
+com.abdownloadmanager.desktop
 DataGrip-*
 install4j-*
 jetbrains-*
@@ -6,4 +8,5 @@ PyCharm-*
 Rider-*
 WebStorm-*
 install4j_*
+io.github.hamidmolareza.RoutePulse.desktop
 *.cache

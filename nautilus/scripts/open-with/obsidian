@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+app_id="md.obsidian.Obsidian"
+config_file="$HOME/.var/app/$app_id/config/obsidian/obsidian.json"
+
+show_error() {
+    local message="$1"
+
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --text="$message" || true
+    fi
+    printf 'Error: %s\n' "$message" >&2
+}
+
+obsidian_is_running() {
+    flatpak ps --columns=application 2>/dev/null | grep -Fxq "$app_id"
+}
+
+find_vault_id() {
+    local path="$1"
+
+    jq -r --arg path "$path" '
+        first(
+            (.vaults // {})
+            | to_entries[]
+            | select(.value.path == $path)
+            | .key
+        ) // empty
+    ' "$config_file"
+}
+
+register_vault() {
+    local path="$1"
+    local vault_id
+    local timestamp
+    local temporary_file
+
+    vault_id="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+    timestamp="$(date +%s%3N)"
+    temporary_file="$(mktemp "${config_file}.XXXXXX")"
+
+    if ! jq \
+        --arg id "$vault_id" \
+        --arg path "$path" \
+        --argjson timestamp "$timestamp" \
+        '(.vaults //= {}) | .vaults[$id] = {path: $path, ts: $timestamp}' \
+        "$config_file" >"$temporary_file"; then
+        rm -f -- "$temporary_file"
+        return 1
+    fi
+
+    chmod --reference="$config_file" "$temporary_file"
+    mv -f -- "$temporary_file" "$config_file"
+    printf '%s\n' "$vault_id"
+}
+
+if (($# == 0)); then
+    show_error "Select at least one folder before running this script."
+    exit 2
+fi
+
+if ! command -v flatpak >/dev/null 2>&1 || ! flatpak info "$app_id" >/dev/null 2>&1; then
+    show_error "The Obsidian Flatpak is not installed."
+    exit 127
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    show_error "jq is required to register folders as Obsidian vaults."
+    exit 127
+fi
+
+if [[ ! -r "$config_file" ]] || ! jq -e 'type == "object"' "$config_file" >/dev/null 2>&1; then
+    show_error "Obsidian's configuration is unavailable. Launch Obsidian once, close it, and try again."
+    exit 1
+fi
+
+declare -a vault_ids=()
+declare -a unregistered_paths=()
+
+for argument in "$@"; do
+    if [[ ! -d "$argument" ]]; then
+        show_error "Not a folder: $argument"
+        exit 2
+    fi
+
+    path="$(realpath -e -- "$argument")"
+    vault_id="$(find_vault_id "$path")"
+
+    if [[ -n "$vault_id" ]]; then
+        vault_ids+=("$vault_id")
+    else
+        unregistered_paths+=("$path")
+    fi
+done
+
+if ((${#unregistered_paths[@]} > 0)); then
+    if obsidian_is_running; then
+        show_error "Close Obsidian and run this script again to register the selected folder as a vault."
+        exit 1
+    fi
+
+    for path in "${unregistered_paths[@]}"; do
+        if ! vault_id="$(register_vault "$path")"; then
+            show_error "Could not register this folder as an Obsidian vault: $path"
+            exit 1
+        fi
+        vault_ids+=("$vault_id")
+    done
+fi
+
+for vault_id in "${vault_ids[@]}"; do
+    gio open "obsidian://open?vault=$vault_id" >/dev/null
+done

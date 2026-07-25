@@ -1,9 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ide-realpath-portable-nautilus
 
-# Check if code is installed
-if ! command -v code &> /dev/null; then
-    zenity --error --text="VSCode" "code could not be found. Please install it to use this script."
-    exit 1
+set -Eeuo pipefail
+
+runtime="${XDG_DATA_HOME:-$HOME/.local/share}/ide-realpath/ide-realpath-setup"
+if [[ ! -x "$runtime" ]]; then
+    message="ide-realpath is not installed. Run ide-realpath-setup first."
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --text="$message" || true
+    fi
+    printf 'Error: %s\n' "$message" >&2
+    exit 127
 fi
 
-code --new-window "$@"
+exec "$runtime" --run code --new-window "$@"
