@@ -26,19 +26,19 @@ All active configuration lives under `config/`:
   `!`; relative exclude-file references resolve from the profile directory.
 - `config/manual/home.manual` contains `Title` or `Title | Description` checklist
   entries.
-- `config/collectors/enabled.conf` contains `MODE|NAME|COMMAND` collector entries.
+- `config/collectors/enabled.conf` contains
+  `PRIORITY|MODE|NAME|COMMAND[|TIMEOUT_SECONDS]` collector entries. Priorities are
+  unique non-negative integers and lower values run first. The timeout is a positive
+  integer and defaults to 1800 seconds. The legacy three-column form is rejected
+  with migration guidance.
 - `config/docker-recovery/local.conf` contains the local home-relative service paths,
   container and volume names, Compose identifiers, and helper images used by the
-  optional Docker collector and restore handler. It is ignored by Git; only an
+  optional Docker collector. It is ignored by Git; only an
   inactive sample is tracked.
-- `config/{credentials,codex-mcp,browser,github,server}-recovery/local.conf` contains
-  reviewed machine/account/application selections for the corresponding collector
-  and handler. These files are ignored; tracked `.sample` files contain no personal
+- `config/{credentials,codex-mcp,browser,github,gitlab,knowledge,server}-recovery/local.conf` contains
+  reviewed machine/account/application selections for the corresponding collector.
+  These files are ignored; tracked `.sample` files contain no personal
   account, host, token, or absolute machine path.
-- `config/restore/handlers.local.conf` optionally contains
-  `COLLECTOR|ABSOLUTE_EXECUTABLE` restore-handler entries. A missing default local
-  file is valid. Only trusted local executables may be configured; code stored in a
-  snapshot must never be executed.
 - `config/retention/default.conf` contains `keep_last=POSITIVE_INTEGER`.
 
 Comments start with `#`; blank lines are ignored. Control characters, unknown keys,
@@ -52,7 +52,7 @@ Required commands are `plan`, `manual`, `run`, `list`, `verify`, `restore`,
 `restore-plan`, `recover`, `prune`, `drill`, and `help`.
 
 Global options are `--dest`, `--config-file`, `--manual-file`, `--collectors-file`,
-`--handlers-file`, `--retention-file`, `--dry-run`, `--verbose`, `--yes`,
+`--retention-file`, `--dry-run`, `--verbose`, `--yes`,
 `--ignore-errors`, and `--log-file`. Command options include `--snapshot`, `--path`,
 `--restore-to`, `--keep-last`, `--deep`, `--target-user`, `--target-home`,
 `--staging-dir`, repeatable `--map-path SOURCE=TARGET`, repeatable
@@ -60,8 +60,9 @@ Global options are `--dest`, `--config-file`, `--manual-file`, `--collectors-fil
 `--all`, `--skip-deep-verify`, and `--allow-legacy`.
 
 `--ignore-errors` may allow an operation to finish collecting diagnostics, but it
-must never turn a required collector, rsync, verify, restore, drill, lock, or prune
-failure into a successful exit code.
+must never turn a required collector, serious rsync error, verify, restore, drill,
+lock, or prune failure into a successful exit code. Rsync exit code 24 is a warning
+because live source files may vanish during traversal.
 
 ## Snapshot transaction and layout
 
@@ -73,42 +74,77 @@ failure into a successful exit code.
 - Final snapshots preserve absolute path layout and may reuse unchanged files with
   `rsync --link-dest` against the latest finalized snapshot.
 - Every final snapshot contains `.backup-home/manifest.tsv`, `report.txt`,
-  `checksums.sha256`, and stable `artifacts/manual` and `artifacts/collectors`
-  locations.
-- New snapshots use manifest schema v2. The manifest records schema version, timing,
+  `checksums.sha256`, and a stable `artifacts/collectors` location.
+- New snapshots use manifest schema v3. The manifest records schema version, timing,
   host and OS, source user/UID/GID/home, safe config digest, roots, excludes,
   previous snapshot, collector results, rsync status, warnings, payload metrics,
   checksum count, script revision/digest, sensitive-profile state, best-effort
-  destination-encryption detection, and the configured unencrypted-destination
-  policy. It must not contain tokens, environment dumps, or raw authentication
-  diagnostics. Schema v1 remains readable.
+  destination-encryption detection, configured unencrypted-destination policy, and
+  each collector's priority, protocol version, and restore capability. It must not
+  contain tokens, environment dumps, or raw authentication diagnostics. Schemas v1
+  and v2 remain readable.
 
 ## Collectors and manual staging
 
-- Collectors are explicitly enabled as `required|name|builtin:system-inventory` or
-  `optional|name|/absolute/executable`; arbitrary directory auto-discovery and
-  `eval` are forbidden.
-- Each collector receives a private staging directory through
-  `BACKUP_HOME_STAGE_DIR`, plus `BACKUP_HOME_SNAPSHOT_NAME`, `BACKUP_HOME_DEST`,
-  `BACKUP_HOME_SOURCE_HOME`, `BACKUP_HOME_PROFILE_FILE`, and
-  `BACKUP_HOME_RUN_STARTED_AT`. Dry runs list collectors but never execute them.
-- A required collector failure aborts the backup. An optional collector failure is
-  recorded as a warning and may produce a successful-with-warnings snapshot.
-- The opt-in system inventory collector exports dconf, manual APT packages, dpkg
-  selections, Snap and Flatpak lists when available, crontab, selected Nautilus
-  data, OS/tool versions, and conservative restore guidance. It never uses sudo or
-  automatically restores settings.
+- Collectors are explicitly enabled as
+  `priority|required|name|/absolute/executable[|timeout-seconds]` or
+  `priority|optional|name|/absolute/executable[|timeout-seconds]`; arbitrary
+  directory auto-discovery, snapshot code execution, built-in application
+  collectors, and `eval` are forbidden.
+- Every collector executable provides read-only `metadata`, mandatory `backup`, and
+  optional `restore describe|preflight|apply|verify|guide` operations. Exit code 20
+  means manual work remains and 64 means restore is unsupported.
+- The core passes a versioned, non-secret `BACKUP_HOME_*` context containing
+  collector identity/order/mode/timeout, project/profile/destination/run/host/source
+  identity, staging paths, and dry-run/verbosity. Restore adds snapshot,
+  artifact/session/staging, source/target identity, selected component, approval,
+  yes, and dry-run state. The full contract is documented in
+  `docs/collector-contract.md`.
+- A required collector failure or timeout aborts the backup. An optional collector
+  failure or timeout is recorded as a warning and produces a
+  successful-with-warnings snapshot. Partial output from a failed collector is
+  deleted and replaced by a private `failure.tsv` marker before later collectors
+  continue.
+- The external Ubuntu system inventory collector exports dconf including Deja Dup,
+  manual APT packages, dpkg selections, Snap and Flatpak lists when available,
+  crontab, selected Nautilus data, and OS/tool versions. Package application stays
+  guided; dconf application requires exact component approval, a private pre-restore
+  copy, reset of the exact selected subtree before load, and post-apply equality
+  verification. Crontab also requires exact approval, a private copy, and equality
+  verification. Inventory command failures create explicit collector warnings and
+  never leave partial output files that can be mistaken for valid inventory. A real
+  no-crontab response is recorded separately from execution failures. Nautilus
+  directory symlinks are resolved within the source home and stored as regular
+  logical home-relative directories.
+- The knowledge collector selects only configured image/document extensions from
+  the rsync-excluded `my-files/learning-daily` tree, preserves home-relative paths,
+  and supports safety-copying restore. Restore revalidates artifact path metadata
+  and rejects traversal or symlink escapes outside artifact, target, and session
+  roots.
+- The manual backup collector owns the interactive checklist and staging workflow.
+  A normalized empty checklist succeeds unattended with valid empty artifacts;
+  non-empty checklists require a terminal. Restore is intentionally unsupported.
+- A GitLab collector is shipped disabled. It prefers `glab`, has a reviewed
+  paginated `curl`/`jq` API fallback, explicitly supports either owned projects or
+  accessible membership projects, verifies the authenticated username against the
+  configured account before enumeration, mirrors repositories and metadata, and
+  limits automatic recovery to a safe local copy with manual remote rebuild guidance.
 - Repository recovery uses only an explicit external collector or an included local
   artifact path. GitHub/GitLab clone and API logic do not belong in the backup core.
 - Every shipped recovery collector writes `index.tsv`, `checksums.sha256`, and
   `RESTORE.md`, uses a private staging directory, never prints secret contents, and
   fails rather than silently omitting a required configured source.
 - The credentials collector creates component-separated metadata-preserving archives
-  for explicitly configured SSH/GPG, keyring, GitHub CLI, and Codex credential paths.
+  for explicitly configured SSH/GPG, keyring, and Codex credential paths. GitHub
+  account credentials belong exclusively to the GitHub collector.
 - The Codex/MCP collector uses the Python standard-library SQLite online backup API
-  and `PRAGMA quick_check`. Candidate roots must not contain an unclassified
-  SQLite-like file. Raw WAL/SHM/database files may be excluded only after explicit
-  classification.
+  and `PRAGMA quick_check`. A SQLite-like file discovered below a candidate root is
+  assigned the root's unambiguous configured category, backed up automatically, and
+  recorded as a warning until explicitly classified. An unreadable or ambiguously
+  categorized discovered candidate is skipped with a warning; an explicitly
+  configured database remains required and fails the collector when unavailable or
+  inconsistent. Raw WAL/SHM/database files may be excluded only when covered by this
+  collector.
 - The browser collector is targeted: bookmark backups, open-session files, sanitized
   extension inventory, and allowlisted extension state are permitted. Raw profiles,
   history, cookies, saved passwords, and unselected extension state are forbidden.
@@ -132,10 +168,12 @@ failure into a successful exit code.
   bind-mounted configuration and runtime data, and checksum every artifact.
   Raw live database storage may be excluded from rsync only when this collector is
   required by the active configuration. A running stateful service without an
-  application-aware handler must fail the collector instead of producing a
+  application-aware collector must fail instead of producing a
   misleading successful snapshot.
-- Real manual staging remains interactive and is stored under the stable manual
-  artifact path. All staging is removed on success, error, cancellation, or signal.
+- Real manual staging remains interactive through a required manual collector. In
+  optional mode, the collector records the deferred checklist and a warning without
+  prompting or blocking the snapshot. All staging is removed on success, error,
+  cancellation, or signal.
 
 ## Locking, retention, verification, and restore
 
@@ -167,13 +205,12 @@ failure into a successful exit code.
   preflight report, and `recover` is the component-aware guided workflow.
 - `restore-plan` validates the selected snapshot, manifest status, captured roots,
   collector artifacts, file count, recorded checksum set, source and target identity,
-  target free space, path mappings, handlers, component risks, and legacy failure
+  target free space, path mappings, collectors, component risks, and legacy failure
   evidence. Deep verification is the default; skipping it must be explicit.
-- Recovery components may be filesystem roots, system inventory, trusted local
-  handler components, or collector-artifact fallbacks. A handler supports
-  `describe`, `preflight`, `apply`, `verify`, and `guide`; its protocol and environment
-  are documented and versioned with the tool. Unknown collector artifacts remain
-  available in staging with manual guidance.
+- Recovery components may be filesystem roots, trusted local collector components,
+  or collector-artifact fallbacks. The core routes opaque component IDs back to the
+  active trusted collector executable. Unknown or unsupported collector artifacts
+  remain available in staging with manual guidance.
 - Recovery sessions live below
   `${XDG_STATE_HOME:-$HOME/.local/state}/backup-home/recovery/SESSION_ID`, with
   directories mode `0700` and state, plan, and guidance files mode `0600`. State is
@@ -194,16 +231,17 @@ failure into a successful exit code.
   safe and privileged components but skips destructive work; destructive work needs
   the matching `--approve-destructive ID`.
 - `sudo` may be used only when explicitly needed to set target ownership or by a
-  trusted application handler. Package installation, dconf import, crontab import,
-  and SQL Server database replacement remain reviewable manual steps rather than
-  silent automation.
-- The shipped Docker handler automates TaskSorter, Joplin Server, and AdGuard recovery
+  trusted application collector. Package installation and SQL Server database
+  replacement remain guided manual steps. Dconf and crontab imports require exact
+  component approval and are never silent.
+- The shipped Docker collector automates TaskSorter, Joplin Server, and AdGuard recovery
   where verified artifacts and local prerequisites are available. It prepares SQL
   Server artifacts and a T-SQL template but intentionally leaves the final database
   selection and replacement to the operator.
-- Tracked handlers for credentials, Codex/MCP databases, targeted browser data,
-  GitHub recovery, and server recovery are automatically registered when executable
-  and not overridden locally. They create safety copies before approved replacement.
+- The trusted local collectors for credentials, Codex/MCP databases, targeted
+  browser data, GitHub recovery, and server recovery expose their recovery
+  components from the same executable. They create safety copies before approved
+  replacement.
   Browser installation, GitHub remote creation/push, server network/firewall changes,
   secret rotation, and Joplin remote database replacement remain guided steps.
 - Legacy snapshots remain available to low-level restore. Guided recovery warns that
@@ -225,9 +263,9 @@ write dated logs, and never expose secrets in summaries.
 Acceptance requires syntax and ShellCheck validation plus isolated integration tests
 for help/plan/dry-run, two linked snapshots, manifests, collectors, failure cleanup,
 locking, pruning, basic/deep verification, legacy handling, safe partial restore,
-restore drill, traversal rejection, manifest v2 identity, read-only recovery plans,
+restore drill, traversal rejection, manifest v3 identity and v1/v2 compatibility, read-only recovery plans,
 staging and conflict handling, resumable sessions, destructive approval boundaries,
-trusted restore handlers, collector fallbacks, and meaningful exit codes.
+unified collector restore, collector fallbacks, and meaningful exit codes.
 Acceptance also requires isolated tests for sensitive-destination policy, live-WAL
 SQLite backup, explicit database classification, targeted browser boundaries, and
 GitHub/server freshness fallback.

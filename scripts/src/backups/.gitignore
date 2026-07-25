@@ -11,7 +11,9 @@ config/codex-mcp-recovery/*.conf
 config/browser-recovery/*.conf
 config/github-recovery/*.conf
 config/server-recovery/*.conf
-config/restore/*.conf
-!config/restore/handlers.local.conf.sample
+config/knowledge-recovery/*.conf
+!config/knowledge-recovery/local.conf.sample
+config/gitlab-recovery/*.conf
+!config/gitlab-recovery/local.conf.sample
 __pycache__/
 *.pyc

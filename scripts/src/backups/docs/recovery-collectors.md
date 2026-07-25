@@ -2,7 +2,7 @@
 
 The recovery collectors keep application-specific consistency logic outside the
 `backup-home` core. They are explicit executables in `config/collectors/enabled.conf`;
-none is discovered or executed implicitly. Their matching trusted handlers are
+none is discovered or executed implicitly. Their trusted restore operations are
 automatically registered from the local checkout and never from snapshot data.
 
 Every collector writes a private artifact directory containing:
@@ -35,10 +35,26 @@ the policy decision but does not make the data safe.
 
 `credentials-recovery` accepts `COMPONENT|HOME_RELATIVE_PATH` entries. Each component
 becomes a separate metadata-preserving tar archive so SSH/GPG material, the GNOME
-keyring, GitHub CLI state, and Codex authentication can be approved independently.
-The handler validates archive paths, creates a private pre-restore archive for
+keyring, and Codex authentication can be approved independently.
+The collector validates archive paths, creates a private pre-restore archive for
 existing state, extracts without trusting snapshot ownership, and then corrects
 target ownership when needed. It never prints archive contents.
+
+GitHub CLI authentication is owned exclusively by `github-recovery`, which validates
+the selected account and keeps it out of the generic credentials collector.
+
+## System inventory
+
+`system-inventory` stages package and Nautilus recovery artifacts privately and
+returns `manual-pending`; it never installs packages or merges Nautilus files.
+Package guidance covers reviewed APT differences, dpkg inventory, Snap, and Flatpak.
+Nautilus guidance identifies the preserved source layout and the target-home
+directories that require a manual merge.
+
+The destructive dconf components first create a private safety dump, run
+`dconf reset -f` for the exact selected subtree, load the artifact, and verify the
+complete resulting subtree. Crontab recovery uses the same safety-before-mutation and
+exact-verification rule.
 
 ## Codex and MCP
 
@@ -46,12 +62,15 @@ target ownership when needed. It never prints archive contents.
 `codex` or `mcp` category. SQLite files are copied through the online backup API and
 checked with `PRAGMA quick_check`; a static classification is reserved for a
 database-like legacy file that SQLite cannot open. Candidate roots are scanned, and
-an unclassified `.db`, `.sqlite`, or `.sqlite3` file fails the collector to prevent
-silent data loss.
+an unclassified `.db`, `.sqlite`, or `.sqlite3` file inherits the candidate root's
+unambiguous configured category. A valid database is backed up automatically with a
+warning; an unreadable or ambiguously categorized candidate is skipped with a
+warning. Explicitly configured files remain required and fail the collector when
+they cannot be backed up.
 
 Normal profile includes retain sessions, memories, logs, skills, configuration, and
 MCP logs. Raw classified databases and their WAL/SHM files are excluded from rsync.
-During recovery, close Codex and MCP processes. The handler safety-copies the current
+During recovery, close Codex and MCP processes. The collector safety-copies the current
 database and sidecars, installs the clean artifact with private mode, removes stale
 sidecars, and repeats the integrity check.
 
@@ -68,7 +87,7 @@ sidecars, and repeats the integrity check.
 It excludes history, cookies, saved browser passwords, caches, and unselected
 extension state. Firefox extension data is keyed by stable extension ID in local
 configuration. The collector resolves that ID to the source profile UUID; the
-handler resolves it again on the new machine, so OneTab and other allowlisted state
+collector resolves it again on the new machine, so OneTab and other allowlisted state
 can move between different profile UUIDs.
 
 All browsers must be closed for restore. Install each extension from its official
@@ -118,7 +137,7 @@ PostgreSQL storage. A configured trusted Joplin helper performs the logical
 PostgreSQL dump and local checksum verification separately. A failed remote refresh
 may use a cache only within `max-age-hours`, which should normally be 24.
 
-The handler can replace the Gateway Monitor and GitHub proxy SQLite databases only
+The collector can replace the Gateway Monitor and GitHub proxy SQLite databases only
 after exact destructive approval. It uploads one clean database, keeps a timestamped
 remote copy of the database and sidecars, stops one explicitly configured systemd
 unit or Docker container, installs the artifact atomically, starts it, and verifies

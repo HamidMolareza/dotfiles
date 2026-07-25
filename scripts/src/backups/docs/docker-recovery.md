@@ -39,7 +39,7 @@ cp config/docker-recovery/local.conf.sample config/docker-recovery/local.conf
 The ignored file defines home-relative TaskSorter and service paths, Docker object
 names, Compose identifiers, helper images, and the list of unsupported running
 stateful containers that must block a backup. It contains no passwords or connection
-strings. Both the collector and trusted restore handler reject missing, unknown,
+strings. Both backup and restore operations reject missing, unknown,
 duplicate, malformed, absolute, or traversal-bearing path settings.
 
 For example, a local home profile may separately include:
@@ -62,7 +62,7 @@ the corresponding database is stopped. Restore them only while every consumer is
 stopped and only with the same database major version. Restoring databases remains an
 explicit operator action at collection time; the collector never replaces active
 data. Guided recovery may apply supported artifacts later through the separate,
-trusted local restore handler and its approval rules.
+trusted local collector and its approval rules.
 
 TaskSorter's Data Protection keys must be restored before the backend starts if
 existing encrypted cookies or protected payloads need to remain readable.
@@ -71,7 +71,7 @@ Stop AdGuard before extracting `config.tar` into its bind-mounted `confdir` or
 `work-data.tar` into `workdir/data`, then validate DNS and the administration UI
 after restart.
 
-## Guided restore handler
+## Guided collector restore
 
 Run a read-only target and artifact preflight first:
 
@@ -81,7 +81,7 @@ Run a read-only target and artifact preflight first:
 ```
 
 When Docker recovery artifacts are present, the trusted
-`restore-handlers/docker-recovery` exposes these component IDs:
+`collectors/docker-recovery restore` exposes these component IDs:
 
 | Component | Automated behavior | Replacement boundary |
 | --- | --- | --- |
@@ -109,7 +109,7 @@ target and planned safety copy:
   --yes
 ```
 
-The handler rechecks destructive approval independently. Application safety archives
+The collector rechecks destructive approval independently. Application safety archives
 are stored under the private recovery session. Core filesystem merge safety copies
 are stored below its `pre-restore/` directory. Keep both until application-level
 verification succeeds.
@@ -133,8 +133,8 @@ databases blindly.
   database set needs several gigabytes of temporary space.
 - Treat collector warnings as recovery work, not harmless noise. A snapshot with a
   collector warning is finalized as `success-with-warnings`.
-- List locally running stateful containers without an application-aware handler in
+- List locally running stateful containers without an application-aware collector in
   `unsupported_containers`. If one is running, the required collector fails instead
   of copying live raw storage and claiming success.
-- Restore handlers are local trusted code. Never copy or execute a handler from a
-  snapshot; see `restore-handler-contract.md` for the protocol and trust boundary.
+- Collectors are local trusted code. Never copy or execute code from a snapshot;
+  see `collector-contract.md` for the protocol and trust boundary.

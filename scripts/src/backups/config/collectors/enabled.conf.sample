@@ -1,10 +1,13 @@
-# mode|unique-name|collector-command
+# priority|mode|unique-name|collector-command|timeout-seconds
+# timeout-seconds is optional and defaults to 1800.
 # All collectors are disabled in this sample until the operator reviews them.
-# required|system-inventory|builtin:system-inventory
-# required|docker-recovery|/absolute/path/to/collectors/docker-recovery
-# required|credentials-recovery|/absolute/path/to/collectors/credentials-recovery
-# required|codex-mcp-recovery|/absolute/path/to/collectors/codex-mcp-recovery
-# required|browser-recovery|/absolute/path/to/collectors/browser-recovery
-# required|github-recovery|/absolute/path/to/collectors/github-recovery
-# required|server-recovery|/absolute/path/to/collectors/server-recovery
-# optional|repository-export|/absolute/path/to/repository-export-wrapper
+# 100|optional|system-inventory|/absolute/path/to/collectors/system-inventory|300
+# 200|optional|credentials-recovery|/absolute/path/to/collectors/credentials-recovery|300
+# 300|optional|codex-mcp-recovery|/absolute/path/to/collectors/codex-mcp-recovery|900
+# 400|optional|browser-recovery|/absolute/path/to/collectors/browser-recovery|300
+# 500|optional|knowledge-recovery|/absolute/path/to/collectors/knowledge-recovery|900
+# 600|optional|docker-recovery|/absolute/path/to/collectors/docker-recovery|3600
+# 700|optional|github-recovery|/absolute/path/to/collectors/github-recovery|3600
+# 750|optional|gitlab-recovery|/absolute/path/to/collectors/gitlab-recovery|3600
+# 800|optional|server-recovery|/absolute/path/to/collectors/server-recovery|3600
+# 900|optional|manual-backup|/absolute/path/to/collectors/manual-backup|60

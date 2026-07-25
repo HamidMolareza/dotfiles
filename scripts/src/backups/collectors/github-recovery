@@ -6,6 +6,8 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/collector-common
 source "$PROJECT_DIR/lib/collector-common"
 
+collector_dispatch "${1:-backup}" supported "$PROJECT_DIR/lib/collector-restore/github-recovery" "${@:2}"
+
 CONFIG_FILE="${BACKUP_HOME_GITHUB_CONFIG:-$PROJECT_DIR/config/github-recovery/local.conf}"
 EXPORT_HELPER="$PROJECT_DIR/lib/github-export.py"
 CACHE_RELATIVE="backups/github"
@@ -241,7 +243,7 @@ cache_is_fresh() {
 
 main() {
   local command cache_root account lock_file
-  for command in cut date env find flock gh git grep mkdir mktemp mv python3 rm sha256sum sort tar wc; do collector_require_command "$command"; done
+  for command in cut date env find flock gh git grep mkdir mktemp mv python3 rm rsync sha256sum sort tar wc; do collector_require_command "$command"; done
   collector_init
   load_config
   write_askpass
@@ -254,23 +256,27 @@ main() {
   printf 'account\trepositories\trefreshed_at\n' >"$COLLECTOR_STAGE_DIR/accounts.tsv"
   for account in "${ACCOUNTS[@]}"; do
     if refresh_account "$account" "$cache_root"; then
-      collector_index github-account "$account" "$CACHE_RELATIVE/accounts/$account" success "owned repositories"
+      collector_index github-account "$account" "cache/accounts/$account" success "owned repositories"
     elif cache_is_fresh "$cache_root/accounts/$account/.last-success"; then
       ACTIVE_TOKEN=""
       collector_warn "GitHub refresh failed; using cache younger than $MAX_AGE_HOURS hours: $account"
-      collector_index github-account "$account" "$CACHE_RELATIVE/accounts/$account" cached "refresh failed"
+      collector_index github-account "$account" "cache/accounts/$account" cached "refresh failed"
     else
       collector_fail "GitHub refresh failed and cache is stale or missing: $account"
     fi
+    mkdir -p -- "$COLLECTOR_STAGE_DIR/cache/accounts/$account"
+    rsync --archive --delete --exclude=.collector.lock --exclude=.refresh-incomplete \
+      "$cache_root/accounts/$account/" "$COLLECTOR_STAGE_DIR/cache/accounts/$account/"
   done
   printf 'cache_relative\t%s\n' "$CACHE_RELATIVE" >"$COLLECTOR_STAGE_DIR/cache.tsv"
   cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
 # GitHub recovery
 
-The home snapshot contains bare repository, wiki, and gist mirrors plus exported
-metadata and recent official user-migration archives. Secret values for Actions and
+This collector artifact contains bare repository, wiki, and gist mirrors plus
+exported metadata and recent official user-migration archives for only the configured
+accounts. Secret values for Actions and
 webhooks cannot be read back through GitHub APIs; restore those from a separate
-password manager. The guided handler can restore local GitHub CLI credentials but
+password manager. Guided recovery can restore local GitHub CLI credentials but
 never creates repositories or pushes mirrors automatically. Review the generated
 remote-rebuild instructions before changing GitHub.
 EOF

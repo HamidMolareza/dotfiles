@@ -1,0 +1,3 @@
+# Home-relative source and comma-separated extension allowlist.
+source-relative|my-files/learning-daily
+extensions|png,jpg,jpeg,gif,bmp,webp,tif,tiff,heic,svg,pdf,txt,md

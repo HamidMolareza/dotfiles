@@ -1,7 +1,7 @@
 # Backup Home Manifest Schema v1
 
-This document describes the previous manifest format. New snapshots use schema v2,
-documented in `manifest-v2.md`; schema v1 remains readable for compatibility.
+This document describes the previous manifest format. New snapshots use schema v3,
+documented in `manifest-v3.md`; schemas v1 and v2 remain readable.
 
 Every finalized snapshot created by `backup-home` contains:
 

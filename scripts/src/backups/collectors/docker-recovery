@@ -3,8 +3,12 @@
 set -Eeuo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
 # shellcheck source=lib/docker-recovery-config
 source "$PROJECT_DIR/lib/docker-recovery-config"
+
+collector_dispatch "${1:-backup}" supported "$PROJECT_DIR/lib/collector-restore/docker-recovery" "${@:2}"
 
 STAGE_DIR="${BACKUP_HOME_STAGE_DIR:-}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"

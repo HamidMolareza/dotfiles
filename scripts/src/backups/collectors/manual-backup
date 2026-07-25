@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+ACTION="${1:-backup}"
+MANUAL_FILE="${BACKUP_HOME_MANUAL_FILE:-$PROJECT_DIR/config/manual/home.manual}"
+COLLECTOR_MODE="${BACKUP_HOME_COLLECTOR_MODE:-required}"
+
+case "$ACTION" in
+  metadata)
+    collector_metadata unsupported
+    ;;
+  restore)
+    exit 64
+    ;;
+  backup)
+    declare -a task_titles=()
+    declare -a task_descriptions=()
+    [[ "$COLLECTOR_MODE" == "required" || "$COLLECTOR_MODE" == "optional" ]] \
+      || collector_fail "Manual collector mode must be required or optional"
+    [[ -f "$MANUAL_FILE" ]] || collector_fail "Manual checklist not found: $MANUAL_FILE"
+    collector_init
+    task_root="$COLLECTOR_STAGE_DIR/tasks"
+    mkdir -p -- "$task_root"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      [[ -n "${line//[[:space:]]/}" ]] || continue
+      title="${line%%|*}"
+      description=""
+      [[ "$line" == *"|"* ]] && description="${line#*|}"
+      title="$(sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' <<<"$title")"
+      description="$(sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' <<<"$description")"
+      [[ -n "$title" ]] || continue
+      task_titles+=("$title")
+      task_descriptions+=("$description")
+    done <"$MANUAL_FILE"
+    count="${#task_titles[@]}"
+    for index in "${!task_titles[@]}"; do
+      title="${task_titles[$index]}"
+      description="${task_descriptions[$index]}"
+      count=$((index + 1))
+      task_dir="$task_root/$(printf '%03d-%s' "$count" "$(printf '%s' "$title" | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')")"
+      mkdir -p -- "$task_dir"
+      printf 'Title: %s\nDescription: %s\n' "$title" "$description" >"$task_dir/task.txt"
+    done
+    count="${#task_titles[@]}"
+    status="success"
+    if [[ "$count" -gt 0 && "$COLLECTOR_MODE" == "optional" ]]; then
+      collector_warn "Manual staging was deferred for $count checklist item(s)"
+      status="warning"
+    elif [[ "$count" -gt 0 ]]; then
+      [[ -t 0 ]] || collector_fail "Manual backup collector requires an interactive terminal"
+      printf 'Manual checklist staging: %s task(s)\nCopy related files into: %s\n' "$count" "$task_root"
+      if command -v xdg-open >/dev/null 2>&1; then
+        (xdg-open "$task_root" >/dev/null 2>&1 &) || true
+      fi
+      printf 'Press Enter when ready, or type q to abort: '
+      read -r reply
+      [[ "$reply" != q && "$reply" != Q ]] || collector_fail "Backup cancelled during manual staging"
+    fi
+    cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# Manual backup artifacts
+
+Review each task directory and restore its files manually. A warning means the
+checklist was recorded without interactive file staging.
+EOF
+    collector_index manual checklist tasks "$status" "$count checklist items"
+    collector_finalize
+    ;;
+  *)
+    collector_fail "Unsupported collector action: $ACTION"
+    ;;
+esac

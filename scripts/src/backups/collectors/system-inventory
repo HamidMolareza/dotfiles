@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+ACTION="${1:-backup}"
+
+capture_inventory() {
+  local label="$1"
+  local target="$2"
+  shift 2
+  local temporary
+  temporary="$(mktemp "${target}.tmp.XXXXXX")"
+  if "$@" >"$temporary" 2>/dev/null; then
+    mv -- "$temporary" "$target"
+    return 0
+  fi
+  rm -f -- "$temporary"
+  collector_warn "$label inventory failed; $(basename -- "$target") was not created"
+  return 0
+}
+
+capture_sorted_inventory() {
+  local label="$1"
+  local target="$2"
+  shift 2
+  local temporary
+  temporary="$(mktemp "${target}.tmp.XXXXXX")"
+  if "$@" 2>/dev/null | sort >"$temporary"; then
+    mv -- "$temporary" "$target"
+    return 0
+  fi
+  rm -f -- "$temporary"
+  collector_warn "$label inventory failed; $(basename -- "$target") was not created"
+  return 0
+}
+
+copy_nautilus_directory() {
+  local logical_relative="$1"
+  local source_path="$COLLECTOR_SOURCE_HOME/$logical_relative"
+  local source_home_real source_real target
+  [[ -e "$source_path" || -L "$source_path" ]] || return 0
+  source_home_real="$(readlink -e -- "$COLLECTOR_SOURCE_HOME")" \
+    || collector_fail "Could not resolve collector source home"
+  source_real="$(readlink -e -- "$source_path" 2>/dev/null || true)"
+  if [[ -z "$source_real" || ! -d "$source_real" ]]; then
+    collector_warn "Nautilus source is not a resolvable directory: $source_path"
+    return 0
+  fi
+  [[ "$source_real" == "$source_home_real/"* ]] \
+    || { collector_warn "Nautilus source resolves outside the source home: $source_path"; return 0; }
+  if [[ -n "$(find "$source_real" -type l -print -quit)" ]]; then
+    collector_warn "Nautilus source contains nested symlinks and was not copied: $source_path"
+    return 0
+  fi
+  target="$COLLECTOR_STAGE_DIR/nautilus/$logical_relative"
+  mkdir -p -- "$target"
+  if ! rsync --archive "$source_real/" "$target/"; then
+    rm -rf -- "$target"
+    collector_warn "Could not copy Nautilus data from $source_path"
+  fi
+}
+
+backup_inventory() {
+  local crontab_temp crontab_error crontab_rc inventory_status="success"
+  for command in awk find hostname mkdir readlink rsync sha256sum sort xargs; do
+    collector_require_command "$command"
+  done
+  collector_init
+  [[ -f /etc/os-release ]] && cp -- /etc/os-release "$COLLECTOR_STAGE_DIR/os-release"
+  hostname >"$COLLECTOR_STAGE_DIR/hostname.txt"
+  {
+    printf 'bash\t%s\n' "${BASH_VERSION}"
+    printf 'backup-home\t%s\n' "$(sha256sum "$PROJECT_DIR/backup-home" | awk '{print $1}')"
+    printf 'rsync\t%s\n' "$(rsync --version | awk 'NR == 1')"
+  } >"$COLLECTOR_STAGE_DIR/tool-versions.tsv"
+  if command -v hostnamectl >/dev/null 2>&1; then
+    hostnamectl >"$COLLECTOR_STAGE_DIR/hostnamectl.txt" 2>/dev/null || true
+  fi
+  if command -v dconf >/dev/null 2>&1; then
+    capture_inventory "dconf export" "$COLLECTOR_STAGE_DIR/dconf.ini" dconf dump /
+    capture_inventory "Deja Dup dconf export" "$COLLECTOR_STAGE_DIR/deja-dup.dconf" \
+      dconf dump /org/gnome/deja-dup/
+  else
+    collector_warn "dconf is unavailable"
+  fi
+  if command -v apt-mark >/dev/null 2>&1; then
+    capture_sorted_inventory "APT manual package" "$COLLECTOR_STAGE_DIR/apt-manual.txt" \
+      apt-mark showmanual
+  else
+    collector_warn "apt-mark is unavailable; apt-manual.txt was not created"
+  fi
+  if command -v dpkg >/dev/null 2>&1; then
+    capture_inventory "dpkg selection" "$COLLECTOR_STAGE_DIR/dpkg-selections.txt" \
+      dpkg --get-selections
+  else
+    collector_warn "dpkg is unavailable; dpkg-selections.txt was not created"
+  fi
+  if command -v snap >/dev/null 2>&1; then
+    capture_inventory "Snap application" "$COLLECTOR_STAGE_DIR/snap-list.txt" snap list
+  else
+    collector_warn "snap is unavailable"
+  fi
+  if command -v flatpak >/dev/null 2>&1; then
+    capture_inventory "Flatpak application" "$COLLECTOR_STAGE_DIR/flatpak-apps.tsv" \
+      flatpak list --app --columns=application,branch,origin
+  else
+    collector_warn "flatpak is unavailable"
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    crontab_temp="$(mktemp)"
+    crontab_error="$(mktemp)"
+    crontab_rc=0
+    crontab -l >"$crontab_temp" 2>"$crontab_error" || crontab_rc=$?
+    if [[ "$crontab_rc" -eq 0 ]]; then
+      mv -- "$crontab_temp" "$COLLECTOR_STAGE_DIR/crontab.txt"
+      rm -f -- "$crontab_error"
+    elif grep -qiE '^no crontab for ' "$crontab_error"; then
+      rm -f -- "$crontab_temp" "$crontab_error"
+      printf 'status\tabsent\n' >"$COLLECTOR_STAGE_DIR/crontab-status.tsv"
+    else
+      rm -f -- "$crontab_temp" "$crontab_error"
+      printf 'status\terror\n' >"$COLLECTOR_STAGE_DIR/crontab-status.tsv"
+      collector_warn "crontab inventory failed; crontab.txt was not created"
+    fi
+  else
+    collector_warn "crontab is unavailable; crontab.txt was not created"
+  fi
+  copy_nautilus_directory ".local/share/nautilus/scripts"
+  copy_nautilus_directory ".config/nautilus"
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# Ubuntu system inventory recovery
+
+Use guided recovery to review package lists and selectively restore dconf, Deja Dup,
+crontab, and Nautilus state. Package installation remains a reviewed manual step.
+EOF
+  [[ ! -s "$COLLECTOR_WARNINGS_FILE" ]] || inventory_status="warning"
+  collector_index inventory system system "$inventory_status" "Ubuntu host and user inventory"
+  collector_finalize
+}
+
+reject_symlink_components() {
+  local path="$1" current="/" component
+  local -a components=()
+  IFS='/' read -r -a components <<<"${path#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || collector_fail "System restore path must not contain symlinks: $current"
+  done
+}
+
+private_stage_dir() {
+  local component="$1"
+  local staging="${BACKUP_HOME_RESTORE_STAGING_DIR:-}"
+  local result
+  [[ "$staging" == /* ]] || collector_fail "System restore staging path must be absolute"
+  result="$staging/artifacts/$component"
+  reject_symlink_components "$result"
+  [[ "$(readlink -m -- "$result")" == "$(readlink -m -- "$staging")/"* ]] \
+    || collector_fail "System recovery staging path escapes its root"
+  [[ ! -e "$result" && ! -L "$result" ]] \
+    || collector_fail "System recovery staging destination already exists: $component"
+  mkdir -p -- "$result"
+  chmod 700 -- "$staging/artifacts" "$result"
+  printf '%s\n' "$result"
+}
+
+stage_package_recovery() {
+  local artifact="$1" output current_manual
+  output="$(private_stage_dir system.packages)"
+  for file in apt-manual.txt dpkg-selections.txt snap-list.txt flatpak-apps.tsv os-release tool-versions.tsv RESTORE.md; do
+    [[ -f "$artifact/$file" && ! -L "$artifact/$file" ]] || continue
+    cp -- "$artifact/$file" "$output/$file"
+  done
+  if [[ -s "$artifact/apt-manual.txt" ]]; then
+    current_manual="$output/current-apt-manual.txt"
+    if command -v apt-mark >/dev/null 2>&1; then
+      apt-mark showmanual 2>/dev/null | sort -u >"$current_manual" \
+        || collector_fail "Could not read current manually installed APT packages"
+    else
+      : >"$current_manual"
+    fi
+    sort -u "$artifact/apt-manual.txt" \
+      | comm -23 - "$current_manual" >"$output/missing-apt-manual.txt"
+  fi
+  cat >"$output/PACKAGE-RECOVERY.md" <<'EOF'
+# Package recovery review
+
+No package was installed automatically.
+
+- If present, review `missing-apt-manual.txt`, remove obsolete or machine-specific
+  packages, then install only the approved names with `sudo apt install ...`.
+- Treat `dpkg-selections.txt` as inventory. Do not feed it directly to
+  `dpkg --set-selections` without reviewing repository availability and package state.
+- Review `snap-list.txt`; reinstall each approved Snap explicitly with `snap install`.
+- Review `flatpak-apps.tsv`; confirm the origin and branch, then reinstall each approved
+  application with `flatpak install ORIGIN APPLICATION`.
+EOF
+  chmod -R go-rwx -- "$output"
+  printf 'Package recovery artifacts staged at: %s\n' "$output"
+  return 20
+}
+
+stage_nautilus_recovery() {
+  local artifact="$1" output target_home="${BACKUP_HOME_TARGET_HOME:-}"
+  [[ -d "$artifact/nautilus" && ! -L "$artifact/nautilus" ]] \
+    || collector_fail "Nautilus recovery artifact is missing"
+  [[ -z "$(find "$artifact/nautilus" -type l -print -quit)" ]] \
+    || collector_fail "Nautilus recovery artifact must not contain symlinks"
+  output="$(private_stage_dir system.nautilus)"
+  mkdir -p -- "$output/data"
+  rsync --archive "$artifact/nautilus/" "$output/data/"
+  cat >"$output/NAUTILUS-RECOVERY.md" <<EOF
+# Nautilus recovery review
+
+No files were merged into the target home.
+
+The \`data/\` directory preserves the logical paths below the source home even when
+the original Nautilus scripts directory was a symlink. Inspect and copy only:
+
+- \`data/.local/share/nautilus/scripts\`
+- \`data/.config/nautilus\`
+
+Merge those contents into the matching directories below \`$target_home\`. Preserve
+script executable bits, do not replace unrelated existing files, and restart Nautilus
+only after reviewing the merge.
+EOF
+  chmod -R go-rwx -- "$output"
+  printf 'Nautilus recovery artifacts staged at: %s\n' "$output"
+  return 20
+}
+
+restore_action() {
+  local subaction="${1:-}" component="${2:-}" artifact="${BACKUP_HOME_ARTIFACT_DIR:-}"
+  local session="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+  local safety_dir current_file error_file expected actual
+  case "$subaction" in
+    describe)
+      [[ -f "$artifact/apt-manual.txt" && ! -L "$artifact/apt-manual.txt" \
+        || -f "$artifact/dpkg-selections.txt" && ! -L "$artifact/dpkg-selections.txt" \
+        || -f "$artifact/snap-list.txt" && ! -L "$artifact/snap-list.txt" \
+        || -f "$artifact/flatpak-apps.tsv" && ! -L "$artifact/flatpak-apps.tsv" ]] \
+        && printf 'component\tsystem.packages\tUbuntu package rebuild guidance\tguided\tmanual\trecommended\n'
+      [[ -s "$artifact/dconf.ini" ]] \
+        && printf 'component\tsystem.dconf\tDesktop and application settings\tautomatic\tdestructive\toptional\n'
+      [[ -s "$artifact/deja-dup.dconf" ]] \
+        && printf 'component\tsystem.deja-dup\tDeja Dup settings\tautomatic\tdestructive\toptional\n'
+      [[ -s "$artifact/crontab.txt" ]] \
+        && printf 'component\tsystem.crontab\tUser crontab\tautomatic\tdestructive\toptional\n'
+      [[ -d "$artifact/nautilus" ]] \
+        && printf 'component\tsystem.nautilus\tNautilus user data\tguided\tmanual\toptional\n'
+      return 0
+      ;;
+    preflight)
+      case "$component" in
+        system.packages)
+          [[ -f "$artifact/apt-manual.txt" && ! -L "$artifact/apt-manual.txt" \
+            || -f "$artifact/dpkg-selections.txt" && ! -L "$artifact/dpkg-selections.txt" \
+            || -f "$artifact/snap-list.txt" && ! -L "$artifact/snap-list.txt" \
+            || -f "$artifact/flatpak-apps.tsv" && ! -L "$artifact/flatpak-apps.tsv" ]] \
+            || { printf 'blocker\tNo package inventory is available\n'; return; }
+          ;;
+        system.dconf)
+          [[ -f "$artifact/dconf.ini" && ! -L "$artifact/dconf.ini" ]] \
+            || { printf 'blocker\tDconf artifact is missing or unsafe\n'; return; }
+          command -v dconf >/dev/null 2>&1 || { printf 'blocker\tdconf is unavailable\n'; return; }
+          ;;
+        system.deja-dup)
+          [[ -f "$artifact/deja-dup.dconf" && ! -L "$artifact/deja-dup.dconf" ]] \
+            || { printf 'blocker\tDeja Dup artifact is missing or unsafe\n'; return; }
+          command -v dconf >/dev/null 2>&1 || { printf 'blocker\tdconf is unavailable\n'; return; }
+          ;;
+        system.crontab)
+          [[ -f "$artifact/crontab.txt" && ! -L "$artifact/crontab.txt" ]] \
+            || { printf 'blocker\tCrontab artifact is missing or unsafe\n'; return; }
+          command -v crontab >/dev/null 2>&1 || { printf 'blocker\tcrontab is unavailable\n'; return; }
+          ;;
+        system.nautilus)
+          [[ -d "$artifact/nautilus" && ! -L "$artifact/nautilus" ]] \
+            || { printf 'blocker\tNautilus artifact is missing or unsafe\n'; return; }
+          ;;
+      esac
+      if [[ "$component" == system.dconf || "$component" == system.deja-dup || "$component" == system.crontab ]]; then
+        if [[ -n "${BACKUP_HOME_TARGET_UID:-}" && "$BACKUP_HOME_TARGET_UID" != "$(id -u)" ]]; then
+          printf 'blocker\tRun recovery as the target desktop user before applying dconf or crontab\n'
+          return
+        fi
+      fi
+      printf 'ok\tSystem inventory artifact is ready for reviewed recovery\n'
+      ;;
+    apply)
+      [[ "${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}" -eq 1 ]] \
+        || { [[ "$component" == system.packages || "$component" == system.nautilus ]] || collector_fail "Exact destructive approval is required"; }
+      [[ "${BACKUP_HOME_RESTORE_DRY_RUN:-0}" -eq 0 ]] || return 0
+      if [[ "$component" == system.dconf || "$component" == system.deja-dup || "$component" == system.crontab ]]; then
+        [[ "$session" == /* ]] || collector_fail "System restore session path must be absolute"
+        safety_dir="$session/pre-restore/$component"
+        reject_symlink_components "$safety_dir"
+        [[ "$(readlink -m -- "$safety_dir")" == "$(readlink -m -- "$session")/"* ]] \
+          || collector_fail "System safety path escapes the recovery session"
+        [[ ! -L "$safety_dir" ]] || collector_fail "System safety path must not be a symlink"
+        mkdir -p -- "$safety_dir"
+        chmod 700 -- "$session/pre-restore" "$safety_dir"
+      fi
+      case "$component" in
+        system.dconf)
+          current_file="$safety_dir/dconf.ini"
+          [[ ! -L "$current_file" ]] || collector_fail "Dconf safety file must not be a symlink"
+          if [[ ! -e "$current_file" ]]; then
+            if ! dconf dump / >"$current_file"; then
+              rm -f -- "$current_file"
+              collector_fail "Could not preserve current dconf state"
+            fi
+            chmod 600 -- "$current_file"
+          fi
+          dconf reset -f /
+          dconf load / <"$artifact/dconf.ini"
+          ;;
+        system.deja-dup)
+          current_file="$safety_dir/deja-dup.dconf"
+          [[ ! -L "$current_file" ]] || collector_fail "Deja Dup safety file must not be a symlink"
+          if [[ ! -e "$current_file" ]]; then
+            if ! dconf dump /org/gnome/deja-dup/ >"$current_file"; then
+              rm -f -- "$current_file"
+              collector_fail "Could not preserve current Deja Dup dconf state"
+            fi
+            chmod 600 -- "$current_file"
+          fi
+          dconf reset -f /org/gnome/deja-dup/
+          dconf load /org/gnome/deja-dup/ <"$artifact/deja-dup.dconf"
+          ;;
+        system.crontab)
+          current_file="$safety_dir/crontab.txt"
+          error_file="$safety_dir/no-crontab"
+          [[ ! -L "$current_file" && ! -L "$error_file" ]] \
+            || collector_fail "Crontab safety files must not be symlinks"
+          if [[ ! -e "$current_file" && ! -e "$error_file" ]]; then
+            if crontab -l >"$current_file" 2>"$error_file.tmp"; then
+              chmod 600 -- "$current_file"
+              rm -f -- "$error_file.tmp"
+            elif grep -qi 'no crontab' "$error_file.tmp"; then
+              rm -f -- "$current_file"
+              printf 'No crontab existed before restore.\n' >"$error_file"
+              chmod 600 -- "$error_file"
+              rm -f -- "$error_file.tmp"
+            else
+              rm -f -- "$error_file.tmp"
+              collector_fail "Could not determine or preserve the current crontab"
+            fi
+          fi
+          crontab "$artifact/crontab.txt"
+          ;;
+        system.packages) stage_package_recovery "$artifact" ;;
+        system.nautilus) stage_nautilus_recovery "$artifact" ;;
+        *) collector_fail "Unknown system inventory component: $component" ;;
+      esac
+      ;;
+    verify)
+      case "$component" in
+        system.dconf)
+          expected="$(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' "$artifact/dconf.ini")"
+          actual="$(dconf dump /)" || collector_fail "Could not read restored dconf state"
+          actual="$(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' <<<"$actual")"
+          [[ "$expected" == "$actual" ]] \
+            || collector_fail "Restored dconf state does not match the artifact"
+          ;;
+        system.deja-dup)
+          expected="$(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' "$artifact/deja-dup.dconf")"
+          actual="$(dconf dump /org/gnome/deja-dup/)" \
+            || collector_fail "Could not read restored Deja Dup state"
+          actual="$(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' <<<"$actual")"
+          [[ "$expected" == "$actual" ]] \
+            || collector_fail "Restored Deja Dup state does not match the artifact"
+          ;;
+        system.crontab)
+          expected="$(sed -e 's/[[:space:]]*$//' "$artifact/crontab.txt")"
+          actual="$(crontab -l)" || collector_fail "Could not read the installed crontab"
+          actual="$(sed -e 's/[[:space:]]*$//' <<<"$actual")"
+          [[ "$expected" == "$actual" ]] \
+            || collector_fail "Installed crontab does not match the artifact"
+          ;;
+        system.packages)
+          [[ -s "${BACKUP_HOME_RESTORE_STAGING_DIR:-}/artifacts/system.packages/PACKAGE-RECOVERY.md" ]] \
+            || collector_fail "Package recovery artifacts were not staged"
+          return 20
+          ;;
+        system.nautilus)
+          [[ -s "${BACKUP_HOME_RESTORE_STAGING_DIR:-}/artifacts/system.nautilus/NAUTILUS-RECOVERY.md" ]] \
+            || collector_fail "Nautilus recovery artifacts were not staged"
+          return 20
+          ;;
+        *) collector_fail "Unknown system inventory component: $component" ;;
+      esac
+      ;;
+    guide)
+      case "$component" in
+        system.packages) printf 'Review the staged missing APT list plus dpkg, Snap, and Flatpak inventory. Install only explicitly approved packages.\n' ;;
+        system.nautilus) printf 'Review the staged Nautilus source layout and merge only selected scripts and configuration into the target home.\n' ;;
+        system.dconf|system.deja-dup) printf 'The approved restore keeps a private safety dump, resets the exact dconf subtree, loads the artifact, and verifies an exact match.\n' ;;
+        system.crontab) printf 'The approved restore keeps a private safety copy, installs the recorded user crontab, and verifies it exactly.\n' ;;
+        *) collector_fail "Unknown system inventory component: $component" ;;
+      esac
+      ;;
+    *) exit 64 ;;
+  esac
+}
+
+case "$ACTION" in
+  metadata) collector_metadata supported ;;
+  backup) backup_inventory ;;
+  restore) shift; restore_action "$@" ;;
+  *) collector_fail "Unsupported collector action: $ACTION" ;;
+esac

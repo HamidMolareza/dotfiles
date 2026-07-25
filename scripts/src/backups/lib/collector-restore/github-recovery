@@ -2,11 +2,10 @@
 
 set -Eeuo pipefail
 
-PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTION="${1:-}"
 COMPONENT="${2:-}"
 ARTIFACT_DIR="${BACKUP_HOME_ARTIFACT_DIR:-}"
-SOURCE_HOME="${BACKUP_HOME_SOURCE_HOME:-}"
 TARGET_HOME="${BACKUP_HOME_TARGET_HOME:-}"
 TARGET_UID="${BACKUP_HOME_TARGET_UID:-}"
 SESSION_DIR="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
@@ -19,6 +18,61 @@ declare -a ACCOUNTS=()
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 validate_relative() {
   [[ -n "$1" && "$1" != /* && ! "$1" =~ (^|/)\.\.?(/|$) ]] || fail "Unsafe GitHub cache path"
+}
+
+reject_symlink_components() {
+  local path="$1" current="/" component
+  local -a components=()
+  IFS='/' read -r -a components <<<"${path#/}"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || fail "GitHub restore path must not contain symlinks: $current"
+  done
+}
+
+require_contained_path() {
+  local path="$1" root="$2" label="$3"
+  local root_real path_real
+  root_real="$(readlink -m -- "$root")"
+  path_real="$(readlink -m -- "$path")"
+  [[ "$path_real" == "$root_real" || "$path_real" == "$root_real/"* ]] \
+    || fail "$label escapes its allowed root"
+}
+
+validate_restore_paths() {
+  local artifact_real path
+  [[ "$ARTIFACT_DIR" == /* && -d "$ARTIFACT_DIR" ]] \
+    || fail "GitHub artifact directory must be an existing absolute directory"
+  [[ "$TARGET_HOME" == /* && -d "$TARGET_HOME" ]] \
+    || fail "GitHub target home must be an existing absolute directory"
+  [[ "$SESSION_DIR" == /* ]] || fail "GitHub recovery session must be an absolute path"
+  for path in \
+    "$ARTIFACT_DIR" \
+    "$TARGET_HOME" \
+    "$TARGET_HOME/$CACHE_RELATIVE" \
+    "$TARGET_HOME/$CACHE_RELATIVE/accounts" \
+    "$TARGET_HOME/.config/gh" \
+    "$SESSION_DIR" \
+    "$SESSION_DIR/safety/github.local-mirrors" \
+    "$SESSION_DIR/safety/github.credentials" \
+    "$SESSION_DIR/github-remote-rebuild.md"; do
+    reject_symlink_components "$path"
+  done
+  artifact_real="$(readlink -e -- "$ARTIFACT_DIR")" \
+    || fail "Could not resolve the GitHub artifact directory"
+  require_contained_path "$TARGET_HOME/$CACHE_RELATIVE" "$TARGET_HOME" "GitHub cache target"
+  require_contained_path "$TARGET_HOME/$CACHE_RELATIVE/accounts" "$TARGET_HOME" "GitHub account cache target"
+  require_contained_path "$TARGET_HOME/.config/gh" "$TARGET_HOME" "GitHub credentials target"
+  require_contained_path "$SESSION_DIR/safety/github.local-mirrors" "$SESSION_DIR" "GitHub mirror safety path"
+  require_contained_path "$SESSION_DIR/safety/github.credentials" "$SESSION_DIR" "GitHub credential safety path"
+  require_contained_path "$SESSION_DIR/github-remote-rebuild.md" "$SESSION_DIR" "GitHub guide path"
+  [[ -z "$(find "$artifact_real" -type l -print -quit)" ]] \
+    || fail "GitHub artifacts must not contain symlinks"
+  for path in "$TARGET_HOME/$CACHE_RELATIVE" "$TARGET_HOME/.config/gh"; do
+    [[ ! -d "$path" || -z "$(find "$path" -type l -print -quit)" ]] \
+      || fail "GitHub restore target must not contain symlinks: $path"
+  done
 }
 
 load_config() {
@@ -35,9 +89,8 @@ load_config() {
 }
 
 describe() {
-  if [[ -d "$BACKUP_HOME_SNAPSHOT_DIR$SOURCE_HOME/$CACHE_RELATIVE" ]]; then
-    printf 'component\tgithub.local-mirrors\tGitHub repository, wiki, gist, and metadata mirrors\tfiles-only\tsafe\trecommended\n'
-    printf 'path\tgithub.local-mirrors\t%s/%s\n' "$SOURCE_HOME" "$CACHE_RELATIVE"
+  if [[ -d "$ARTIFACT_DIR/cache/accounts" ]]; then
+    printf 'component\tgithub.local-mirrors\tGitHub repository, wiki, gist, and metadata mirrors\tautomatic\tdestructive\trecommended\n'
   fi
   if find "$ARTIFACT_DIR/credentials" -type f -name '*.token' -print -quit 2>/dev/null | grep -q .; then
     printf 'component\tgithub.credentials\tGitHub CLI credentials\tautomatic\tdestructive\trecommended\n'
@@ -49,6 +102,8 @@ preflight() {
   case "$COMPONENT" in
     github.local-mirrors)
       command -v git >/dev/null 2>&1 && printf 'ok\tGit is available for mirror verification\n' || printf 'blocker\tGit is unavailable\n'
+      [[ ! -e "$TARGET_HOME/$CACHE_RELATIVE" && ! -L "$TARGET_HOME/$CACHE_RELATIVE" ]] \
+        || { printf 'risk\tdestructive\n'; printf 'warning\tExisting GitHub cache will be safety-copied before merge\n'; }
       ;;
     github.credentials)
       command -v gh >/dev/null 2>&1 && printf 'ok\tGitHub CLI is available\n' || printf 'blocker\tGitHub CLI is unavailable\n'
@@ -66,13 +121,20 @@ preflight() {
 
 apply_credentials() {
   local token account current_token safety="$SESSION_DIR/safety/github.credentials"
+  local credentials_target="$TARGET_HOME/.config/gh"
   [[ "$DESTRUCTIVE_APPROVED" -eq 1 ]] || fail "GitHub credential recovery requires destructive approval"
   [[ -z "$TARGET_UID" || "$TARGET_UID" == "$(id -u)" ]] \
     || fail "GitHub credential recovery must run as the target desktop user"
   if [[ "$DRY_RUN" -eq 1 ]]; then printf 'Would import GitHub CLI credentials without printing tokens.\n'; return 0; fi
+  [[ ! -e "$safety" && ! -L "$safety" ]] \
+    || fail "GitHub credential safety destination already exists"
   mkdir -p -- "$safety"
-  chmod 700 -- "$safety"
-  [[ ! -e "$TARGET_HOME/.config/gh" ]] || cp -a -- "$TARGET_HOME/.config/gh" "$safety/gh-config"
+  chmod 700 -- "$SESSION_DIR/safety" "$safety"
+  if [[ -e "$credentials_target" || -L "$credentials_target" ]]; then
+    [[ ! -e "$safety/gh-config" && ! -L "$safety/gh-config" ]] \
+      || fail "GitHub credential safety copy already exists"
+    cp -a -- "$credentials_target" "$safety/gh-config"
+  fi
   for account in "${ACCOUNTS[@]}"; do
     current_token="$(HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" env -u GITHUB_TOKEN -u GH_TOKEN \
       gh auth token --hostname github.com --user "$account" 2>/dev/null || true)"
@@ -107,8 +169,24 @@ apply_remote_guide() {
 }
 
 apply() {
+  local target
   case "$COMPONENT" in
-    github.local-mirrors) : ;;
+    github.local-mirrors)
+      target="$TARGET_HOME/$CACHE_RELATIVE"
+      [[ ! -e "$target" && ! -L "$target" || "$DESTRUCTIVE_APPROVED" -eq 1 ]] \
+        || fail "Existing GitHub mirrors require exact destructive approval"
+      if [[ "$DRY_RUN" -eq 0 ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+          [[ ! -e "$SESSION_DIR/safety/github.local-mirrors" && ! -L "$SESSION_DIR/safety/github.local-mirrors" ]] \
+            || fail "GitHub mirror safety destination already exists"
+          mkdir -p -- "$SESSION_DIR/safety/github.local-mirrors"
+          chmod 700 -- "$SESSION_DIR/safety" "$SESSION_DIR/safety/github.local-mirrors"
+          rsync --archive --relative "$target" "$SESSION_DIR/safety/github.local-mirrors/"
+        fi
+        mkdir -p -- "$target/accounts"
+        rsync --archive "$ARTIFACT_DIR/cache/accounts/" "$target/accounts/"
+      fi
+      ;;
     github.credentials) apply_credentials ;;
     github.remote-rebuild) apply_remote_guide ;;
     *) fail "Component is handled by the core or is unknown: $COMPONENT" ;;
@@ -148,13 +226,13 @@ guide() {
   esac
 }
 
-[[ -d "$ARTIFACT_DIR" && -n "$TARGET_HOME" && -n "$SESSION_DIR" ]] || fail "Restore environment is incomplete"
 load_config
+validate_restore_paths
 case "$ACTION" in
   describe) describe ;;
   preflight) preflight ;;
   apply) apply ;;
   verify) verify ;;
   guide) guide ;;
-  *) fail "Unknown restore handler action: $ACTION" ;;
+  *) fail "Unknown collector restore action: $ACTION" ;;
 esac

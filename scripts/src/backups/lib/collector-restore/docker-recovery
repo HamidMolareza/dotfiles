@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/docker-recovery-config
 source "$PROJECT_DIR/lib/docker-recovery-config"
 
@@ -491,7 +491,7 @@ main() {
     apply) [[ -n "$COMPONENT" ]] || fail "apply requires a component"; apply_component ;;
     verify) [[ -n "$COMPONENT" ]] || fail "verify requires a component"; verify_component ;;
     guide) [[ -n "$COMPONENT" ]] || fail "guide requires a component"; guide_component ;;
-    *) fail "Unknown restore handler action: $ACTION" ;;
+    *) fail "Unknown collector restore action: $ACTION" ;;
   esac
 }
 

@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+ACTION="${1:-backup}"
+CONFIG_FILE="${BACKUP_HOME_GITLAB_CONFIG:-$PROJECT_DIR/config/gitlab-recovery/local.conf}"
+HOST="gitlab.com"
+ACCOUNT=""
+TOKEN_ENV="GITLAB_TOKEN"
+SCOPE="membership"
+API_CLIENT="auto"
+API_CLIENT_RESOLVED=""
+
+load_config() {
+  local line key value
+  [[ -f "$CONFIG_FILE" ]] || collector_fail "GitLab recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r key value extra <<<"$line"
+    [[ -n "$key" && -n "$value" && -z "${extra:-}" ]] || collector_fail "Invalid GitLab config entry"
+    case "$key" in
+      host) HOST="$value" ;;
+      account) ACCOUNT="$value" ;;
+      token-env) TOKEN_ENV="$value" ;;
+      scope)
+        [[ "$value" == owned || "$value" == membership ]] \
+          || collector_fail "GitLab scope must be owned or membership"
+        SCOPE="$value"
+        ;;
+      api-client)
+        [[ "$value" == auto || "$value" == glab || "$value" == curl ]] \
+          || collector_fail "GitLab api-client must be auto, glab, or curl"
+        API_CLIENT="$value"
+        ;;
+      *) collector_fail "Unknown GitLab config key: $key" ;;
+    esac
+  done <"$CONFIG_FILE"
+  collector_validate_name "$ACCOUNT"
+}
+
+resolve_api_client() {
+  if [[ "$API_CLIENT" != curl ]] && command -v glab >/dev/null 2>&1; then
+    API_CLIENT_RESOLVED=glab
+  else
+    [[ "$API_CLIENT" != glab ]] || collector_fail "glab is unavailable"
+    collector_require_command curl
+    API_CLIENT_RESOLVED=curl
+  fi
+}
+
+curl_api() {
+  local endpoint="$1"
+  local token="${!TOKEN_ENV:-}"
+  [[ -n "$token" ]] || collector_fail "$TOKEN_ENV is required for GitLab curl API access"
+  printf 'PRIVATE-TOKEN: %s\n' "$token" \
+    | curl --fail --silent --show-error --header @- "https://$HOST/api/v4/$endpoint"
+}
+
+authenticated_username() {
+  if [[ "$API_CLIENT_RESOLVED" == glab ]]; then
+    glab api --hostname "$HOST" user | jq -er '.username | select(type == "string" and length > 0)'
+  else
+    curl_api user | jq -er '.username | select(type == "string" and length > 0)'
+  fi
+}
+
+verify_authenticated_account() {
+  local actual
+  actual="$(authenticated_username)" \
+    || collector_fail "Could not determine the authenticated GitLab account"
+  [[ "${actual,,}" == "${ACCOUNT,,}" ]] \
+    || collector_fail "Authenticated GitLab account '$actual' does not match configured account '$ACCOUNT'"
+}
+
+api_projects() {
+  local endpoint page page_file page_count temp_dir
+  if [[ "$SCOPE" == owned ]]; then
+    endpoint="users/$ACCOUNT/projects?owned=true&simple=true&per_page=100"
+  else
+    endpoint="projects?membership=true&simple=true&per_page=100"
+  fi
+  if [[ "$API_CLIENT_RESOLVED" == glab ]]; then
+    glab api --hostname "$HOST" --paginate "$endpoint" \
+      | jq -s 'add // []'
+  else
+    temp_dir="$(mktemp -d)"
+    page=1
+    while :; do
+      page_file="$temp_dir/page-$page.json"
+      curl_api "$endpoint&page=$page" >"$page_file" \
+        || { rm -rf -- "$temp_dir"; collector_fail "GitLab API request failed on page $page"; }
+      if ! page_count="$(jq 'length' "$page_file")"; then
+        rm -rf -- "$temp_dir"
+        collector_fail "GitLab API returned invalid JSON on page $page"
+      fi
+      [[ "$page_count" =~ ^[0-9]+$ ]] \
+        || { rm -rf -- "$temp_dir"; collector_fail "GitLab API returned an invalid page"; }
+      [[ "$page_count" -gt 0 ]] || break
+      page=$((page + 1))
+    done
+    jq -s 'add // []' "$temp_dir"/page-*.json
+    rm -rf -- "$temp_dir"
+  fi
+}
+
+backup_gitlab() {
+  local project_path clone_url mirror
+  for command in find git mkdir sha256sum sort xargs; do collector_require_command "$command"; done
+  collector_require_command jq
+  collector_init
+  load_config
+  resolve_api_client
+  verify_authenticated_account
+  api_projects >"$COLLECTOR_STAGE_DIR/projects.json"
+  mkdir -p -- "$COLLECTOR_STAGE_DIR/mirrors"
+  while IFS=$'\t' read -r project_path clone_url; do
+    [[ -n "$project_path" && -n "$clone_url" ]] || continue
+    collector_validate_relative_path "$project_path"
+    mirror="$COLLECTOR_STAGE_DIR/mirrors/${project_path}.git"
+    mkdir -p -- "$(dirname -- "$mirror")"
+    git clone --mirror -- "$clone_url" "$mirror"
+    collector_index gitlab-project "$project_path" "mirrors/$project_path.git" success "mirror clone"
+  done < <(jq -r '.[] | [.path_with_namespace, .ssh_url_to_repo] | @tsv' "$COLLECTOR_STAGE_DIR/projects.json")
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<EOF
+# GitLab recovery
+
+Mirrors and API metadata for \`$ACCOUNT@$HOST\` are available locally. Guided
+recovery copies them to a reviewed local directory. Creating projects or pushing
+mirrors to GitLab remains an explicit manual operation.
+
+Configured project scope: \`$SCOPE\`.
+EOF
+  collector_finalize
+}
+
+restore_gitlab() {
+  local subaction="${1:-}" artifact="${BACKUP_HOME_ARTIFACT_DIR:-}"
+  local target_home="${BACKUP_HOME_TARGET_HOME:-}"
+  local session="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+  local target="$target_home/gitlab-recovery"
+  local safety="$session/safety/gitlab.local-mirrors"
+  local root_real target_root_real session_root_real path_real component current
+
+  [[ "$artifact" == /* && -d "$artifact" && "$target_home" == /* && -d "$target_home" \
+    && "$session" == /* ]] \
+    || collector_fail "GitLab restore paths must be absolute and complete"
+  for path in "$artifact" "$target_home" "$session" "$target" "$safety"; do
+    current="/"
+    IFS='/' read -r -a components <<<"${path#/}"
+    for component in "${components[@]}"; do
+      [[ -n "$component" ]] || continue
+      current="${current%/}/$component"
+      [[ ! -L "$current" ]] || collector_fail "GitLab restore path must not contain symlinks: $current"
+    done
+  done
+  root_real="$(readlink -e -- "$artifact")" \
+    || collector_fail "Could not resolve the GitLab artifact directory"
+  target_root_real="$(readlink -e -- "$target_home")" \
+    || collector_fail "Could not resolve the GitLab target home"
+  session_root_real="$(readlink -m -- "$session")"
+  path_real="$(readlink -m -- "$target")"
+  [[ "$path_real" == "$target_root_real/"* ]] \
+    || collector_fail "GitLab restore target escapes the target home"
+  path_real="$(readlink -m -- "$safety")"
+  [[ "$path_real" == "$session_root_real/"* ]] \
+    || collector_fail "GitLab safety path escapes the recovery session"
+  [[ -z "$(find "$root_real" -type l -print -quit)" ]] \
+    || collector_fail "GitLab artifacts must not contain symlinks"
+  [[ ! -d "$target" || -z "$(find "$target" -type l -print -quit)" ]] \
+    || collector_fail "GitLab restore target must not contain symlinks"
+
+  case "$subaction" in
+    describe) printf 'component\tgitlab.local-mirrors\tGitLab repository mirrors and metadata\tautomatic\tdestructive\trecommended\n' ;;
+    preflight)
+      [[ -d "$artifact/mirrors" && -s "$artifact/projects.json" ]] \
+        || { printf 'blocker\tGitLab mirrors or metadata are missing\n'; return; }
+      [[ -e "$target" || -L "$target" ]] && printf 'risk\tdestructive\n'
+      printf 'ok\tGitLab artifacts are ready for local recovery\n'
+      ;;
+    apply)
+      [[ ! -e "$target" && ! -L "$target" || "${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}" -eq 1 ]] \
+        || collector_fail "Existing GitLab recovery target requires exact destructive approval"
+      [[ "${BACKUP_HOME_RESTORE_DRY_RUN:-0}" -eq 0 ]] || return 0
+      if [[ -e "$target" || -L "$target" ]]; then
+        [[ ! -e "$safety" && ! -L "$safety" ]] \
+          || collector_fail "GitLab safety destination already exists"
+        mkdir -p -- "$safety"
+        chmod 700 -- "$session/safety" "$safety"
+        rsync --archive --relative "$target" "$safety/"
+      fi
+      mkdir -p -- "$target"
+      rsync --archive "$artifact/" "$target/"
+      ;;
+    verify) [[ -s "$target/projects.json" ]] || collector_fail "GitLab metadata was not restored" ;;
+    guide) printf 'Review projects.json, create missing remote projects explicitly, then push each mirror with git push --mirror.\n' ;;
+    *) exit 64 ;;
+  esac
+}
+
+case "$ACTION" in
+  metadata) collector_metadata supported ;;
+  backup) backup_gitlab ;;
+  restore) shift; restore_gitlab "$@" ;;
+  *) collector_fail "Unsupported collector action: $ACTION" ;;
+esac

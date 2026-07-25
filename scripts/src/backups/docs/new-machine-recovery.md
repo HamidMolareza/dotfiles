@@ -19,17 +19,18 @@ sudo apt install bash rsync coreutils findutils util-linux gawk python3 git open
 ```
 
 Obtain a clean, trusted checkout of this backup tool independently of the snapshot.
-Review local restore handlers before running them. Never execute scripts copied out
+Review local collectors before running them. Never execute scripts copied out
 of a backup snapshot.
 
 Recreate ignored local configuration from the tracked samples. Review the Docker,
-credentials, Codex/MCP, browser, GitHub, and server recovery samples and copy only
-the collectors you intend to use. Set paths, account names, extension IDs, SSH
-aliases, and service names for the new machine before running `restore-plan`.
+credentials, Codex/MCP, browser, GitHub, GitLab, knowledge, and server recovery
+samples and copy only the collectors you intend to use. Set paths, account names,
+extension IDs, SSH aliases, and service names for the new machine before running
+`restore-plan`.
 
 The old machine's ignored local files are data, not trusted code. If needed, restore
 the previous `config/` tree to a temporary directory, compare it with the clean
-checkout, and copy reviewed values manually. Never run a collector or handler copied
+checkout, and copy reviewed values manually. Never run a collector copied
 from the snapshot.
 
 Create the intended target user before recovery. Reusing the original username,
@@ -149,27 +150,30 @@ initializing a new browser profile changes readiness.
 
 ## 6. Rebuild system-level configuration
 
-The `system.inventory` component stages the inventory and generates a list of manual
-APT packages missing from the new machine. Review the generated commands instead of
-blindly installing everything. Hardware, Ubuntu release, repositories, package names,
-and desktop choices may differ.
+Select `system.packages` to stage the APT, dpkg, Snap, and Flatpak inventory plus a
+current-machine comparison. Review `missing-apt-manual.txt` and the generated
+guidance; no package is installed automatically. Select `system.nautilus` to stage
+Nautilus scripts and configuration with manual merge instructions; it does not write
+into the target home.
 
-Apply dconf, crontab, Snap, Flatpak, and package selections selectively. The recovery
-tool intentionally does not import them automatically. Reboot or log out after
-desktop/session changes where required.
+The destructive `system.dconf` and `system.deja-dup` components preserve a private
+safety dump, reset the exact selected dconf subtree, load the snapshot, and verify an
+exact match. `system.crontab` similarly preserves and replaces the current user's
+crontab. Approve each one separately and run recovery as the target desktop user.
+Reboot or log out after desktop/session changes where required.
 
 ## 7. Recover credentials, Codex, and browsers
 
 ### Credentials
 
 Recover credential components independently. All configured components are
-recommended for a complete recovery; skip GNOME keyring or GitHub CLI state only when
+recommended for a complete recovery; skip GNOME keyring state only when
 a fresh login from the password manager is deliberately preferable. Existing state
-changes the component risk to destructive. Exact approval causes the handler to
+changes the component risk to destructive. Exact approval causes the collector to
 create a private safety archive before extraction.
 
 Restore GnuPG or the GNOME keyring from a separate TTY or administrator session after
-the target desktop user is logged out. The handler blocks while `gpg-agent`, the
+the target desktop user is logged out. The collector blocks while `gpg-agent`, the
 keyring daemon, Codex, or related MCP processes are using the selected component.
 
 After SSH/GPG recovery, test one known SSH host and list GnuPG keys without sharing
@@ -180,7 +184,7 @@ disk was unencrypted.
 ### Codex and MCP
 
 Close Codex and every MCP process before selecting `codex.databases` or
-`mcp.databases`. The handler restores only explicitly classified database files,
+`mcp.databases`. The collector restores only explicitly classified database files,
 removes stale WAL/SHM sidecars, corrects ownership, and runs `PRAGMA quick_check`.
 Normal filesystem recovery supplies Codex sessions, config, skills, memories,
 authentication files, and MCP logs.
@@ -206,13 +210,13 @@ security or privacy risk.
 ## 8. Recover application services
 
 Install Docker Engine and the Compose plugin, start the daemon, and make the required
-images available before rerunning `restore-plan`. The handler does not pull images
+images available before rerunning `restore-plan`. The collector does not pull images
 automatically.
 
 ### TaskSorter
 
 Select `docker.tasksorter`. The core first restores the TaskSorter source and Compose
-definition. The trusted Docker handler then restores PostgreSQL from the logical dump
+definition. The trusted Docker collector then restores PostgreSQL from the logical dump
 or stopped-volume archive, restores Data Protection keys before the backend starts,
 starts PostgreSQL/backend/frontend, waits for health, and verifies PostgreSQL and the
 application services. Existing TaskSorter containers or volumes make the component
@@ -220,7 +224,7 @@ destructive and require exact approval; a safety archive is created first.
 
 ### Joplin Server
 
-Select `docker.joplin-server`. The handler restores the Compose source, restores the
+Select `docker.joplin-server`. The collector restores the Compose source, restores the
 PostgreSQL logical dump or compatible stopped-data archive, starts Compose, and
 checks database health. Existing database files require exact destructive approval
 and a safety archive.
@@ -231,7 +235,7 @@ profile.
 
 ### AdGuard Home
 
-Select `docker.adguard`. The handler stops the service, restores the separately
+Select `docker.adguard`. The collector stops the service, restores the separately
 archived configuration and runtime data, restarts Compose, and verifies the service.
 Existing state requires exact approval and is archived first. Test DNS resolution,
 filters, upstreams, and the administration UI afterward.
@@ -257,7 +261,7 @@ Restore `github.local-mirrors` as normal filesystem data and optionally approve
 Run `git fsck --full` on important bare mirrors and compare repository metadata,
 issues, releases, and rules before rebuilding anything remote.
 
-Select `github.remote-rebuild` to generate review instructions. The handler never
+Select `github.remote-rebuild` to generate review instructions. The collector never
 creates a repository and never runs `git push --mirror`; perform those operations one
 repository at a time after checking account ownership, visibility, archive state,
 default branch, and name collisions. Re-enter Actions and webhook secret values from
@@ -271,7 +275,7 @@ configuration and inventory. Deploy service code from a trusted repository check
 not from a snapshot archive.
 
 Gateway Monitor and GitHub proxy SQLite recovery can be automated after exact
-destructive approval. The handler keeps a timestamped remote safety copy, stops only
+destructive approval. The collector keeps a timestamped remote safety copy, stops only
 the configured systemd unit or Docker container, installs a clean database, restarts
 it, and checks integrity and runtime state. Keep the original SSH session open during
 any network work. Apply
@@ -298,7 +302,7 @@ After components report verified:
 6. Keep the external backup unchanged until the new machine has survived normal use
    and at least one fresh verified backup.
 
-If an approved merge or handler produced a bad result, stop affected services and use
-the session's `pre-restore/` safety copy or handler safety archive. Recovery does not
+If an approved merge or collector produced a bad result, stop affected services and use
+the session's `pre-restore/` safety copy or collector safety archive. Recovery does not
 automatically roll back because service-specific rollback can itself destroy newer
 data.

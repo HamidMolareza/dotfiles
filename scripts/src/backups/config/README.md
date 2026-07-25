@@ -1,8 +1,8 @@
 # Configuration Policy
 
 Tracked configuration is limited to reusable defaults and inactive samples. Local
-profiles, absolute paths, manual checklists, collector selections, and restore-handler
-registrations are intentionally ignored by Git.
+profiles, absolute paths, manual checklists, and collector selections are
+intentionally ignored by Git.
 
 ## Tracked files
 
@@ -16,8 +16,9 @@ registrations are intentionally ignored by Git.
 - `codex-mcp-recovery/*.sample`: inactive SQLite classification examples
 - `browser-recovery/*.sample`: inactive targeted-browser examples
 - `github-recovery/*.sample`: inactive account/cache policy examples
+- `gitlab-recovery/*.sample`: inactive account/host examples
+- `knowledge-recovery/*.sample`: selected knowledge-tree examples
 - `server-recovery/*.sample`: inactive SSH/server coverage examples
-- `restore/*.sample`: inactive trusted-handler examples
 - `retention/default.conf`: reusable default retention policy
 
 ## Local files
@@ -34,15 +35,22 @@ cp config/credentials-recovery/local.conf.sample config/credentials-recovery/loc
 cp config/codex-mcp-recovery/local.conf.sample config/codex-mcp-recovery/local.conf
 cp config/browser-recovery/local.conf.sample config/browser-recovery/local.conf
 cp config/github-recovery/local.conf.sample config/github-recovery/local.conf
+cp config/knowledge-recovery/local.conf.sample config/knowledge-recovery/local.conf
 cp config/server-recovery/local.conf.sample config/server-recovery/local.conf
-cp config/restore/handlers.local.conf.sample config/restore/handlers.local.conf
 ```
 
-Each application recovery file is needed only when its collector or restore handler
+Collector rows use
+`priority|mode|unique-name|absolute-command[|timeout-seconds]`. Lower priorities run
+first; omitted timeouts default to 1800 seconds.
+
+Each application recovery file is needed only when its collector
 is enabled. Samples are intentionally inactive and contain placeholders. Account
-names, SSH aliases, absolute helper paths, database paths, extension choices, and
+names, GitLab owned/membership scope, SSH aliases, absolute helper paths, database paths, extension choices, and
 credential selections belong only in ignored `local.conf` files.
 
 Files ending in `.conf`, `.exclude`, or `.manual` in the corresponding local config
 directories are ignored unless explicitly declared as a reusable tracked default.
 Never put secrets, tokens, passwords, or connection strings in a sample.
+
+Create `config/gitlab-recovery/local.conf` from its sample only when enabling the
+disabled GitLab collector.

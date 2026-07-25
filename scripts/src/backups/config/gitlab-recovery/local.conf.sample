@@ -1,0 +1,6 @@
+# Copy to local.conf, review it, and enable the collector explicitly.
+host|gitlab.com
+account|example-user
+token-env|GITLAB_TOKEN
+scope|membership
+api-client|auto

@@ -2,6 +2,8 @@
 # sqlite|codex|.codex/state.sqlite
 # sqlite|mcp|.local/share/example-mcp/data.sqlite
 # static|mcp|.local/share/example-mcp/legacy.db
+# Candidate roots auto-back up newly discovered SQLite files with a warning when
+# their configured entries all resolve to one category.
 # candidate-root|.codex
 # candidate-root|.local/share/example-mcp
 # ignore-root|.codex/cache

@@ -6,6 +6,8 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/collector-common
 source "$PROJECT_DIR/lib/collector-common"
 
+collector_dispatch "${1:-backup}" supported "$PROJECT_DIR/lib/collector-restore/server-recovery" "${@:2}"
+
 CONFIG_FILE="${BACKUP_HOME_SERVER_CONFIG:-$PROJECT_DIR/config/server-recovery/local.conf}"
 SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
 HOST=""

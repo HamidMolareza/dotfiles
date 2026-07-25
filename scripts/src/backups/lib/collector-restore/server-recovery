@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
 ACTION="${1:-}"
 COMPONENT="${2:-}"
@@ -236,5 +236,5 @@ case "$ACTION" in
   apply) apply ;;
   verify) verify ;;
   guide) guide ;;
-  *) fail "Unknown restore handler action: $ACTION" ;;
+  *) fail "Unknown collector restore action: $ACTION" ;;
 esac

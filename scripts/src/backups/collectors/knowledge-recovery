@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/collector-common
+source "$PROJECT_DIR/lib/collector-common"
+
+ACTION="${1:-backup}"
+CONFIG_FILE="${BACKUP_HOME_KNOWLEDGE_CONFIG:-$PROJECT_DIR/config/knowledge-recovery/local.conf}"
+SOURCE_RELATIVE="my-files/learning-daily"
+EXTENSIONS="png,jpg,jpeg,gif,bmp,webp,tif,tiff,heic,svg,pdf,txt,md"
+
+load_config() {
+  local line key value
+  [[ -f "$CONFIG_FILE" ]] || collector_fail "Knowledge recovery config not found: $CONFIG_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    IFS='|' read -r key value extra <<<"$line"
+    [[ -n "$key" && -n "$value" && -z "${extra:-}" ]] || collector_fail "Invalid knowledge config entry"
+    case "$key" in
+      source-relative) collector_validate_relative_path "$value"; SOURCE_RELATIVE="$value" ;;
+      extensions) EXTENSIONS="$value" ;;
+      *) collector_fail "Unknown knowledge config key: $key" ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+backup_knowledge() {
+  local source extension expression=() file_count
+  collector_init
+  load_config
+  source="$COLLECTOR_SOURCE_HOME/$SOURCE_RELATIVE"
+  [[ -d "$source" ]] || collector_fail "Knowledge source not found: $SOURCE_RELATIVE"
+  IFS=',' read -ra extension_list <<<"$EXTENSIONS"
+  for extension in "${extension_list[@]}"; do
+    [[ "$extension" =~ ^[A-Za-z0-9]+$ ]] || collector_fail "Invalid knowledge extension: $extension"
+    [[ "${#expression[@]}" -eq 0 ]] || expression+=(-o)
+    expression+=(-iname "*.$extension")
+  done
+  mkdir -p -- "$COLLECTOR_STAGE_DIR/files"
+  (
+    cd -- "$COLLECTOR_SOURCE_HOME"
+    find "$SOURCE_RELATIVE" -type f \( "${expression[@]}" \) -print0 \
+      | rsync --archive --from0 --files-from=- ./ "$COLLECTOR_STAGE_DIR/files/"
+  )
+  file_count="$(find "$COLLECTOR_STAGE_DIR/files" -type f | wc -l | awk '{print $1}')"
+  printf 'source-relative\t%s\nextensions\t%s\n' "$SOURCE_RELATIVE" "$EXTENSIONS" \
+    >"$COLLECTOR_STAGE_DIR/selection.tsv"
+  cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
+# Selected knowledge recovery
+
+The artifact preserves home-relative paths for selected documents and images.
+Guided recovery creates a safety copy before merging into an existing target.
+EOF
+  collector_index knowledge "$SOURCE_RELATIVE" files success "$file_count selected files"
+  collector_finalize
+}
+
+restore_knowledge() {
+  local subaction="${1:-}" artifact="${BACKUP_HOME_ARTIFACT_DIR:-}"
+  local target_home="${BACKUP_HOME_TARGET_HOME:-}" session="${BACKUP_HOME_RESTORE_SESSION_DIR:-}"
+  local relative target artifact_root source safety_root
+  local target_home_real artifact_real artifact_root_real source_real session_real safety_real
+  [[ "$artifact" == /* && "$target_home" == /* && "$session" == /* ]] \
+    || collector_fail "Knowledge restore paths must be absolute"
+  [[ -s "$artifact/selection.tsv" ]] || collector_fail "Knowledge selection metadata is missing"
+  [[ "$(awk -F '\t' '$1 == "source-relative" && NF == 2 {count++} END {print count + 0}' "$artifact/selection.tsv")" -eq 1 ]] \
+    || collector_fail "Knowledge selection metadata must contain exactly one source-relative entry"
+  relative="$(awk -F '\t' '$1 == "source-relative" {print $2}' "$artifact/selection.tsv")"
+  collector_validate_relative_path "$relative"
+  target_home_real="$(readlink -m -- "$target_home")"
+  target="$(readlink -m -- "$target_home/$relative")"
+  [[ "$target" == "$target_home_real/"* ]] \
+    || collector_fail "Knowledge target escapes the target home"
+  artifact_root="$artifact/files"
+  artifact_real="$(readlink -m -- "$artifact")"
+  artifact_root_real="$(readlink -m -- "$artifact_root")"
+  [[ "$artifact_root_real" == "$artifact_real/"* ]] \
+    || collector_fail "Knowledge artifact files path escapes its artifact root"
+  source="$artifact_root/$relative"
+  source_real="$(readlink -e -- "$source" 2>/dev/null || true)"
+  [[ -n "$source_real" && "$source_real" == "$artifact_root_real/"* ]] \
+    || collector_fail "Knowledge artifact source is missing or escapes its artifact root"
+  session_real="$(readlink -m -- "$session")"
+  safety_root="$session/pre-restore/knowledge.files"
+  safety_real="$(readlink -m -- "$safety_root")"
+  [[ "$safety_real" == "$session_real/"* ]] \
+    || collector_fail "Knowledge safety path escapes the recovery session"
+  case "$subaction" in
+    describe) printf 'component\tknowledge.files\tSelected learning documents and images\tautomatic\tdestructive\trecommended\n' ;;
+    preflight)
+      [[ -d "$source_real" ]] || { printf 'blocker\tKnowledge artifact is missing\n'; return; }
+      [[ -e "$target" ]] && printf 'risk\tdestructive\n'
+      printf 'ok\tSelected knowledge files are ready\n'
+      ;;
+    apply)
+      [[ ! -e "$target" || "${BACKUP_HOME_DESTRUCTIVE_APPROVED:-0}" -eq 1 ]] \
+        || collector_fail "Existing knowledge target requires exact destructive approval"
+      [[ "${BACKUP_HOME_RESTORE_DRY_RUN:-0}" -eq 0 ]] || return 0
+      if [[ -e "$target" ]]; then
+        [[ ! -L "$safety_root" ]] || collector_fail "Knowledge safety path must not be a symlink"
+        mkdir -p -- "$safety_root"
+        chmod 700 -- "$session/pre-restore" "$safety_root"
+        rsync --archive --relative "$target" "$safety_root/"
+      fi
+      mkdir -p -- "$target"
+      rsync --archive "$source_real/" "$target/"
+      ;;
+    verify)
+      comparison="$(rsync --archive --checksum --dry-run --itemize-changes "$source_real/" "$target/")"
+      [[ -z "$comparison" ]] || collector_fail "Knowledge restore verification failed"
+      ;;
+    guide) printf 'Review the restored learning files before removing the recovery safety copy.\n' ;;
+    *) exit 64 ;;
+  esac
+}
+
+case "$ACTION" in
+  metadata) collector_metadata supported ;;
+  backup) backup_knowledge ;;
+  restore) shift; restore_knowledge "$@" ;;
+  *) collector_fail "Unsupported collector action: $ACTION" ;;
+esac

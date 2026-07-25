@@ -8,7 +8,6 @@ DEFAULT_PROFILE_FILE="$SCRIPT_DIR/config/profiles/home.conf"
 DEFAULT_MANUAL_FILE="$SCRIPT_DIR/config/manual/home.manual"
 DEFAULT_COLLECTORS_FILE="$SCRIPT_DIR/config/collectors/enabled.conf"
 DEFAULT_RETENTION_FILE="$SCRIPT_DIR/config/retention/default.conf"
-DEFAULT_HANDLERS_FILE="$SCRIPT_DIR/config/restore/handlers.local.conf"
 
 COMMAND=""
 DEST_ROOT=""
@@ -17,7 +16,6 @@ PROFILE_FILE="$DEFAULT_PROFILE_FILE"
 MANUAL_FILE="$DEFAULT_MANUAL_FILE"
 COLLECTORS_FILE="$DEFAULT_COLLECTORS_FILE"
 RETENTION_FILE="$DEFAULT_RETENTION_FILE"
-HANDLERS_FILE="$DEFAULT_HANDLERS_FILE"
 DRY_RUN=0
 VERBOSE=0
 ASSUME_YES=0
@@ -56,6 +54,7 @@ INCOMPLETE_SNAPSHOT_DIR=""
 RUN_ACTIVE=0
 RUN_FAILURE_REPORTED=0
 RUN_STARTED_AT=""
+RUN_ID=""
 RSYNC_EXIT_CODE=0
 LOCK_FD=""
 LOCK_MODE=""
@@ -64,6 +63,8 @@ LOCK_OWNER_FILE=""
 
 CHECKSUM_SAMPLE_COUNT=16
 CHECKSUM_SAMPLE_MAX_BYTES=16777216
+DEFAULT_COLLECTOR_TIMEOUT_SECONDS=1800
+COLLECTOR_METADATA_TIMEOUT_SECONDS=30
 
 declare -a POSITIONAL_ARGS=()
 declare -a TEMP_FILES=()
@@ -76,8 +77,12 @@ declare -a EXPECTED_PATHS=()
 declare -a SIZE_REPORT_ENTRIES=()
 declare -a RUN_WARNINGS=()
 declare -a COLLECTOR_MODES=()
+declare -a COLLECTOR_PRIORITIES=()
 declare -a COLLECTOR_NAMES=()
 declare -a COLLECTOR_COMMANDS=()
+declare -a COLLECTOR_TIMEOUTS=()
+declare -a COLLECTOR_PROTOCOLS=()
+declare -a COLLECTOR_RESTORE_CAPABILITIES=()
 declare -a COLLECTOR_STATUSES=()
 declare -a COLLECTOR_EXIT_CODES=()
 declare -a COLLECTOR_STARTED_AT=()
@@ -85,15 +90,13 @@ declare -a COLLECTOR_ENDED_AT=()
 declare -a SELECTED_COMPONENTS=()
 declare -a APPROVED_DESTRUCTIVE=()
 declare -a PATH_MAPPINGS=()
-declare -a RESTORE_HANDLER_NAMES=()
-declare -a RESTORE_HANDLER_COMMANDS=()
 declare -a COMPONENT_IDS=()
 declare -a COMPONENT_LABELS=()
 declare -a COMPONENT_KINDS=()
 declare -a COMPONENT_CAPABILITIES=()
 declare -a COMPONENT_RISKS=()
 declare -a COMPONENT_RECOMMENDED=()
-declare -a COMPONENT_HANDLERS=()
+declare -a COMPONENT_COLLECTORS=()
 declare -a COMPONENT_SOURCE_PATHS=()
 declare -a COMPONENT_DEPENDENCIES=()
 declare -a RECOVERY_BLOCKERS=()
@@ -128,7 +131,6 @@ Global options:
   --manual-file PATH      Manual checklist (default: $DEFAULT_MANUAL_FILE)
   --collectors-file PATH  Collector config (default: $DEFAULT_COLLECTORS_FILE)
   --retention-file PATH   Retention config (default: $DEFAULT_RETENTION_FILE)
-  --handlers-file PATH    Local restore handler config (default: $DEFAULT_HANDLERS_FILE)
   --dry-run               Preview write-capable work
   --verbose               Show detailed command output
   --yes                   Confirm real run, restore, or prune operations
@@ -156,11 +158,8 @@ Profile format:
   unencrypted_destination=warn
 
 Collector format:
-  required|system-inventory|builtin:system-inventory
-  optional|repository-export|/absolute/path/to/wrapper
-
-Restore handler format:
-  collector-name|/absolute/path/to/restore-handler
+  100|required|system-inventory|/absolute/path/to/collector|300
+  700|optional|repository-export|/absolute/path/to/collector|1800
 EOF
 }
 
@@ -973,173 +972,223 @@ sanitize_name() {
   printf '%s\n' "$value"
 }
 
-prepare_manual_stage() {
-  local target_dir="$RUN_STAGE_DIR/artifacts/manual"
-  local title
-  local description
-  local base_name
-  local dir_name
-  local count
-  local reply
-  local total
-  declare -A used_names=()
-
-  total="$(manual_task_count)"
-  [[ "$total" -gt 0 ]] || return 0
-  [[ -t 0 ]] || die "Manual staging requires an interactive terminal for a real run"
-  mkdir -p -- "$target_dir"
-  {
-    printf 'Manual backup artifacts for snapshot %s\n\n' "$SNAPSHOT_NAME"
-    printf 'Copy files into the matching task directories before continuing.\n'
-  } >"$target_dir/README.txt"
-
-  while IFS=$'\t' read -r title description; do
-    base_name="$(sanitize_name "$title")"
-    count="${used_names[$base_name]:-0}"
-    count=$((count + 1))
-    used_names["$base_name"]="$count"
-    dir_name="$base_name"
-    [[ "$count" -gt 1 ]] && dir_name="${base_name}-${count}"
-    mkdir -p -- "$target_dir/$dir_name"
-    if [[ -n "$description" ]]; then
-      printf 'Title: %s\nDescription: %s\n' "$title" "$description" >"$target_dir/$dir_name/task.txt"
-    fi
-  done < <(manual_entries)
-
-  printf 'Manual checklist staging: %s task(s)\n' "$total"
-  printf 'Copy related files into: %s\n' "$target_dir"
-  if command -v xdg-open >/dev/null 2>&1; then
-    (xdg-open "$target_dir" >/dev/null 2>&1 &) || true
-  fi
-  printf 'Press Enter when ready, or type q to abort: '
-  read -r reply
-  case "$reply" in
-    q|Q|quit|QUIT) die "Backup cancelled during manual staging" ;;
+prepare_collector_environment() {
+  local command_path="$1"
+  local name
+  local config_override=""
+  COLLECTOR_ENV_PREFIX=(env)
+  while IFS= read -r name; do
+    [[ "$name" == BACKUP_HOME_* ]] || continue
+    COLLECTOR_ENV_PREFIX+=(-u "$name")
+  done < <(compgen -e)
+  case "${command_path##*/}" in
+    browser-recovery) config_override=BACKUP_HOME_BROWSER_CONFIG ;;
+    codex-mcp-recovery) config_override=BACKUP_HOME_CODEX_MCP_CONFIG ;;
+    credentials-recovery) config_override=BACKUP_HOME_CREDENTIALS_CONFIG ;;
+    docker-recovery) config_override=BACKUP_HOME_DOCKER_RECOVERY_CONFIG ;;
+    github-recovery) config_override=BACKUP_HOME_GITHUB_CONFIG ;;
+    gitlab-recovery) config_override=BACKUP_HOME_GITLAB_CONFIG ;;
+    knowledge-recovery) config_override=BACKUP_HOME_KNOWLEDGE_CONFIG ;;
+    server-recovery) config_override=BACKUP_HOME_SERVER_CONFIG ;;
   esac
+  if [[ -n "$config_override" && -v "$config_override" ]]; then
+    COLLECTOR_ENV_PREFIX+=("$config_override=${!config_override}")
+  fi
 }
 
 parse_collectors_file() {
   local line
+  local priority
   local mode
   local name
   local command_path
+  local timeout_seconds
   local extra
   local existing
+  local metadata
+  local protocol
+  local backup_capability
+  local restore_capability
+  local sorted_file
 
+  COLLECTOR_PRIORITIES=()
   COLLECTOR_MODES=()
   COLLECTOR_NAMES=()
   COLLECTOR_COMMANDS=()
+  COLLECTOR_TIMEOUTS=()
+  COLLECTOR_PROTOCOLS=()
+  COLLECTOR_RESTORE_CAPABILITIES=()
   COLLECTOR_STATUSES=()
   COLLECTOR_EXIT_CODES=()
   COLLECTOR_STARTED_AT=()
   COLLECTOR_ENDED_AT=()
   [[ -f "$COLLECTORS_FILE" ]] || return 0
+  require_commands timeout
   COLLECTORS_FILE="$(canonicalize_path "$COLLECTORS_FILE")"
+  sorted_file="$(mktemp)"
+  TEMP_FILES+=("$sorted_file")
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(normalize_config_line "$line")"
     [[ -n "$line" ]] || continue
-    IFS='|' read -r mode name command_path extra <<<"$line"
+    if [[ "$(awk -F '|' '{print NF}' <<<"$line")" -eq 3 ]]; then
+      die "Legacy 3-column collector entry is no longer supported; use PRIORITY|MODE|NAME|COMMAND[|TIMEOUT_SECONDS]: $line"
+    fi
+    IFS='|' read -r priority mode name command_path timeout_seconds extra <<<"$line"
+    priority="$(trim_whitespace "${priority:-}")"
     mode="$(trim_whitespace "${mode:-}")"
     name="$(trim_whitespace "${name:-}")"
     command_path="$(trim_whitespace "${command_path:-}")"
-    [[ -z "${extra:-}" && -n "$mode" && -n "$name" && -n "$command_path" ]] \
+    timeout_seconds="$(trim_whitespace "${timeout_seconds:-}")"
+    [[ -z "${extra:-}" && -n "$priority" && -n "$mode" && -n "$name" && -n "$command_path" ]] \
       || die "Invalid collector entry: $line"
+    [[ -n "$timeout_seconds" ]] || timeout_seconds="$DEFAULT_COLLECTOR_TIMEOUT_SECONDS"
+    [[ "$priority" =~ ^[0-9]+$ ]] || die "Collector priority must be a non-negative integer: $priority"
+    priority="$(sed 's/^0*//; s/^$/0/' <<<"$priority")"
     [[ "$mode" == "required" || "$mode" == "optional" ]] \
       || die "Collector mode must be required or optional: $mode"
+    [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] \
+      || die "Collector timeout must be a positive integer: $timeout_seconds"
     [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid collector name: $name"
     for existing in "${COLLECTOR_NAMES[@]}"; do
       [[ "$existing" != "$name" ]] || die "Duplicate collector name: $name"
     done
-    if [[ "$command_path" == builtin:* ]]; then
-      [[ "$command_path" == "builtin:system-inventory" ]] || die "Unknown built-in collector: $command_path"
+    for existing in "${COLLECTOR_PRIORITIES[@]}"; do
+      [[ "$existing" != "$priority" ]] || die "Duplicate collector priority: $priority"
+    done
+    [[ "$command_path" == /* ]] || die "Collector must be an absolute executable: $command_path"
+    [[ -x "$command_path" ]] || die "Collector is not executable: $command_path"
+    printf '%s|%s|%s|%s|%s\n' \
+      "$priority" "$mode" "$name" "$command_path" "$timeout_seconds" >>"$sorted_file"
+    COLLECTOR_PRIORITIES+=("$priority")
+    COLLECTOR_NAMES+=("$name")
+  done <"$COLLECTORS_FILE"
+
+  COLLECTOR_PRIORITIES=()
+  COLLECTOR_NAMES=()
+  while IFS='|' read -r priority mode name command_path timeout_seconds; do
+    prepare_collector_environment "$command_path"
+    if metadata="$("${COLLECTOR_ENV_PREFIX[@]}" \
+      BACKUP_HOME_PROTOCOL_VERSION=1 BACKUP_HOME_ACTION=metadata \
+      BACKUP_HOME_COLLECTOR_NAME="$name" BACKUP_HOME_COLLECTOR_PRIORITY="$priority" \
+      BACKUP_HOME_COLLECTOR_MODE="$mode" BACKUP_HOME_COLLECTOR_CONFIG="$COLLECTORS_FILE" \
+      BACKUP_HOME_PROJECT_DIR="$SCRIPT_DIR" BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
+      BACKUP_HOME_MANUAL_FILE="$MANUAL_FILE" BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+      BACKUP_HOME_DESTINATION_ENCRYPTION="$DESTINATION_ENCRYPTION_STATE" \
+      BACKUP_HOME_RUN_ID="$RUN_ID" BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
+      BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
+      BACKUP_HOME_SOURCE_USER="$(id -un)" BACKUP_HOME_SOURCE_UID="$(id -u)" \
+      BACKUP_HOME_SOURCE_GID="$(id -g)" \
+      BACKUP_HOME_SOURCE_HOME="$(canonicalize_path "${HOME:?HOME is required}")" \
+      BACKUP_HOME_HOSTNAME="$(hostname)" BACKUP_HOME_OS_ID="$(os_release_value ID)" \
+      BACKUP_HOME_OS_VERSION_ID="$(os_release_value VERSION_ID)" \
+      BACKUP_HOME_COLLECTOR_STARTED_AT="" BACKUP_HOME_STAGE_DIR="" \
+      BACKUP_HOME_ARTIFACT_DIR="" BACKUP_HOME_SNAPSHOT_DIR="" \
+      BACKUP_HOME_RESTORE_ACTION="" BACKUP_HOME_RESTORE_COMPONENT="" \
+      BACKUP_HOME_RESTORE_SESSION_DIR="" BACKUP_HOME_RESTORE_STAGING_DIR="" \
+      BACKUP_HOME_TARGET_USER="" BACKUP_HOME_TARGET_UID="" BACKUP_HOME_TARGET_GID="" \
+      BACKUP_HOME_TARGET_HOME="" BACKUP_HOME_RESTORE_DRY_RUN=0 \
+      BACKUP_HOME_RESTORE_ASSUME_YES=0 BACKUP_HOME_DESTRUCTIVE_APPROVED=0 \
+      BACKUP_HOME_COLLECTOR_TIMEOUT_SECONDS="$timeout_seconds" \
+      BACKUP_HOME_DRY_RUN="$DRY_RUN" BACKUP_HOME_VERBOSE="$VERBOSE" \
+      timeout --foreground --signal=TERM --kill-after=10s "${COLLECTOR_METADATA_TIMEOUT_SECONDS}s" \
+      "$command_path" metadata 2>/dev/null)"; then
+      :
     else
-      [[ "$command_path" == /* ]] || die "External collector must be an absolute executable: $command_path"
-      [[ -x "$command_path" ]] || die "External collector is not executable: $command_path"
+      die "Collector metadata failed: $name"
     fi
+    protocol="$(awk -F '\t' '$1 == "protocol" {print $2; exit}' <<<"$metadata")"
+    backup_capability="$(awk -F '\t' '$1 == "backup" {print $2; exit}' <<<"$metadata")"
+    restore_capability="$(awk -F '\t' '$1 == "restore" {print $2; exit}' <<<"$metadata")"
+    [[ "$protocol" == "1" ]] || die "Collector $name returned unsupported protocol metadata"
+    [[ "$backup_capability" == "required" ]] || die "Collector $name does not declare required backup support"
+    [[ "$restore_capability" == "supported" || "$restore_capability" == "unsupported" ]] \
+      || die "Collector $name returned invalid restore metadata"
+    COLLECTOR_PRIORITIES+=("$priority")
     COLLECTOR_MODES+=("$mode")
     COLLECTOR_NAMES+=("$name")
     COLLECTOR_COMMANDS+=("$command_path")
+    COLLECTOR_TIMEOUTS+=("$timeout_seconds")
+    COLLECTOR_PROTOCOLS+=("$protocol")
+    COLLECTOR_RESTORE_CAPABILITIES+=("$restore_capability")
     COLLECTOR_STATUSES+=("pending")
     COLLECTOR_EXIT_CODES+=("0")
     COLLECTOR_STARTED_AT+=("")
     COLLECTOR_ENDED_AT+=("")
-  done <"$COLLECTORS_FILE"
+  done < <(sort -t '|' -k1,1n "$sorted_file")
 }
 
-inventory_warning() {
-  local output_dir="$1"
-  shift
-  printf '%s\n' "$*" >>"$output_dir/warnings.txt"
+collector_context() {
+  local action="$1"
+  local index="$2"
+  local output_dir="${3:-}"
+  prepare_collector_environment "${COLLECTOR_COMMANDS[$index]}"
+  "${COLLECTOR_ENV_PREFIX[@]}" \
+  BACKUP_HOME_PROTOCOL_VERSION=1 \
+  BACKUP_HOME_ACTION="$action" \
+  BACKUP_HOME_COLLECTOR_NAME="${COLLECTOR_NAMES[$index]}" \
+  BACKUP_HOME_COLLECTOR_PRIORITY="${COLLECTOR_PRIORITIES[$index]}" \
+  BACKUP_HOME_COLLECTOR_MODE="${COLLECTOR_MODES[$index]}" \
+  BACKUP_HOME_COLLECTOR_TIMEOUT_SECONDS="${COLLECTOR_TIMEOUTS[$index]}" \
+  BACKUP_HOME_COLLECTOR_CONFIG="$COLLECTORS_FILE" \
+  BACKUP_HOME_PROJECT_DIR="$SCRIPT_DIR" \
+  BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
+  BACKUP_HOME_MANUAL_FILE="$MANUAL_FILE" \
+  BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+  BACKUP_HOME_DESTINATION_ENCRYPTION="$DESTINATION_ENCRYPTION_STATE" \
+  BACKUP_HOME_RUN_ID="$RUN_ID" \
+  BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
+  BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
+  BACKUP_HOME_COLLECTOR_STARTED_AT="${COLLECTOR_STARTED_AT[$index]}" \
+  BACKUP_HOME_SOURCE_USER="$(id -un)" \
+  BACKUP_HOME_SOURCE_UID="$(id -u)" \
+  BACKUP_HOME_SOURCE_GID="$(id -g)" \
+  BACKUP_HOME_SOURCE_HOME="$(canonicalize_path "${HOME:?HOME is required}")" \
+  BACKUP_HOME_HOSTNAME="$(hostname)" \
+  BACKUP_HOME_OS_ID="$(os_release_value ID)" \
+  BACKUP_HOME_OS_VERSION_ID="$(os_release_value VERSION_ID)" \
+  BACKUP_HOME_STAGE_DIR="$output_dir" \
+  BACKUP_HOME_ARTIFACT_DIR="$output_dir" \
+  BACKUP_HOME_DRY_RUN="$DRY_RUN" \
+  BACKUP_HOME_VERBOSE="$VERBOSE" \
+  BACKUP_HOME_SNAPSHOT_DIR="" \
+  BACKUP_HOME_RESTORE_ACTION="" \
+  BACKUP_HOME_RESTORE_COMPONENT="" \
+  BACKUP_HOME_RESTORE_SESSION_DIR="" \
+  BACKUP_HOME_RESTORE_STAGING_DIR="" \
+  BACKUP_HOME_TARGET_USER="" \
+  BACKUP_HOME_TARGET_UID="" \
+  BACKUP_HOME_TARGET_GID="" \
+  BACKUP_HOME_TARGET_HOME="" \
+  BACKUP_HOME_RESTORE_DRY_RUN=0 \
+  BACKUP_HOME_RESTORE_ASSUME_YES=0 \
+  BACKUP_HOME_DESTRUCTIVE_APPROVED=0 \
+    timeout --foreground --signal=TERM --kill-after=10s "${COLLECTOR_TIMEOUTS[$index]}s" \
+    "${COLLECTOR_COMMANDS[$index]}" "$action"
 }
 
-collector_system_inventory() {
-  local output_dir="$1"
-  local user_home="${HOME:?HOME is required for system inventory}"
-  local crontab_temp
-  local source_path
+replace_failed_collector_artifact() {
+  local name="$1"
+  local output_dir="$2"
+  local rc="$3"
+  local timeout_seconds="$4"
+  local timed_out="no"
 
+  [[ "$output_dir" == "$RUN_STAGE_DIR/artifacts/collectors/$name" ]] \
+    || die "Refusing to clean unexpected collector output path: $output_dir"
+  [[ "$rc" -ne 124 ]] || timed_out="yes"
+  rm -rf -- "$output_dir"
   mkdir -p -- "$output_dir"
-  [[ -f /etc/os-release ]] && cp -- /etc/os-release "$output_dir/os-release"
-  hostname >"$output_dir/hostname.txt"
+  chmod 700 "$output_dir"
   {
-    printf 'backup-home script sha256: %s\n' "$(sha256sum "$SCRIPT_DIR/backup-home" | awk '{print $1}')"
-    printf 'bash: %s\n' "${BASH_VERSION}"
-    printf 'rsync: %s\n' "$(rsync --version | awk 'NR==1 {print $0}')"
-  } >"$output_dir/tool-versions.txt"
-
-  if command -v hostnamectl >/dev/null 2>&1; then
-    hostnamectl >"$output_dir/hostnamectl.txt" 2>/dev/null || inventory_warning "$output_dir" "hostnamectl export failed"
-  fi
-  if command -v dconf >/dev/null 2>&1; then
-    dconf dump / >"$output_dir/dconf.ini" 2>/dev/null || inventory_warning "$output_dir" "dconf export failed"
-  else
-    inventory_warning "$output_dir" "dconf is unavailable"
-  fi
-  if command -v apt-mark >/dev/null 2>&1; then
-    apt-mark showmanual 2>/dev/null | sort >"$output_dir/apt-manual.txt" \
-      || inventory_warning "$output_dir" "apt-mark export failed"
-  fi
-  if command -v dpkg >/dev/null 2>&1; then
-    dpkg --get-selections >"$output_dir/dpkg-selections.txt" 2>/dev/null \
-      || inventory_warning "$output_dir" "dpkg selections export failed"
-  fi
-  if command -v snap >/dev/null 2>&1; then
-    snap list >"$output_dir/snap-list.txt" 2>/dev/null \
-      || inventory_warning "$output_dir" "snap list export failed"
-  else
-    inventory_warning "$output_dir" "snap is unavailable"
-  fi
-  if command -v flatpak >/dev/null 2>&1; then
-    flatpak list --app --columns=application,branch,origin >"$output_dir/flatpak-apps.tsv" 2>/dev/null \
-      || inventory_warning "$output_dir" "flatpak list export failed"
-  else
-    inventory_warning "$output_dir" "flatpak is unavailable"
-  fi
-  if command -v crontab >/dev/null 2>&1; then
-    crontab_temp="$(mktemp)"
-    TEMP_FILES+=("$crontab_temp")
-    if crontab -l >"$crontab_temp" 2>/dev/null; then
-      cp -- "$crontab_temp" "$output_dir/crontab.txt"
-    else
-      printf 'No readable user crontab was found.\n' >"$output_dir/crontab-status.txt"
-    fi
-  fi
-
-  for source_path in "$user_home/.local/share/nautilus/scripts" "$user_home/.config/nautilus"; do
-    if [[ -e "$source_path" ]]; then
-      mkdir -p -- "$output_dir/nautilus"
-      rsync --archive --relative "$source_path" "$output_dir/nautilus/" >/dev/null 2>&1 \
-        || inventory_warning "$output_dir" "Could not copy Nautilus data from $source_path"
-    fi
-  done
-
-  {
-    printf '# System inventory restore guidance\n\n'
-    printf 'These files are recovery references, not an automatic restore program.\n'
-    printf 'Review package lists and settings before applying them to another system.\n'
-    printf 'Do not run package installation or dconf import commands without a separate review.\n'
-  } >"$output_dir/RESTORE.md"
+    printf 'schema_version\t1\n'
+    printf 'collector\t%s\n' "$name"
+    printf 'status\tfailed\n'
+    printf 'exit_code\t%s\n' "$rc"
+    printf 'timed_out\t%s\n' "$timed_out"
+    printf 'timeout_seconds\t%s\n' "$timeout_seconds"
+  } >"$output_dir/failure.tsv"
+  chmod 600 "$output_dir/failure.tsv"
 }
 
 run_collectors() {
@@ -1148,6 +1197,7 @@ run_collectors() {
   local name
   local command_path
   local output_dir
+  local timeout_seconds
   local rc
   local status
 
@@ -1155,32 +1205,18 @@ run_collectors() {
     mode="${COLLECTOR_MODES[$index]}"
     name="${COLLECTOR_NAMES[$index]}"
     command_path="${COLLECTOR_COMMANDS[$index]}"
+    timeout_seconds="${COLLECTOR_TIMEOUTS[$index]}"
     output_dir="$RUN_STAGE_DIR/artifacts/collectors/$name"
     mkdir -p -- "$output_dir"
     COLLECTOR_STARTED_AT[index]="$(iso_now)"
-    log_line "Collector started: $name ($mode)"
+    log_line "Collector started: $name ($mode, timeout=${timeout_seconds}s)"
 
     set +e
-    if [[ "$command_path" == "builtin:system-inventory" ]]; then
-      collector_system_inventory "$output_dir"
-      rc=$?
-    elif [[ "$VERBOSE" -eq 1 ]]; then
-      BACKUP_HOME_STAGE_DIR="$output_dir" \
-      BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
-      BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
-      BACKUP_HOME_SOURCE_HOME="${HOME:?HOME is required}" \
-      BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
-      BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
-        "$command_path"
+    if [[ "$VERBOSE" -eq 1 ]]; then
+      collector_context backup "$index" "$output_dir"
       rc=$?
     else
-      BACKUP_HOME_STAGE_DIR="$output_dir" \
-      BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
-      BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
-      BACKUP_HOME_SOURCE_HOME="${HOME:?HOME is required}" \
-      BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
-      BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
-        "$command_path" >/dev/null 2>&1
+      collector_context backup "$index" "$output_dir" >/dev/null 2>&1
       rc=$?
     fi
     set -e
@@ -1190,6 +1226,7 @@ run_collectors() {
     status="success"
     if [[ "$rc" -ne 0 ]]; then
       status="failed"
+      replace_failed_collector_artifact "$name" "$output_dir" "$rc" "$timeout_seconds"
     elif [[ -s "$output_dir/warnings.txt" ]]; then
       status="warning"
     fi
@@ -1200,7 +1237,11 @@ run_collectors() {
       return "$rc"
     fi
     if [[ "$rc" -ne 0 && "$mode" == "optional" ]]; then
-      record_warning "Optional collector failed: $name (rc=$rc)"
+      if [[ "$rc" -eq 124 ]]; then
+        record_warning "Optional collector timed out: $name (${timeout_seconds}s)"
+      else
+        record_warning "Optional collector failed: $name (rc=$rc)"
+      fi
     elif [[ "$status" == "warning" ]]; then
       record_warning "Collector completed with warnings: $name"
     fi
@@ -1260,9 +1301,11 @@ write_snapshot_report() {
       printf '  - none\n'
     else
       for index in "${!COLLECTOR_NAMES[@]}"; do
-        printf '  - %s: %s (%s, rc=%s)\n' \
+        printf '  - %s: %s (priority=%s, %s, timeout=%ss, restore=%s, rc=%s)\n' \
           "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_STATUSES[$index]}" \
-          "${COLLECTOR_MODES[$index]}" "${COLLECTOR_EXIT_CODES[$index]}"
+          "${COLLECTOR_PRIORITIES[$index]}" "${COLLECTOR_MODES[$index]}" \
+          "${COLLECTOR_TIMEOUTS[$index]}" "${COLLECTOR_RESTORE_CAPABILITIES[$index]}" \
+          "${COLLECTOR_EXIT_CODES[$index]}"
       done
     fi
     printf '\nWarnings:\n'
@@ -1327,7 +1370,7 @@ write_snapshot_manifest() {
   script_hash="$(sha256sum "$SCRIPT_DIR/backup-home" | awk '{print $1}')"
 
   {
-    printf 'schema_version\t2\n'
+    printf 'schema_version\t3\n'
     printf 'snapshot\t%s\n' "$(manifest_escape "$SNAPSHOT_NAME")"
     printf 'status\t%s\n' "$status"
     printf 'started_at\t%s\n' "$(manifest_escape "$RUN_STARTED_AT")"
@@ -1358,10 +1401,12 @@ write_snapshot_manifest() {
       printf 'exclude\t%s\n' "$(manifest_escape "$rule")"
     done
     for index in "${!COLLECTOR_NAMES[@]}"; do
-      printf 'collector\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      printf 'collector\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_MODES[$index]}" \
         "${COLLECTOR_STATUSES[$index]}" "${COLLECTOR_EXIT_CODES[$index]}" \
-        "${COLLECTOR_STARTED_AT[$index]}" "${COLLECTOR_ENDED_AT[$index]}"
+        "${COLLECTOR_STARTED_AT[$index]}" "${COLLECTOR_ENDED_AT[$index]}" \
+        "${COLLECTOR_PRIORITIES[$index]}" "${COLLECTOR_PROTOCOLS[$index]}" \
+        "${COLLECTOR_RESTORE_CAPABILITIES[$index]}"
     done
     for warning_message in "${RUN_WARNINGS[@]}"; do
       printf 'warning\t%s\n' "$(manifest_escape "$warning_message")"
@@ -1389,7 +1434,7 @@ self_verify_snapshot() {
 
   [[ -s "$manifest" ]] || return 1
   case "$(manifest_value "$manifest" schema_version)" in
-    1|2) ;;
+    1|2|3) ;;
     *) return 1 ;;
   esac
   [[ "$(manifest_value "$manifest" snapshot)" == "$expected_name" ]] || return 1
@@ -1473,7 +1518,10 @@ show_plan() {
     printf '  - none\n'
   else
     for index in "${!COLLECTOR_NAMES[@]}"; do
-      printf '  - %s | %s | %s\n' "${COLLECTOR_MODES[$index]}" "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_COMMANDS[$index]}"
+      printf '  - %s | %s | %s | %s | timeout=%ss | restore=%s\n' \
+        "${COLLECTOR_PRIORITIES[$index]}" "${COLLECTOR_MODES[$index]}" \
+        "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_COMMANDS[$index]}" \
+        "${COLLECTOR_TIMEOUTS[$index]}" "${COLLECTOR_RESTORE_CAPABILITIES[$index]}"
     done
   fi
   printf '\nManual checklist:\n'
@@ -1557,6 +1605,7 @@ run_backup() {
   free_bytes="$(available_dest_bytes)"
   SNAPSHOT_NAME="$(timestamp_now)"
   RUN_STARTED_AT="$(iso_now)"
+  RUN_ID="$SNAPSHOT_NAME-$$"
   previous_snapshot="$(latest_snapshot_name || true)"
 
   print_label_value "Profile:" "$PROFILE_FILE"
@@ -1574,7 +1623,9 @@ run_backup() {
     printf 'Collectors:\n'
     local index
     for index in "${!COLLECTOR_NAMES[@]}"; do
-      printf '  - would run %s (%s)\n' "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_MODES[$index]}"
+      printf '  - would run %s (%s, timeout=%ss)\n' \
+        "${COLLECTOR_NAMES[$index]}" "${COLLECTOR_MODES[$index]}" \
+        "${COLLECTOR_TIMEOUTS[$index]}"
     done
   fi
 
@@ -1589,7 +1640,11 @@ run_backup() {
     rsync_backup "$exclude_file" "$snapshot_dir" "$link_dest_dir"
     RSYNC_EXIT_CODE=$?
     set -e
-    [[ "$RSYNC_EXIT_CODE" -eq 0 ]] || die_with_code "$RSYNC_EXIT_CODE" "Dry-run rsync failed with exit code $RSYNC_EXIT_CODE"
+    if [[ "$RSYNC_EXIT_CODE" -eq 24 ]]; then
+      log_line "WARNING: Dry-run rsync reported vanished source files (rc=24)"
+    elif [[ "$RSYNC_EXIT_CODE" -ne 0 ]]; then
+      die_with_code "$RSYNC_EXIT_CODE" "Dry-run rsync failed with exit code $RSYNC_EXIT_CODE"
+    fi
     log_line "Dry-run finished successfully"
     return 0
   fi
@@ -1611,7 +1666,6 @@ run_backup() {
   setup_run_log
   log_line "Previous snapshot: ${previous_snapshot:-none}"
 
-  prepare_manual_stage
   set +e
   run_collectors
   collector_rc=$?
@@ -1625,7 +1679,9 @@ run_backup() {
   rsync_backup "$exclude_file" "$INCOMPLETE_SNAPSHOT_DIR" "$link_dest_dir"
   RSYNC_EXIT_CODE=$?
   set -e
-  if [[ "$RSYNC_EXIT_CODE" -ne 0 ]]; then
+  if [[ "$RSYNC_EXIT_CODE" -eq 24 ]]; then
+    record_warning "Rsync reported vanished source files (rc=24)"
+  elif [[ "$RSYNC_EXIT_CODE" -ne 0 ]]; then
     fail_active_run "Backup rsync failed with exit code $RSYNC_EXIT_CODE" "$RSYNC_EXIT_CODE"
   fi
 
@@ -1718,7 +1774,7 @@ verify_snapshot() {
     done
   else
     case "$(manifest_value "$manifest" schema_version)" in
-      1|2) ;;
+      1|2|3) ;;
       *) errors=$((errors + 1)) ;;
     esac
     [[ "$(manifest_value "$manifest" snapshot)" == "$snapshot" ]] || errors=$((errors + 1))
@@ -1932,67 +1988,17 @@ validate_component_id() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid recovery component ID: $1"
 }
 
-register_restore_handler() {
-  local name="$1"
-  local command_path="$2"
-  local index
-  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid restore handler name: $name"
-  [[ "$command_path" == /* ]] || die "Restore handler must be absolute: $command_path"
-  [[ -x "$command_path" ]] || die "Restore handler is not executable: $command_path"
-  for index in "${!RESTORE_HANDLER_NAMES[@]}"; do
-    [[ "${RESTORE_HANDLER_NAMES[$index]}" != "$name" ]] \
-      || die "Duplicate restore handler: $name"
-  done
-  RESTORE_HANDLER_NAMES+=("$name")
-  RESTORE_HANDLER_COMMANDS+=("$command_path")
+parse_recovery_collectors() {
+  parse_collectors_file
 }
 
-parse_restore_handlers() {
-  local line
-  local name
-  local command_path
-  local extra
-  local builtin
-  local -a builtin_names=(
-    docker-recovery
-    credentials-recovery
-    codex-mcp-recovery
-    browser-recovery
-    github-recovery
-    server-recovery
-  )
-
-  RESTORE_HANDLER_NAMES=()
-  RESTORE_HANDLER_COMMANDS=()
-  if [[ -f "$HANDLERS_FILE" ]]; then
-    HANDLERS_FILE="$(canonicalize_path "$HANDLERS_FILE")"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      line="$(normalize_config_line "$line")"
-      [[ -n "$line" ]] || continue
-      IFS='|' read -r name command_path extra <<<"$line"
-      name="$(trim_whitespace "${name:-}")"
-      command_path="$(trim_whitespace "${command_path:-}")"
-      [[ -z "${extra:-}" && -n "$name" && -n "$command_path" ]] \
-        || die "Invalid restore handler entry: $line"
-      register_restore_handler "$name" "$(canonicalize_path "$command_path")"
-    done <"$HANDLERS_FILE"
-  elif [[ "$HANDLERS_FILE" != "$DEFAULT_HANDLERS_FILE" ]]; then
-    die "Restore handler file not found: $HANDLERS_FILE"
-  fi
-
-  for name in "${builtin_names[@]}"; do
-    array_contains "$name" "${RESTORE_HANDLER_NAMES[@]}" && continue
-    builtin="$SCRIPT_DIR/restore-handlers/$name"
-    [[ -x "$builtin" ]] && register_restore_handler "$name" "$builtin"
-  done
-}
-
-restore_handler_command() {
+collector_restore_command() {
   local wanted="$1"
   local index
-  for index in "${!RESTORE_HANDLER_NAMES[@]}"; do
-    if [[ "${RESTORE_HANDLER_NAMES[$index]}" == "$wanted" ]]; then
-      printf '%s\n' "${RESTORE_HANDLER_COMMANDS[$index]}"
+  for index in "${!COLLECTOR_NAMES[@]}"; do
+    if [[ "${COLLECTOR_NAMES[$index]}" == "$wanted" \
+      && "${COLLECTOR_RESTORE_CAPABILITIES[$index]}" == "supported" ]]; then
+      printf '%s\n' "${COLLECTOR_COMMANDS[$index]}"
       return 0
     fi
   done
@@ -2006,7 +2012,7 @@ reset_recovery_components() {
   COMPONENT_CAPABILITIES=()
   COMPONENT_RISKS=()
   COMPONENT_RECOMMENDED=()
-  COMPONENT_HANDLERS=()
+  COMPONENT_COLLECTORS=()
   COMPONENT_SOURCE_PATHS=()
   COMPONENT_DEPENDENCIES=()
   COMPONENT_INDEX=()
@@ -2019,7 +2025,7 @@ add_recovery_component() {
   local capability="$4"
   local risk="$5"
   local recommended="$6"
-  local handler="${7:-}"
+  local collector="${7:-}"
   local source_path="${8:-}"
   local dependencies="${9:-}"
   local index
@@ -2040,7 +2046,7 @@ add_recovery_component() {
   COMPONENT_CAPABILITIES+=("$capability")
   COMPONENT_RISKS+=("$risk")
   COMPONENT_RECOMMENDED+=("$recommended")
-  COMPONENT_HANDLERS+=("$handler")
+  COMPONENT_COLLECTORS+=("$collector")
   COMPONENT_SOURCE_PATHS+=("${source_path%/}")
   COMPONENT_DEPENDENCIES+=("$dependencies")
 }
@@ -2049,8 +2055,8 @@ set_component_source_path() {
   local id="$1"
   local path="$2"
   local index="${COMPONENT_INDEX[$id]:-}"
-  [[ -n "$index" ]] || die "Handler referenced an unknown component: $id"
-  [[ "$path" == /* ]] || die "Handler component path must be absolute: $path"
+  [[ -n "$index" ]] || die "Collector referenced an unknown component: $id"
+  [[ "$path" == /* ]] || die "Collector component path must be absolute: $path"
   COMPONENT_SOURCE_PATHS[index]="${path%/}"
 }
 
@@ -2058,7 +2064,7 @@ add_component_dependency() {
   local id="$1"
   local dependency="$2"
   local index="${COMPONENT_INDEX[$id]:-}"
-  [[ -n "$index" ]] || die "Handler referenced an unknown component: $id"
+  [[ -n "$index" ]] || die "Collector referenced an unknown component: $id"
   validate_component_id "$dependency"
   if [[ -n "${COMPONENT_DEPENDENCIES[$index]}" ]]; then
     COMPONENT_DEPENDENCIES[index]+=",$dependency"
@@ -2154,7 +2160,7 @@ load_recovery_snapshot_context() {
   fi
   [[ -n "$RECOVERY_SOURCE_UID" ]] || RECOVERY_SOURCE_UID="${source_owner%%:*}"
   [[ -n "$RECOVERY_SOURCE_GID" ]] || RECOVERY_SOURCE_GID="${source_owner#*:}"
-  [[ "$RECOVERY_SCHEMA" == "2" ]] \
+  [[ "$RECOVERY_SCHEMA" == "2" || "$RECOVERY_SCHEMA" == "3" ]] \
     || RECOVERY_WARNINGS+=("Source identity was inferred because the snapshot has no manifest v2 identity fields")
 
   [[ -n "$TARGET_USER" ]] || TARGET_USER="$(id -un)"
@@ -2211,7 +2217,7 @@ validate_recovery_snapshot() {
 
   [[ "$RECOVERY_SCHEMA" != "legacy" ]] || return 0
   case "$RECOVERY_SCHEMA" in
-    1|2) ;;
+    1|2|3) ;;
     *) RECOVERY_BLOCKERS+=("Unsupported manifest schema: $RECOVERY_SCHEMA"); return 0 ;;
   esac
   [[ "$(manifest_value "$RECOVERY_MANIFEST" snapshot)" == "$SNAPSHOT_NAME" ]] \
@@ -2265,34 +2271,79 @@ validate_recovery_snapshot() {
   fi
 }
 
-invoke_restore_handler() {
-  local handler="$1"
+invoke_collector_restore() {
+  local collector="$1"
   local action="$2"
   local component="${3:-}"
   local command_path
+  local index
+  local priority=""
+  local mode=""
+  local timeout_seconds="$DEFAULT_COLLECTOR_TIMEOUT_SECONDS"
   local destructive_approved=0
-  command_path="$(restore_handler_command "$handler")" || return 127
+  local restore_session_dir
+  local collector_started_at
+  command_path="$(collector_restore_command "$collector")" || return 127
+  for index in "${!COLLECTOR_NAMES[@]}"; do
+    if [[ "${COLLECTOR_NAMES[$index]}" == "$collector" ]]; then
+      priority="${COLLECTOR_PRIORITIES[$index]}"
+      mode="${COLLECTOR_MODES[$index]}"
+      timeout_seconds="${COLLECTOR_TIMEOUTS[$index]}"
+      break
+    fi
+  done
   if [[ -n "$component" ]] && array_contains "$component" "${APPROVED_DESTRUCTIVE[@]}"; then
     destructive_approved=1
   fi
+  restore_session_dir="${RECOVERY_SESSION_DIR:-$(recovery_session_base)/plan-$RUN_ID}"
+  collector_started_at="$(iso_now)"
+  prepare_collector_environment "$command_path"
+  "${COLLECTOR_ENV_PREFIX[@]}" \
+  BACKUP_HOME_PROTOCOL_VERSION=1 \
+  BACKUP_HOME_ACTION=restore \
   BACKUP_HOME_RESTORE_ACTION="$action" \
+  BACKUP_HOME_COLLECTOR_NAME="$collector" \
+  BACKUP_HOME_COLLECTOR_PRIORITY="$priority" \
+  BACKUP_HOME_COLLECTOR_MODE="$mode" \
+  BACKUP_HOME_COLLECTOR_TIMEOUT_SECONDS="$timeout_seconds" \
+  BACKUP_HOME_COLLECTOR_CONFIG="$COLLECTORS_FILE" \
+  BACKUP_HOME_PROJECT_DIR="$SCRIPT_DIR" \
+  BACKUP_HOME_PROFILE_FILE="$PROFILE_FILE" \
+  BACKUP_HOME_MANUAL_FILE="$MANUAL_FILE" \
+  BACKUP_HOME_DEST="$DEST_ROOT_REAL" \
+  BACKUP_HOME_DESTINATION_ENCRYPTION="$DESTINATION_ENCRYPTION_STATE" \
+  BACKUP_HOME_RUN_ID="$RUN_ID" \
+  BACKUP_HOME_SNAPSHOT_NAME="$SNAPSHOT_NAME" \
+  BACKUP_HOME_RUN_STARTED_AT="$RUN_STARTED_AT" \
+  BACKUP_HOME_COLLECTOR_STARTED_AT="$collector_started_at" \
   BACKUP_HOME_SNAPSHOT_DIR="$RECOVERY_SNAPSHOT_DIR" \
-  BACKUP_HOME_ARTIFACT_DIR="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/$handler" \
+  BACKUP_HOME_STAGE_DIR="$STAGING_DIR" \
+  BACKUP_HOME_ARTIFACT_DIR="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/$collector" \
   BACKUP_HOME_RESTORE_STAGING_DIR="$STAGING_DIR" \
-  BACKUP_HOME_RESTORE_SESSION_DIR="$RECOVERY_SESSION_DIR" \
+  BACKUP_HOME_RESTORE_SESSION_DIR="$restore_session_dir" \
   BACKUP_HOME_SOURCE_HOME="$RECOVERY_SOURCE_HOME" \
+  BACKUP_HOME_SOURCE_USER="$RECOVERY_SOURCE_USER" \
+  BACKUP_HOME_SOURCE_UID="$RECOVERY_SOURCE_UID" \
+  BACKUP_HOME_SOURCE_GID="$RECOVERY_SOURCE_GID" \
+  BACKUP_HOME_HOSTNAME="$(hostname)" \
+  BACKUP_HOME_OS_ID="$(os_release_value ID)" \
+  BACKUP_HOME_OS_VERSION_ID="$(os_release_value VERSION_ID)" \
   BACKUP_HOME_TARGET_USER="$TARGET_USER" \
   BACKUP_HOME_TARGET_UID="$RECOVERY_TARGET_UID" \
   BACKUP_HOME_TARGET_GID="$RECOVERY_TARGET_GID" \
   BACKUP_HOME_TARGET_HOME="$TARGET_HOME" \
   BACKUP_HOME_RESTORE_DRY_RUN="$DRY_RUN" \
   BACKUP_HOME_RESTORE_ASSUME_YES="$ASSUME_YES" \
+  BACKUP_HOME_RESTORE_COMPONENT="$component" \
   BACKUP_HOME_DESTRUCTIVE_APPROVED="$destructive_approved" \
-    "$command_path" "$action" ${component:+"$component"}
+  BACKUP_HOME_DRY_RUN="$DRY_RUN" \
+  BACKUP_HOME_VERBOSE="$VERBOSE" \
+    timeout --foreground --signal=TERM --kill-after=10s "${timeout_seconds}s" \
+    "$command_path" restore "$action" ${component:+"$component"}
 }
 
-discover_handler_components() {
-  local handler="$1"
+discover_collector_components() {
+  local collector="$1"
   local output
   local rc
   local record
@@ -2304,13 +2355,13 @@ discover_handler_components() {
   local extra
   local before_count="${#COMPONENT_IDS[@]}"
 
-  if output="$(invoke_restore_handler "$handler" describe)"; then
+  if output="$(invoke_collector_restore "$collector" describe)"; then
     rc=0
   else
     rc=$?
   fi
   if [[ "$rc" -ne 0 ]]; then
-    RECOVERY_WARNINGS+=("Restore handler describe failed: $handler (rc=$rc)")
+    RECOVERY_WARNINGS+=("Collector restore describe failed: $collector (rc=$rc)")
     return 1
   fi
   while IFS=$'\t' read -r record id label capability risk recommended extra; do
@@ -2318,20 +2369,20 @@ discover_handler_components() {
     case "$record" in
       component)
         [[ -z "${extra:-}" && -n "$id" && -n "$label" && -n "$capability" && -n "$risk" && -n "$recommended" ]] \
-          || die "Invalid component record from handler $handler"
-        add_recovery_component "$id" "$label" handler "$capability" "$risk" "$recommended" "$handler"
+          || die "Invalid component record from collector $collector"
+        add_recovery_component "$id" "$label" collector "$capability" "$risk" "$recommended" "$collector"
         ;;
       path)
         [[ -n "$id" && -n "$label" && -z "${capability:-}${risk:-}${recommended:-}${extra:-}" ]] \
-          || die "Invalid path record from handler $handler"
+          || die "Invalid path record from collector $collector"
         set_component_source_path "$id" "$label"
         ;;
       dependency)
         [[ -n "$id" && -n "$label" && -z "${capability:-}${risk:-}${recommended:-}${extra:-}" ]] \
-          || die "Invalid dependency record from handler $handler"
+          || die "Invalid dependency record from collector $collector"
         add_component_dependency "$id" "$label"
         ;;
-      *) die "Unknown record from restore handler $handler: $record" ;;
+      *) die "Unknown record from collector $collector: $record" ;;
     esac
   done <<<"$output"
   [[ "${#COMPONENT_IDS[@]}" -gt "$before_count" ]]
@@ -2340,7 +2391,7 @@ discover_handler_components() {
 discover_recovery_components() {
   local root
   local collector
-  local handler
+  local collector_command
   local id
   local index=0
   local -a collectors=()
@@ -2364,13 +2415,8 @@ discover_recovery_components() {
 
   mapfile -t collectors < <(awk -F '\t' '$1 == "collector" {print $2}' "$RECOVERY_MANIFEST")
   for collector in "${collectors[@]}"; do
-    if [[ "$collector" == "system-inventory" ]]; then
-      add_recovery_component "system.inventory" "System inventory and rebuild guidance" \
-        system-inventory guided manual recommended "$collector"
-      continue
-    fi
-    handler="$(restore_handler_command "$collector" || true)"
-    if [[ -n "$handler" ]] && discover_handler_components "$collector"; then
+    collector_command="$(collector_restore_command "$collector" || true)"
+    if [[ -n "$collector_command" ]] && discover_collector_components "$collector"; then
       continue
     fi
     id="collector.$(sanitize_name "$collector").artifacts"
@@ -2382,7 +2428,7 @@ preflight_recovery_components() {
   local index
   local id
   local kind
-  local handler
+  local collector
   local source_path
   local target_path
   local output
@@ -2395,7 +2441,7 @@ preflight_recovery_components() {
   for index in "${!COMPONENT_IDS[@]}"; do
     id="${COMPONENT_IDS[$index]}"
     kind="${COMPONENT_KINDS[$index]}"
-    handler="${COMPONENT_HANDLERS[$index]}"
+    collector="${COMPONENT_COLLECTORS[$index]}"
     source_path="${COMPONENT_SOURCE_PATHS[$index]}"
     if [[ -n "$source_path" ]]; then
       if [[ ! -e "$RECOVERY_SNAPSHOT_DIR$source_path" && ! -L "$RECOVERY_SNAPSHOT_DIR$source_path" ]]; then
@@ -2409,14 +2455,14 @@ preflight_recovery_components() {
         fi
       fi
     fi
-    [[ "$kind" == "handler" ]] || continue
-    if output="$(invoke_restore_handler "$handler" preflight "$id")"; then
+    [[ "$kind" == "collector" ]] || continue
+    if output="$(invoke_collector_restore "$collector" preflight "$id")"; then
       rc=0
     else
       rc=$?
     fi
     if [[ "$rc" -ne 0 ]]; then
-      RECOVERY_BLOCKERS+=("Handler preflight failed for $id (rc=$rc)")
+      RECOVERY_BLOCKERS+=("Collector preflight failed for $id (rc=$rc)")
       continue
     fi
     while IFS=$'\t' read -r level message extra; do
@@ -2426,11 +2472,11 @@ preflight_recovery_components() {
         warning) RECOVERY_WARNINGS+=("$id: $message") ;;
         blocker) RECOVERY_BLOCKERS+=("$id: $message") ;;
         risk)
-          case "$message" in safe|privileged|destructive|manual) COMPONENT_RISKS[index]="$message" ;; *) die "Invalid dynamic risk from handler $handler: $message" ;; esac
+          case "$message" in safe|privileged|destructive|manual) COMPONENT_RISKS[index]="$message" ;; *) die "Invalid dynamic risk from collector $collector: $message" ;; esac
           ;;
-        *) die "Invalid preflight record from handler $handler: $level" ;;
+        *) die "Invalid preflight record from collector $collector: $level" ;;
       esac
-      [[ -z "${extra:-}" ]] || die "Invalid preflight record from handler $handler"
+      [[ -z "${extra:-}" ]] || die "Invalid preflight record from collector $collector"
     done <<<"$output"
   done
 }
@@ -2489,7 +2535,7 @@ print_recovery_plan() {
 
   printf '\nPreflight:\n'
   if [[ "${#RECOVERY_PREFLIGHT_LINES[@]}" -eq 0 ]]; then
-    printf '  - no handler-specific checks\n'
+    printf '  - no collector-specific checks\n'
   else
     for entry in "${RECOVERY_PREFLIGHT_LINES[@]}"; do
       IFS='|' read -r id level message <<<"$entry"
@@ -2516,7 +2562,9 @@ prepare_recovery_plan() {
     sha256sum flock hostname id getent stat grep
   ensure_dest_access "check"
   acquire_lock "shared"
-  parse_restore_handlers
+  RUN_STARTED_AT="$(iso_now)"
+  RUN_ID="recovery-$(sanitize_name "${SNAPSHOT_NAME:-latest}")-$(timestamp_now)-$$"
+  parse_recovery_collectors
   load_recovery_snapshot_context
   validate_recovery_snapshot
   discover_recovery_components
@@ -2586,6 +2634,8 @@ load_recovery_session() {
     DEST_ROOT="$recorded_dest"
   fi
   SNAPSHOT_NAME="$(recovery_state_value snapshot)"
+  COLLECTORS_FILE="$(recovery_state_value collectors_file)"
+  [[ -n "$COLLECTORS_FILE" ]] || COLLECTORS_FILE="$DEFAULT_COLLECTORS_FILE"
   TARGET_USER="$(recovery_state_value target_user)"
   TARGET_HOME="$(recovery_state_value target_home)"
   STAGING_DIR="$(recovery_state_value staging_dir)"
@@ -2613,6 +2663,7 @@ create_recovery_session() {
     printf 'created_at\t%s\n' "$(iso_now)"
     printf 'destination\t%s\n' "$DEST_ROOT_REAL"
     printf 'snapshot\t%s\n' "$SNAPSHOT_NAME"
+    printf 'collectors_file\t%s\n' "$COLLECTORS_FILE"
     printf 'target_user\t%s\n' "$TARGET_USER"
     printf 'target_home\t%s\n' "$TARGET_HOME"
     printf 'staging_dir\t%s\n' "$STAGING_DIR"
@@ -2851,12 +2902,12 @@ recover_filesystem_component() {
   esac
 }
 
-append_handler_guide() {
+append_collector_guide() {
   local index="$1"
   local id="${COMPONENT_IDS[$index]}"
-  local handler="${COMPONENT_HANDLERS[$index]}"
+  local collector="${COMPONENT_COLLECTORS[$index]}"
   local guide
-  guide="$(invoke_restore_handler "$handler" guide "$id" || true)"
+  guide="$(invoke_collector_restore "$collector" guide "$id" || true)"
   [[ -n "$guide" ]] || return 0
   {
     printf '\n## %s\n\n' "${COMPONENT_LABELS[$index]}"
@@ -2865,65 +2916,65 @@ append_handler_guide() {
   printf '%s\n' "$guide"
 }
 
-recover_handler_component() {
+recover_collector_component() {
   local index="$1"
   local id="${COMPONENT_IDS[$index]}"
-  local handler="${COMPONENT_HANDLERS[$index]}"
+  local collector="${COMPONENT_COLLECTORS[$index]}"
   local source_path="${COMPONENT_SOURCE_PATHS[$index]}"
   local log_file="$RECOVERY_SESSION_DIR/logs/$id.log"
   local rc
 
   if ! approve_recovery_component "$index"; then
-    append_handler_guide "$index"
-    record_recovery_status "$id" manual-pending "Handler execution was not approved"
+    append_collector_guide "$index"
+    record_recovery_status "$id" manual-pending "Collector execution was not approved"
     return 0
   fi
   if [[ -n "$source_path" ]]; then
     if ! stage_recovery_component "$index"; then
-      record_recovery_status "$id" failed "Handler source staging failed"
+      record_recovery_status "$id" failed "Collector source staging failed"
       return 1
     fi
     if merge_staged_component "$index"; then rc=0; else rc=$?; fi
     if [[ "$rc" -ne 0 ]]; then
-      append_handler_guide "$index"
+      append_collector_guide "$index"
       if [[ "$rc" -eq 20 ]]; then
-        record_recovery_status "$id" manual-pending "Handler source needs manual merge"
+        record_recovery_status "$id" manual-pending "Collector source needs manual merge"
         return 0
       fi
-      record_recovery_status "$id" failed "Handler source merge failed"
+      record_recovery_status "$id" failed "Collector source merge failed"
       return "$rc"
     fi
   fi
 
-  if invoke_restore_handler "$handler" apply "$id" 2>&1 | tee -a "$log_file"; then
+  if invoke_collector_restore "$collector" apply "$id" 2>&1 | tee -a "$log_file"; then
     rc=0
   else
     rc="${PIPESTATUS[0]}"
   fi
   if [[ "$rc" -eq 20 ]]; then
-    append_handler_guide "$index"
-    record_recovery_status "$id" manual-pending "Handler prepared guided manual steps"
+    append_collector_guide "$index"
+    record_recovery_status "$id" manual-pending "Collector prepared guided manual steps"
     return 0
   fi
   if [[ "$rc" -ne 0 ]]; then
-    append_handler_guide "$index"
-    record_recovery_status "$id" failed "Handler apply failed with rc=$rc"
+    append_collector_guide "$index"
+    record_recovery_status "$id" failed "Collector apply failed with rc=$rc"
     return "$rc"
   fi
 
-  if invoke_restore_handler "$handler" verify "$id" 2>&1 | tee -a "$log_file"; then
+  if invoke_collector_restore "$collector" verify "$id" 2>&1 | tee -a "$log_file"; then
     rc=0
   else
     rc="${PIPESTATUS[0]}"
   fi
   if [[ "$rc" -eq 0 ]]; then
-    record_recovery_status "$id" verified "Handler verification succeeded"
+    record_recovery_status "$id" verified "Collector verification succeeded"
   elif [[ "$rc" -eq 20 ]]; then
-    append_handler_guide "$index"
-    record_recovery_status "$id" manual-pending "Handler verification requires manual work"
+    append_collector_guide "$index"
+    record_recovery_status "$id" manual-pending "Collector verification requires manual work"
   else
-    append_handler_guide "$index"
-    record_recovery_status "$id" failed "Handler verification failed with rc=$rc"
+    append_collector_guide "$index"
+    record_recovery_status "$id" failed "Collector verification failed with rc=$rc"
     return "$rc"
   fi
 }
@@ -2931,7 +2982,7 @@ recover_handler_component() {
 stage_collector_artifacts() {
   local index="$1"
   local id="${COMPONENT_IDS[$index]}"
-  local collector="${COMPONENT_HANDLERS[$index]}"
+  local collector="${COMPONENT_COLLECTORS[$index]}"
   local artifact_dir="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/$collector"
   local target="$STAGING_DIR/artifacts/$collector"
   [[ -d "$artifact_dir" ]] || return 1
@@ -2950,39 +3001,6 @@ stage_collector_artifacts() {
     sed -n '1,240p' "$target/RESTORE.md"
   fi
   record_recovery_status "$id" manual-pending "Collector artifacts staged for manual recovery"
-}
-
-recover_system_inventory() {
-  local index="$1"
-  local id="${COMPONENT_IDS[$index]}"
-  local artifact_dir="$RECOVERY_SNAPSHOT_DIR/.backup-home/artifacts/collectors/system-inventory"
-  local target="$STAGING_DIR/artifacts/system-inventory"
-  local missing_apt="$RECOVERY_SESSION_DIR/commands/apt-missing.txt"
-
-  if ! approve_recovery_component "$index"; then
-    record_recovery_status "$id" skipped "System inventory guidance was not selected"
-    return 0
-  fi
-  [[ -d "$artifact_dir" ]] || { record_recovery_status "$id" failed "System inventory artifacts are missing"; return 1; }
-  mkdir -p -- "$target"
-  rsync --archive "$artifact_dir/" "$target/"
-  if [[ -s "$target/apt-manual.txt" ]] && command -v apt-mark >/dev/null 2>&1; then
-    comm -23 <(sort -u "$target/apt-manual.txt") <(apt-mark showmanual 2>/dev/null | sort -u) >"$missing_apt"
-  else
-    : >"$missing_apt"
-  fi
-  chmod 600 -- "$missing_apt"
-  {
-    printf '\n## System inventory\n\n'
-    printf 'Inventory artifacts were staged at %s.\n\n' "\`$target\`"
-    printf 'Review %s before installing packages. Package installation, dconf import, and crontab import are intentionally not automatic.\n\n' "\`$missing_apt\`"
-    printf 'Suggested commands after review:\n\n```bash\n'
-    printf 'xargs -r sudo apt install -- < %q\n' "$missing_apt"
-    [[ -s "$target/dconf.ini" ]] && printf 'dconf dump / > current-dconf.ini\ndconf load / < %q\n' "$target/dconf.ini"
-    [[ -s "$target/crontab.txt" ]] && printf 'crontab -l > current-crontab.txt\ncrontab %q\n' "$target/crontab.txt"
-    printf '```\n'
-  } >>"$RECOVERY_SESSION_DIR/manual-steps.md"
-  record_recovery_status "$id" manual-pending "System rebuild commands require review"
 }
 
 component_dependencies_ready() {
@@ -3017,8 +3035,7 @@ execute_recovery_component() {
   local index="$2"
   case "$kind" in
     filesystem) recover_filesystem_component "$index" ;;
-    handler) recover_handler_component "$index" ;;
-    system-inventory) recover_system_inventory "$index" ;;
+    collector) recover_collector_component "$index" ;;
     fallback) stage_collector_artifacts "$index" ;;
     *) printf 'Unknown component kind: %s\n' "$kind" >&2; return 1 ;;
   esac
@@ -3184,7 +3201,6 @@ parse_args() {
       --manual-file) [[ $# -ge 2 ]] || die "--manual-file requires a value"; MANUAL_FILE="$2"; shift 2 ;;
       --collectors-file) [[ $# -ge 2 ]] || die "--collectors-file requires a value"; COLLECTORS_FILE="$2"; shift 2 ;;
       --retention-file) [[ $# -ge 2 ]] || die "--retention-file requires a value"; RETENTION_FILE="$2"; shift 2 ;;
-      --handlers-file) [[ $# -ge 2 ]] || die "--handlers-file requires a value"; HANDLERS_FILE="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       --verbose) VERBOSE=1; shift ;;
       --yes) ASSUME_YES=1; shift ;;

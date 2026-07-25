@@ -6,6 +6,8 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/collector-common
 source "$PROJECT_DIR/lib/collector-common"
 
+collector_dispatch "${1:-backup}" supported "$PROJECT_DIR/lib/collector-restore/codex-mcp-recovery" "${@:2}"
+
 CONFIG_FILE="${BACKUP_HOME_CODEX_MCP_CONFIG:-$PROJECT_DIR/config/codex-mcp-recovery/local.conf}"
 SQLITE_HELPER="$PROJECT_DIR/lib/sqlite-backup.py"
 declare -a ENTRY_KINDS=()
@@ -14,6 +16,7 @@ declare -a ENTRY_PATHS=()
 declare -a CANDIDATE_ROOTS=()
 declare -a IGNORE_ROOTS=()
 declare -A CONFIGURED_DATABASES=()
+declare -A AUTO_DISCOVERED_DATABASES=()
 
 load_config() {
   local line
@@ -52,6 +55,24 @@ load_config() {
   [[ "${#ENTRY_PATHS[@]}" -gt 0 ]] || collector_fail "No Codex/MCP databases are configured"
 }
 
+infer_candidate_category() {
+  local root="$1"
+  local category=""
+  local index
+  local relative
+  for index in "${!ENTRY_PATHS[@]}"; do
+    relative="${ENTRY_PATHS[$index]}"
+    [[ "$relative" == "$root" || "$relative" == "$root"/* ]] || continue
+    if [[ -z "$category" ]]; then
+      category="${ENTRY_CATEGORIES[$index]}"
+    elif [[ "$category" != "${ENTRY_CATEGORIES[$index]}" ]]; then
+      return 1
+    fi
+  done
+  [[ -n "$category" ]] || return 1
+  printf '%s\n' "$category"
+}
+
 is_ignored_candidate() {
   local relative="$1"
   local ignored
@@ -61,13 +82,16 @@ is_ignored_candidate() {
   return 1
 }
 
-validate_candidate_coverage() {
+discover_candidate_databases() {
   local root
+  local category
   local source
   local relative
-  local uncovered=0
+  local index
 
-  for root in "${CANDIDATE_ROOTS[@]}"; do
+  for index in "${!CANDIDATE_ROOTS[@]}"; do
+    root="${CANDIDATE_ROOTS[$index]}"
+    category="$(infer_candidate_category "$root" 2>/dev/null || true)"
     if [[ ! -d "$COLLECTOR_SOURCE_HOME/$root" ]]; then
       collector_warn "SQLite candidate root does not exist: $root"
       continue
@@ -76,14 +100,20 @@ validate_candidate_coverage() {
       relative="${source#"$COLLECTOR_SOURCE_HOME"/}"
       is_ignored_candidate "$relative" && continue
       if [[ -z "${CONFIGURED_DATABASES[$relative]+x}" ]]; then
-        printf 'Unconfigured SQLite-like file: %s\n' "$relative" >&2
-        uncovered=1
+        if [[ -z "$category" ]]; then
+          collector_warn "Unconfigured SQLite-like file was skipped because its candidate-root category is ambiguous: $relative"
+          continue
+        fi
+        CONFIGURED_DATABASES["$relative"]="sqlite"
+        AUTO_DISCOVERED_DATABASES["$relative"]=1
+        ENTRY_KINDS+=("sqlite")
+        ENTRY_CATEGORIES+=("$category")
+        ENTRY_PATHS+=("$relative")
+        collector_warn "Automatically included unconfigured SQLite file: $relative"
       fi
     done < <(find "$COLLECTOR_SOURCE_HOME/$root" -type f \
       \( -iname '*.db' -o -iname '*.sqlite' -o -iname '*.sqlite3' \) -print0)
   done
-  [[ "$uncovered" -eq 0 ]] \
-    || collector_fail "Unconfigured SQLite-like files were found; classify them before backup"
 }
 
 backup_entry() {
@@ -95,29 +125,47 @@ backup_entry() {
   local artifact="databases/$category/$relative"
   local target="$COLLECTOR_STAGE_DIR/$artifact"
   local metadata
+  local discovery="configured"
 
-  [[ -f "$source" ]] || collector_fail "Required Codex/MCP database file is missing: $relative"
+  if [[ -n "${AUTO_DISCOVERED_DATABASES[$relative]+x}" ]]; then
+    discovery="automatic"
+  fi
+  if [[ ! -f "$source" ]]; then
+    if [[ "$discovery" == "automatic" ]]; then
+      collector_warn "Automatically discovered SQLite file disappeared before backup: $relative"
+      collector_index "$kind" "$relative" "$artifact" warning "$category;discovery=$discovery;reason=missing"
+      return 0
+    fi
+    collector_fail "Required Codex/MCP database file is missing: $relative"
+  fi
   mkdir -p -- "$(dirname -- "$target")"
   if [[ "$kind" == sqlite ]]; then
-    python3 "$SQLITE_HELPER" backup "$source" "$target" \
-      || collector_fail "Could not create consistent SQLite backup: $relative"
+    if ! python3 "$SQLITE_HELPER" backup "$source" "$target"; then
+      rm -f -- "$target"
+      if [[ "$discovery" == "automatic" ]]; then
+        collector_warn "Automatically discovered SQLite file could not be backed up and was skipped: $relative"
+        collector_index "$kind" "$relative" "$artifact" warning "$category;discovery=$discovery;reason=backup-failed"
+        return 0
+      fi
+      collector_fail "Could not create consistent SQLite backup: $relative"
+    fi
   else
     collector_copy_stable_file "$source" "$target" \
       || collector_fail "Could not copy stable database-like file: $relative"
     chmod 600 -- "$target"
   fi
   metadata="mode=$(stat -c '%a' -- "$source");uid=$(stat -c '%u' -- "$source");gid=$(stat -c '%g' -- "$source")"
-  collector_index "$kind" "$relative" "$artifact" success "$category;$metadata"
+  collector_index "$kind" "$relative" "$artifact" success "$category;$metadata;discovery=$discovery"
 }
 
 main() {
   local command
   local index
-  for command in cp find mkdir python3 sha256sum sort stat xargs; do collector_require_command "$command"; done
+  for command in cp find mkdir python3 rm sha256sum sort stat xargs; do collector_require_command "$command"; done
   [[ -f "$SQLITE_HELPER" ]] || collector_fail "SQLite helper is missing: $SQLITE_HELPER"
   collector_init
   load_config
-  validate_candidate_coverage
+  discover_candidate_databases
   for index in "${!ENTRY_PATHS[@]}"; do backup_entry "$index"; done
   cat >"$COLLECTOR_STAGE_DIR/RESTORE.md" <<'EOF'
 # Codex and MCP database recovery

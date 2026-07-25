@@ -25,7 +25,40 @@ collector_validate_name() {
     || collector_fail "Unsafe collector name: $1"
 }
 
+collector_metadata() {
+  local restore_capability="$1"
+  printf 'protocol\t1\n'
+  printf 'backup\trequired\n'
+  printf 'restore\t%s\n' "$restore_capability"
+}
+
+collector_dispatch() {
+  local action="$1"
+  local restore_capability="$2"
+  local restore_command="$3"
+  shift 3
+  case "$action" in
+    metadata)
+      collector_metadata "$restore_capability"
+      exit 0
+      ;;
+    backup)
+      return 0
+      ;;
+    restore)
+      [[ "$restore_capability" == "supported" ]] || exit 64
+      [[ -f "$restore_command" ]] || collector_fail "Collector restore implementation is unavailable"
+      exec bash "$restore_command" "$@"
+      ;;
+    *)
+      collector_fail "Unsupported collector action: $action"
+      ;;
+  esac
+}
+
 collector_init() {
+  [[ "${BACKUP_HOME_PROTOCOL_VERSION:-1}" == "1" ]] \
+    || collector_fail "Unsupported BACKUP_HOME_PROTOCOL_VERSION"
   COLLECTOR_STAGE_DIR="${BACKUP_HOME_STAGE_DIR:-}"
   COLLECTOR_SOURCE_HOME="${BACKUP_HOME_SOURCE_HOME:-${HOME:-}}"
   [[ -n "$COLLECTOR_STAGE_DIR" && "$COLLECTOR_STAGE_DIR" == /* ]] \
