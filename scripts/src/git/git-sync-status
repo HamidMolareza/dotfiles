@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize local Git repositories that need commit, push, or pull work."""
+"""Summarize and safely update local Git repositories."""
 
 from __future__ import annotations
 
@@ -85,6 +85,10 @@ class RepoSummary:
     latest_commit_sha: str | None
     latest_commit_subject: str | None
     fetch_error: str | None
+    pull_status: str
+    pull_reason: str | None
+    pulled_commits: int
+    pull_error: str | None
     error: str | None
 
     @property
@@ -93,6 +97,7 @@ class RepoSummary:
             [
                 self.error,
                 self.fetch_error,
+                self.pull_status in {"skipped", "failed"},
                 self.commit_files > 0,
                 self.conflict_files > 0,
                 self.remote_state in {"no_remote", "no_upstream"},
@@ -106,13 +111,14 @@ class RepoSummary:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Scan a path for Git repositories and summarize local work that "
-            "still needs commit, push, pull, or remote setup."
+            "Scan a path for Git repositories, optionally fast-forward safe branches, "
+            "and summarize local work that still needs commit, push, pull, or remote setup."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=f"""Examples:
   {Path(sys.argv[0]).name} ~/my-files/projects
   {Path(sys.argv[0]).name} . --fetch
+  {Path(sys.argv[0]).name} ~/my-files/projects --max-depth -1 --pull
   {Path(sys.argv[0]).name} ~/my-files --only-needs-action --max-depth 3
   {Path(sys.argv[0]).name} ~/my-files/projects --json
   {Path(sys.argv[0]).name} ~/my-files/projects --view full
@@ -121,6 +127,7 @@ def parse_args() -> argparse.Namespace:
 Notes:
   Remote ahead/behind counts use local remote-tracking refs.
   Add --fetch to refresh remotes before summarizing.
+  Add --pull to fetch and fast-forward eligible clean tracking branches.
   Symlinked project directories are scanned with loop protection.
 """,
     )
@@ -143,6 +150,14 @@ Notes:
         "--fetch",
         action="store_true",
         help="Run 'git fetch --all --prune --quiet' in each repo before summarizing.",
+    )
+    parser.add_argument(
+        "--pull",
+        action="store_true",
+        help=(
+            "Fetch every repo, then fast-forward clean behind-only tracking branches. "
+            "Dirty, detached, ahead, diverged, and in-progress repos are skipped."
+        ),
     )
     parser.add_argument(
         "--include-hidden",
@@ -500,9 +515,7 @@ def fetch_repo(repo: Path) -> str | None:
     return clean_error(result.stderr)
 
 
-def summarize_repo(repo: Path, *, fetch: bool) -> RepoSummary:
-    fetch_error = fetch_repo(repo) if fetch else None
-
+def inspect_repo(repo: Path, *, fetch_error: str | None) -> RepoSummary:
     try:
         counts = get_status_counts(repo)
         branch = get_branch(repo)
@@ -541,6 +554,10 @@ def summarize_repo(repo: Path, *, fetch: bool) -> RepoSummary:
             latest_commit_sha=latest_sha,
             latest_commit_subject=latest_subject,
             fetch_error=fetch_error,
+            pull_status="not_requested",
+            pull_reason=None,
+            pulled_commits=0,
+            pull_error=None,
             error=None,
         )
     except Exception as exc:  # noqa: BLE001 - keep one bad repo from hiding the rest.
@@ -563,8 +580,127 @@ def summarize_repo(repo: Path, *, fetch: bool) -> RepoSummary:
             latest_commit_sha=None,
             latest_commit_subject=None,
             fetch_error=fetch_error,
+            pull_status="not_requested",
+            pull_reason=None,
+            pulled_commits=0,
+            pull_error=None,
             error=str(exc),
         )
+
+
+def git_operation_in_progress(repo: Path) -> str | None:
+    markers = [
+        ("merge_in_progress", "MERGE_HEAD"),
+        ("rebase_in_progress", "rebase-merge"),
+        ("rebase_in_progress", "rebase-apply"),
+        ("cherry_pick_in_progress", "CHERRY_PICK_HEAD"),
+        ("revert_in_progress", "REVERT_HEAD"),
+        ("bisect_in_progress", "BISECT_LOG"),
+        ("sequencer_in_progress", "sequencer"),
+    ]
+
+    for reason, marker in markers:
+        result = run_git(repo, ["rev-parse", "--git-path", marker])
+        if result.returncode != 0 or not result.stdout.strip():
+            continue
+
+        marker_path = Path(result.stdout.strip())
+        if not marker_path.is_absolute():
+            marker_path = repo / marker_path
+        if marker_path.exists():
+            return reason
+
+    return None
+
+
+def mark_pull_outcome(
+    summary: RepoSummary,
+    *,
+    status: str,
+    reason: str | None = None,
+    pulled_commits: int = 0,
+    error: str | None = None,
+) -> RepoSummary:
+    summary.pull_status = status
+    summary.pull_reason = reason
+    summary.pulled_commits = pulled_commits
+    summary.pull_error = error
+    return summary
+
+
+def apply_safe_pull(repo: Path, summary: RepoSummary) -> RepoSummary:
+    if summary.error:
+        return mark_pull_outcome(
+            summary,
+            status="failed",
+            reason="inspect_failed",
+            error=summary.error,
+        )
+    if summary.conflict_files:
+        return mark_pull_outcome(summary, status="skipped", reason="conflicts")
+
+    operation = git_operation_in_progress(repo)
+    if operation:
+        return mark_pull_outcome(summary, status="skipped", reason=operation)
+    if summary.branch.startswith("DETACHED@"):
+        return mark_pull_outcome(summary, status="skipped", reason="detached_head")
+    if summary.branch == "unknown":
+        return mark_pull_outcome(summary, status="failed", reason="state_unknown")
+    if summary.remote_state == "no_remote":
+        return mark_pull_outcome(summary, status="skipped", reason="no_remote")
+    if summary.remote_state == "no_upstream":
+        return mark_pull_outcome(summary, status="skipped", reason="no_upstream")
+    if summary.ahead_commits is None or summary.behind_commits is None:
+        return mark_pull_outcome(summary, status="failed", reason="state_unknown")
+    if summary.ahead_commits > 0 and summary.behind_commits > 0:
+        return mark_pull_outcome(summary, status="skipped", reason="diverged")
+    if summary.ahead_commits > 0:
+        return mark_pull_outcome(summary, status="skipped", reason="local_ahead")
+    if summary.behind_commits == 0:
+        return mark_pull_outcome(summary, status="unchanged", reason="already_current")
+    if summary.commit_files > 0:
+        return mark_pull_outcome(summary, status="skipped", reason="dirty_worktree")
+
+    pulled_commits = summary.behind_commits
+    result = run_git(repo, ["merge", "--ff-only", "--quiet", "@{u}"])
+    updated_summary = inspect_repo(repo, fetch_error=None)
+    if result.returncode != 0:
+        return mark_pull_outcome(
+            updated_summary,
+            status="failed",
+            reason="ff_only_failed",
+            error=clean_error(result.stderr),
+        )
+    if updated_summary.error:
+        return mark_pull_outcome(
+            updated_summary,
+            status="failed",
+            reason="post_update_inspect_failed",
+            pulled_commits=pulled_commits,
+            error=updated_summary.error,
+        )
+    return mark_pull_outcome(
+        updated_summary,
+        status="updated",
+        pulled_commits=pulled_commits,
+    )
+
+
+def summarize_repo(repo: Path, *, fetch: bool, pull: bool) -> RepoSummary:
+    fetch_requested = fetch or pull
+    fetch_error = fetch_repo(repo) if fetch_requested else None
+    summary = inspect_repo(repo, fetch_error=fetch_error)
+
+    if not pull:
+        return summary
+    if fetch_error:
+        return mark_pull_outcome(
+            summary,
+            status="failed",
+            reason="fetch_failed",
+            error=fetch_error,
+        )
+    return apply_safe_pull(repo, summary)
 
 
 def clean_error(value: str | bytes) -> str:
@@ -617,6 +753,8 @@ def importance_score(summary: RepoSummary) -> int:
 
     if summary.error:
         score += 1_000_000
+    if summary.pull_status == "failed":
+        score += 950_000
     if summary.conflict_files:
         score += 900_000 + summary.conflict_files * 1_000
     if summary.commit_files:
@@ -638,6 +776,8 @@ def importance_score(summary: RepoSummary) -> int:
         score += 400_000 + summary.stash_count * 1_000
     if summary.fetch_error:
         score += 300_000
+    if summary.pull_status == "skipped":
+        score += 250_000
 
     return score
 
@@ -710,6 +850,28 @@ def sync_value(summary: RepoSummary) -> str:
     return ", ".join(actions) if actions else "synced"
 
 
+def pull_reason_value(reason: str | None) -> str:
+    if not reason:
+        return ""
+    return reason.replace("_", " ")
+
+
+def pull_result_value(summary: RepoSummary) -> str:
+    if summary.pull_status == "not_requested":
+        return "-"
+    if summary.pull_status == "updated":
+        return f"updated {summary.pulled_commits}"
+    if summary.pull_status == "unchanged":
+        return "up to date"
+
+    reason = pull_reason_value(summary.pull_reason)
+    if summary.pull_status == "skipped":
+        return f"skipped: {reason}"
+    if summary.pull_status == "failed":
+        return f"failed: {reason}"
+    return summary.pull_status
+
+
 def action_text(summary: RepoSummary) -> str:
     actions: list[str] = []
 
@@ -733,12 +895,18 @@ def action_text(summary: RepoSummary) -> str:
         actions.append(f"review stash {summary.stash_count}")
     if summary.fetch_error:
         actions.append("fetch failed")
+    if summary.pull_status == "updated":
+        actions.append(f"updated {summary.pulled_commits}")
+    elif summary.pull_status == "skipped":
+        actions.append(f"pull skipped: {pull_reason_value(summary.pull_reason)}")
+    elif summary.pull_status == "failed" and summary.pull_reason != "fetch_failed":
+        actions.append(f"pull failed: {pull_reason_value(summary.pull_reason)}")
 
     return ", ".join(actions) if actions else "ok"
 
 
 def action_style(summary: RepoSummary) -> str:
-    if summary.error or summary.fetch_error:
+    if summary.error or summary.fetch_error or summary.pull_status == "failed":
         return "red_bold"
     if summary.conflict_files:
         return "red_bold"
@@ -753,6 +921,8 @@ def action_style(summary: RepoSummary) -> str:
     if (summary.behind_commits or 0) > 0:
         return "blue_bold"
     if summary.stash_count:
+        return "yellow"
+    if summary.pull_status == "skipped":
         return "yellow"
     return "green"
 
@@ -813,6 +983,16 @@ def sync_style(summary: RepoSummary) -> str:
     return "green"
 
 
+def pull_result_style(summary: RepoSummary) -> str:
+    if summary.pull_status == "failed":
+        return "red_bold"
+    if summary.pull_status == "skipped":
+        return "yellow"
+    if summary.pull_status in {"updated", "unchanged"}:
+        return "green"
+    return "dim"
+
+
 def truncate_plain(value: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -852,6 +1032,7 @@ def table_rows(
                 colorize(str(summary.commit_files), commit_files_style(summary), color_enabled),
                 colorize(push_value(summary), push_style(summary), color_enabled),
                 colorize(pull_value(summary), pull_style(summary), color_enabled),
+                colorize(pull_result_value(summary), pull_result_style(summary), color_enabled),
                 colorize(str(summary.stash_count), stash_style(summary), color_enabled),
                 colorize(
                     summary.upstream or ("none" if summary.remote_state == "no_remote" else "-"),
@@ -900,6 +1081,7 @@ def print_full_table(
         "Commit files",
         "Push",
         "Pull",
+        "Pull result",
         "Stash",
         "Upstream",
         "Latest commit",
@@ -1037,6 +1219,7 @@ def print_run_summary(
     listed_count: int,
     input_path: Path,
     fetched: bool,
+    pull_requested: bool,
     color_enabled: bool,
 ) -> None:
     needs_action_count = sum(1 for summary in summaries if summary.needs_action)
@@ -1049,7 +1232,16 @@ def print_run_summary(
     no_remote_count = sum(1 for summary in summaries if summary.remote_state == "no_remote")
     no_upstream_count = sum(1 for summary in summaries if summary.remote_state == "no_upstream")
     stash_count = sum(summary.stash_count for summary in summaries)
-    error_count = sum(1 for summary in summaries if summary.error or summary.fetch_error)
+    error_count = sum(
+        1
+        for summary in summaries
+        if summary.error or summary.fetch_error or summary.pull_status == "failed"
+    )
+    updated_repo_count = sum(1 for summary in summaries if summary.pull_status == "updated")
+    updated_commit_count = sum(summary.pulled_commits for summary in summaries)
+    unchanged_repo_count = sum(1 for summary in summaries if summary.pull_status == "unchanged")
+    skipped_repo_count = sum(1 for summary in summaries if summary.pull_status == "skipped")
+    failed_pull_count = sum(1 for summary in summaries if summary.pull_status == "failed")
 
     refresh_note = "after fetch" if fetched else "use --fetch to refresh"
     print(
@@ -1108,6 +1300,33 @@ def print_run_summary(
         + " | "
         + colorize(f"errors {error_count}", count_style(error_count), color_enabled)
     )
+    if pull_requested:
+        print(
+            colorize("Pull: ", "bold", color_enabled)
+            + colorize(
+                f"updated {updated_commit_count} {noun(updated_commit_count, 'commit')}/{updated_repo_count} {noun(updated_repo_count, 'repo')}",
+                "green" if updated_repo_count else "dim",
+                color_enabled,
+            )
+            + " | "
+            + colorize(
+                f"up to date {unchanged_repo_count}",
+                "green" if unchanged_repo_count else "dim",
+                color_enabled,
+            )
+            + " | "
+            + colorize(
+                f"skipped {skipped_repo_count}",
+                count_style(skipped_repo_count),
+                color_enabled,
+            )
+            + " | "
+            + colorize(
+                f"failed {failed_pull_count}",
+                "red_bold" if failed_pull_count else "green",
+                color_enabled,
+            )
+        )
     if listed_count != len(summaries):
         print(colorize(f"Showing {listed_count} repositories after filters.", "dim", color_enabled))
 
@@ -1213,6 +1432,9 @@ def print_verbose(summaries: list[RepoSummary], *, base: Path, absolute: bool) -
             print("  latest commit: no commits")
         if summary.fetch_error:
             print(f"  fetch error: {summary.fetch_error}")
+        print(f"  pull result: {pull_result_value(summary)}")
+        if summary.pull_error:
+            print(f"  pull error: {summary.pull_error}")
         if summary.error:
             print(f"  error: {summary.error}")
 
@@ -1243,7 +1465,9 @@ def main() -> int:
         print(f"No Git repositories found under: {input_path}", file=sys.stderr)
         return 1
 
-    all_summaries = [summarize_repo(repo, fetch=args.fetch) for repo in repositories]
+    all_summaries = [
+        summarize_repo(repo, fetch=args.fetch, pull=args.pull) for repo in repositories
+    ]
     summaries = all_summaries
     if args.only_needs_action:
         summaries = [summary for summary in summaries if summary.needs_action]
@@ -1259,7 +1483,8 @@ def main() -> int:
             repo_count=len(repositories),
             listed_count=len(summaries),
             input_path=input_path,
-            fetched=args.fetch,
+            fetched=args.fetch or args.pull,
+            pull_requested=args.pull,
             color_enabled=color_enabled,
         )
         print_next_actions(
