@@ -1,0 +1,1820 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+from pathlib import Path
+from typing import Any
+from typing import Iterable
+from typing import Sequence
+
+
+DEFAULT_DAYS = 7
+DEFAULT_SORT = "tokens"
+DEFAULT_TITLE_WIDTH = 72
+INTERACTIVE_SOURCES = (
+    "cli",
+    "vscode",
+    '{"custom":"atlas"}',
+    '{"custom":"chatgpt"}',
+)
+STATE_DB_RE = re.compile(r"state_(\d+)\.sqlite")
+SESSION_ID_RE = re.compile(r"[0-9a-f-]+", re.IGNORECASE)
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization)"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
+UNATTRIBUTED_TASK_KEY = "__unattributed__"
+UNATTRIBUTED_TASK_TITLE = "Session setup / unattributed"
+CONTINUE_MESSAGES = {"continue", "ادامه", "ادامه بده"}
+IMPLEMENT_MESSAGES = {
+    "implement the plan",
+    "پیاده سازی کن",
+    "پیاده‌سازی کن",
+    "پلن را پیاده سازی کن",
+    "پلن را پیاده‌سازی کن",
+}
+REQUIRED_THREAD_COLUMNS = {
+    "id",
+    "rollout_path",
+    "source",
+    "cwd",
+    "title",
+    "tokens_used",
+    "archived",
+    "first_user_message",
+    "updated_at_ms",
+    "preview",
+    "recency_at_ms",
+}
+REQUIRED_EDGE_COLUMNS = {"parent_thread_id", "child_thread_id"}
+
+
+class UsageReportError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class StateDatabase:
+    path: Path
+    has_name_column: bool
+    thread_columns: frozenset[str]
+
+
+@dataclass(frozen=True)
+class CandidateRollout:
+    thread_id: str
+    path: Path
+
+
+@dataclass
+class SessionReport:
+    thread_id: str
+    title: str
+    display_title: str
+    cwd: str
+    created_at_ms: int | None
+    updated_at_ms: int
+    recency_at_ms: int
+    main_tokens: int
+    subagent_tokens: int
+    total_tokens: int
+    subagent_count: int
+    window_tokens: int = 0
+    window_share_percent: float = 0.0
+    rank: int = 0
+
+    @property
+    def duration_seconds(self) -> int | None:
+        if self.created_at_ms is None or self.created_at_ms <= 0 or self.updated_at_ms <= 0:
+            return None
+        return max((self.updated_at_ms - self.created_at_ms) // 1000, 0)
+
+
+@dataclass
+class TokenBreakdown:
+    total_tokens: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+
+    def add(self, other: TokenBreakdown) -> None:
+        self.total_tokens += other.total_tokens
+        self.input_tokens += other.input_tokens
+        self.cached_input_tokens += other.cached_input_tokens
+        self.output_tokens += other.output_tokens
+        self.reasoning_output_tokens += other.reasoning_output_tokens
+
+    def copy(self) -> TokenBreakdown:
+        return TokenBreakdown(**self.to_dict())
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "total_tokens": self.total_tokens,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_output_tokens": self.reasoning_output_tokens,
+        }
+
+
+@dataclass(frozen=True)
+class DetailThread:
+    thread_id: str
+    parent_thread_id: str | None
+    depth: int
+    rollout_path: Path
+    title: str
+    cwd: str
+    database_tokens: int
+    created_at_ms: int
+    updated_at_ms: int
+    model: str
+    reasoning_effort: str
+    agent_path: str
+    agent_nickname: str
+    agent_role: str
+
+
+@dataclass
+class AgentDetail:
+    thread: DetailThread
+    tokens: TokenBreakdown = field(default_factory=TokenBreakdown)
+    task_key: str = UNATTRIBUTED_TASK_KEY
+    tools: Counter[str] = field(default_factory=Counter)
+    result_summary: str = ""
+    used_state_fallback: bool = False
+
+
+@dataclass
+class TaskDetail:
+    key: str
+    title: str
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    phase_count: int = 0
+    main_tokens: TokenBreakdown = field(default_factory=TokenBreakdown)
+    subagent_tokens: TokenBreakdown = field(default_factory=TokenBreakdown)
+    agent_ids: list[str] = field(default_factory=list)
+
+    @property
+    def total_tokens(self) -> TokenBreakdown:
+        combined = self.main_tokens.copy()
+        combined.add(self.subagent_tokens)
+        return combined
+
+
+@dataclass
+class SessionDetail:
+    root: DetailThread
+    tasks: list[TaskDetail]
+    agents: list[AgentDetail]
+    tokens: TokenBreakdown
+    main_tokens: int
+    subagent_tokens: int
+    window_tokens: int
+    window_share_percent: float
+    window_total: int
+    window_start: datetime
+    window_end: datetime
+    detail_stats: ScanStats
+    window_stats: ScanStats
+    warnings: list[str]
+
+
+@dataclass
+class ScanStats:
+    candidate_files: int = 0
+    files_scanned: int = 0
+    missing_files: int = 0
+    malformed_lines: int = 0
+    invalid_timestamps: int = 0
+    last_usage_fallback_events: int = 0
+    cumulative_resets: int = 0
+    read_errors: int = 0
+    elapsed_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, int | float]:
+        return {
+            "candidate_files": self.candidate_files,
+            "files_scanned": self.files_scanned,
+            "missing_files": self.missing_files,
+            "malformed_lines": self.malformed_lines,
+            "invalid_timestamps": self.invalid_timestamps,
+            "last_usage_fallback_events": self.last_usage_fallback_events,
+            "cumulative_resets": self.cumulative_resets,
+            "read_errors": self.read_errors,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+        }
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def title_width(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed < 20:
+        raise argparse.ArgumentTypeError("title width must be at least 20")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Report token usage for the most recent interactive Codex sessions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  codex-session-usage 10
+  codex-session-usage 20 --sort recent
+  codex-session-usage 10 --days 30 --json
+  codex-session-usage 10 --exclude-current
+  codex-session-usage --session 019f83e5
+  codex-session-usage --session 019f83e5 --verbose
+  codex-session-usage --session 019f83e5 --json
+
+Each row includes the root session and all of its descendant subagent sessions.
+The time-window percentage compares tokens produced inside the same rolling window.
+""",
+    )
+    parser.add_argument(
+        "count",
+        nargs="?",
+        type=positive_int,
+        help="Number of recent interactive sessions to select",
+    )
+    parser.add_argument(
+        "--session",
+        metavar="ID",
+        help="Inspect token usage by task for one session ID or ID prefix",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show per-agent token composition and tool counts in session mode",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=("tokens", "recent"),
+        default=DEFAULT_SORT,
+        help=f"Output order, default: {DEFAULT_SORT}",
+    )
+    parser.add_argument(
+        "--days",
+        type=positive_int,
+        default=DEFAULT_DAYS,
+        help=f"Rolling comparison window in days, default: {DEFAULT_DAYS}",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+        help="Codex home directory, default: CODEX_HOME or ~/.codex",
+    )
+    parser.add_argument(
+        "--title-width",
+        type=title_width,
+        default=DEFAULT_TITLE_WIDTH,
+        help=f"Maximum displayed title width, default: {DEFAULT_TITLE_WIDTH}",
+    )
+    parser.add_argument(
+        "--exclude-current",
+        action="store_true",
+        help="Exclude CODEX_THREAD_ID from the recent-session selection",
+    )
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    return parser
+
+
+def state_db_sort_key(path: Path) -> tuple[int, str]:
+    match = STATE_DB_RE.fullmatch(path.name)
+    return (int(match.group(1)) if match else -1, path.name)
+
+
+def readonly_connection(path: Path) -> sqlite3.Connection:
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
+def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def inspect_state_database(path: Path) -> StateDatabase | None:
+    try:
+        with readonly_connection(path) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if not {"threads", "thread_spawn_edges"}.issubset(tables):
+                return None
+            thread_columns = table_columns(connection, "threads")
+            edge_columns = table_columns(connection, "thread_spawn_edges")
+            if not REQUIRED_THREAD_COLUMNS.issubset(thread_columns):
+                return None
+            if not REQUIRED_EDGE_COLUMNS.issubset(edge_columns):
+                return None
+            return StateDatabase(
+                path=path,
+                has_name_column="name" in thread_columns,
+                thread_columns=frozenset(thread_columns),
+            )
+    except sqlite3.Error:
+        return None
+
+
+def discover_state_database(codex_home: Path) -> StateDatabase:
+    home = codex_home.expanduser().resolve()
+    if not home.is_dir():
+        raise UsageReportError(f"Codex home does not exist: {home}")
+
+    candidates = sorted(home.glob("state_*.sqlite"), key=state_db_sort_key, reverse=True)
+    legacy = home / "state.sqlite"
+    if legacy.is_file():
+        candidates.append(legacy)
+
+    if not candidates:
+        raise UsageReportError(f"no Codex state database found under {home}")
+
+    for candidate in candidates:
+        inspected = inspect_state_database(candidate)
+        if inspected is not None:
+            return inspected
+
+    names = ", ".join(path.name for path in candidates)
+    raise UsageReportError(f"no compatible Codex state database found under {home}; checked: {names}")
+
+
+def normalize_title(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+def shorten_title(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    return value[: width - 1].rstrip() + "…"
+
+
+def title_expression(has_name_column: bool, table_alias: str = "") -> str:
+    prefix = f"{table_alias}." if table_alias else ""
+    candidates = []
+    if has_name_column:
+        candidates.append(f"NULLIF(TRIM({prefix}name), '')")
+    candidates.extend(
+        (
+            f"NULLIF(TRIM({prefix}title), '')",
+            f"NULLIF(TRIM({prefix}preview), '')",
+            f"NULLIF(TRIM({prefix}first_user_message), '')",
+            f"{prefix}id",
+        )
+    )
+    return "COALESCE(" + ", ".join(candidates) + ")"
+
+
+def load_report_snapshot(
+    database: StateDatabase,
+    *,
+    count: int,
+    title_width_value: int,
+    cutoff_ms: int,
+    excluded_thread_id: str | None,
+) -> tuple[list[SessionReport], dict[str, str], list[CandidateRollout]]:
+    connection = readonly_connection(database.path)
+    try:
+        connection.execute("BEGIN")
+        source_placeholders = ", ".join("?" for _ in INTERACTIVE_SOURCES)
+        exclude_sql = " AND id <> ?" if excluded_thread_id else ""
+        created_at_column = (
+            "created_at_ms" if "created_at_ms" in database.thread_columns else "NULL AS created_at_ms"
+        )
+        query = f"""
+SELECT
+    id,
+    {title_expression(database.has_name_column, "threads")} AS effective_title,
+    cwd,
+    {created_at_column},
+    updated_at_ms,
+    recency_at_ms,
+    tokens_used
+FROM threads
+WHERE archived = 0
+  AND preview <> ''
+  AND source IN ({source_placeholders})
+  {exclude_sql}
+ORDER BY recency_at_ms DESC, id DESC
+LIMIT ?
+"""
+        parameters: list[Any] = list(INTERACTIVE_SOURCES)
+        if excluded_thread_id:
+            parameters.append(excluded_thread_id)
+        parameters.append(count)
+        root_rows = list(connection.execute(query, parameters))
+
+        reports: list[SessionReport] = []
+        thread_to_root: dict[str, str] = {}
+        for root in root_rows:
+            member_rows = list(
+                connection.execute(
+                    """
+WITH RECURSIVE tree(id) AS (
+    SELECT ?
+    UNION
+    SELECT edge.child_thread_id
+    FROM thread_spawn_edges AS edge
+    JOIN tree ON edge.parent_thread_id = tree.id
+)
+SELECT threads.id, threads.tokens_used
+FROM tree
+JOIN threads ON threads.id = tree.id
+""",
+                    (root["id"],),
+                )
+            )
+            main_tokens = max(int(root["tokens_used"] or 0), 0)
+            subagent_tokens = sum(
+                max(int(member["tokens_used"] or 0), 0)
+                for member in member_rows
+                if member["id"] != root["id"]
+            )
+            for member in member_rows:
+                thread_to_root[str(member["id"])] = str(root["id"])
+
+            full_title = normalize_title(root["effective_title"]) or str(root["id"])
+            reports.append(
+                SessionReport(
+                    thread_id=str(root["id"]),
+                    title=full_title,
+                    display_title=shorten_title(full_title, title_width_value),
+                    cwd=str(root["cwd"] or ""),
+                    created_at_ms=(
+                        max(int(root["created_at_ms"]), 0)
+                        if root["created_at_ms"] is not None
+                        else None
+                    ),
+                    updated_at_ms=max(int(root["updated_at_ms"] or 0), 0),
+                    recency_at_ms=int(root["recency_at_ms"] or 0),
+                    main_tokens=main_tokens,
+                    subagent_tokens=subagent_tokens,
+                    total_tokens=main_tokens + subagent_tokens,
+                    subagent_count=max(len(member_rows) - 1, 0),
+                )
+            )
+
+        rollout_rows = list(
+            connection.execute(
+                """
+SELECT id, rollout_path
+FROM threads
+WHERE updated_at_ms >= ?
+  AND rollout_path <> ''
+ORDER BY id
+""",
+                (cutoff_ms,),
+            )
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+
+    rollouts = [
+        CandidateRollout(thread_id=str(row["id"]), path=Path(str(row["rollout_path"])))
+        for row in rollout_rows
+    ]
+    return reports, thread_to_root, rollouts
+
+
+def optional_thread_column(
+    database: StateDatabase,
+    column: str,
+    fallback_sql: str,
+) -> str:
+    if column in database.thread_columns:
+        return column
+    return f"{fallback_sql} AS {column}"
+
+
+def agent_path_from_source(value: Any) -> str:
+    if not isinstance(value, str) or not value.startswith("{"):
+        return ""
+    try:
+        source = json.loads(value)
+    except json.JSONDecodeError:
+        return ""
+    try:
+        path = source["subagent"]["thread_spawn"]["agent_path"]
+    except (KeyError, TypeError):
+        return ""
+    return str(path) if path else ""
+
+
+def load_detail_snapshot(
+    database: StateDatabase,
+    *,
+    session_prefix: str,
+    cutoff_ms: int,
+) -> tuple[list[DetailThread], list[CandidateRollout]]:
+    normalized_prefix = session_prefix.strip().lower()
+    if len(normalized_prefix) < 8 or SESSION_ID_RE.fullmatch(normalized_prefix) is None:
+        raise UsageReportError("session ID must be at least 8 hexadecimal or hyphen characters")
+
+    connection = readonly_connection(database.path)
+    try:
+        connection.execute("BEGIN")
+        matches = list(
+            connection.execute(
+                f"""
+SELECT id, {title_expression(database.has_name_column)} AS effective_title
+FROM threads
+WHERE lower(id) LIKE ?
+ORDER BY id
+LIMIT 6
+""",
+                (normalized_prefix + "%",),
+            )
+        )
+        if not matches:
+            raise UsageReportError(f"no session found for ID prefix {session_prefix!r}")
+        if len(matches) > 1:
+            identifiers = ", ".join(str(row["id"]) for row in matches[:5])
+            raise UsageReportError(
+                f"session ID prefix {session_prefix!r} is ambiguous; matches: {identifiers}"
+            )
+
+        root_id = str(matches[0]["id"])
+        created_column = optional_thread_column(database, "created_at_ms", "recency_at_ms")
+        model_column = optional_thread_column(database, "model", "''")
+        reasoning_column = optional_thread_column(database, "reasoning_effort", "''")
+        path_column = optional_thread_column(database, "agent_path", "''")
+        nickname_column = optional_thread_column(database, "agent_nickname", "''")
+        role_column = optional_thread_column(database, "agent_role", "''")
+        rows = list(
+            connection.execute(
+                f"""
+WITH RECURSIVE tree(id, parent_id, depth, path) AS (
+    SELECT ?, NULL, 0, ',' || ? || ','
+    UNION ALL
+    SELECT edge.child_thread_id, edge.parent_thread_id, tree.depth + 1,
+           tree.path || edge.child_thread_id || ','
+    FROM thread_spawn_edges AS edge
+    JOIN tree ON edge.parent_thread_id = tree.id
+    WHERE instr(tree.path, ',' || edge.child_thread_id || ',') = 0
+)
+SELECT
+    tree.parent_id,
+    tree.depth,
+    threads.id,
+    threads.rollout_path,
+    {title_expression(database.has_name_column, "threads")} AS effective_title,
+    threads.cwd,
+    threads.tokens_used,
+    threads.source,
+    {created_column},
+    threads.updated_at_ms,
+    {model_column},
+    {reasoning_column},
+    {path_column},
+    {nickname_column},
+    {role_column}
+FROM tree
+JOIN threads ON threads.id = tree.id
+ORDER BY tree.depth, created_at_ms, threads.id
+""",
+                (root_id, root_id),
+            )
+        )
+        rollout_rows = list(
+            connection.execute(
+                """
+SELECT id, rollout_path
+FROM threads
+WHERE updated_at_ms >= ?
+  AND rollout_path <> ''
+ORDER BY id
+""",
+                (cutoff_ms,),
+            )
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+
+    threads = []
+    for row in rows:
+        agent_path = str(row["agent_path"] or "") or agent_path_from_source(row["source"])
+        threads.append(
+            DetailThread(
+                thread_id=str(row["id"]),
+                parent_thread_id=str(row["parent_id"]) if row["parent_id"] else None,
+                depth=int(row["depth"] or 0),
+                rollout_path=Path(str(row["rollout_path"])),
+                title=normalize_title(row["effective_title"]) or str(row["id"]),
+                cwd=str(row["cwd"] or ""),
+                database_tokens=max(int(row["tokens_used"] or 0), 0),
+                created_at_ms=max(int(row["created_at_ms"] or 0), 0),
+                updated_at_ms=max(int(row["updated_at_ms"] or 0), 0),
+                model=str(row["model"] or ""),
+                reasoning_effort=str(row["reasoning_effort"] or ""),
+                agent_path=agent_path,
+                agent_nickname=str(row["agent_nickname"] or ""),
+                agent_role=str(row["agent_role"] or ""),
+            )
+        )
+
+    rollouts = [
+        CandidateRollout(thread_id=str(row["id"]), path=Path(str(row["rollout_path"])))
+        for row in rollout_rows
+    ]
+    return threads, rollouts
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def token_total(value: Any) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    total = value.get("total_tokens")
+    if not isinstance(total, bool):
+        try:
+            if total is not None:
+                return max(int(total), 0)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        input_tokens = int(value.get("input_tokens") or 0)
+        output_tokens = int(value.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    if input_tokens or output_tokens:
+        return max(input_tokens, 0) + max(output_tokens, 0)
+    return None
+
+
+def token_breakdown(value: Any) -> TokenBreakdown | None:
+    total = token_total(value)
+    if total is None or not isinstance(value, dict):
+        return None
+
+    def component(name: str) -> int:
+        raw_value = value.get(name)
+        if isinstance(raw_value, bool):
+            return 0
+        try:
+            return max(int(raw_value or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return TokenBreakdown(
+        total_tokens=total,
+        input_tokens=component("input_tokens"),
+        cached_input_tokens=component("cached_input_tokens"),
+        output_tokens=component("output_tokens"),
+        reasoning_output_tokens=component("reasoning_output_tokens"),
+    )
+
+
+def breakdown_delta(current: TokenBreakdown, previous: TokenBreakdown | None) -> TokenBreakdown:
+    if previous is None:
+        return current.copy()
+
+    def delta(name: str) -> int:
+        current_value = getattr(current, name)
+        previous_value = getattr(previous, name)
+        return current_value - previous_value if current_value >= previous_value else current_value
+
+    return TokenBreakdown(
+        total_tokens=delta("total_tokens"),
+        input_tokens=delta("input_tokens"),
+        cached_input_tokens=delta("cached_input_tokens"),
+        output_tokens=delta("output_tokens"),
+        reasoning_output_tokens=delta("reasoning_output_tokens"),
+    )
+
+
+def subtract_breakdown(
+    value: TokenBreakdown,
+    subtraction: TokenBreakdown,
+) -> tuple[TokenBreakdown, TokenBreakdown]:
+    def remaining(name: str) -> int:
+        return max(getattr(subtraction, name) - getattr(value, name), 0)
+
+    def result(name: str) -> int:
+        return max(getattr(value, name) - getattr(subtraction, name), 0)
+
+    return (
+        TokenBreakdown(
+            total_tokens=result("total_tokens"),
+            input_tokens=result("input_tokens"),
+            cached_input_tokens=result("cached_input_tokens"),
+            output_tokens=result("output_tokens"),
+            reasoning_output_tokens=result("reasoning_output_tokens"),
+        ),
+        TokenBreakdown(
+            total_tokens=remaining("total_tokens"),
+            input_tokens=remaining("input_tokens"),
+            cached_input_tokens=remaining("cached_input_tokens"),
+            output_tokens=remaining("output_tokens"),
+            reasoning_output_tokens=remaining("reasoning_output_tokens"),
+        ),
+    )
+
+
+@dataclass
+class TokenDeltaTracker:
+    previous_cumulative: TokenBreakdown | None = None
+    pending_fallback: TokenBreakdown = field(default_factory=TokenBreakdown)
+
+    def consume(self, info: Any, stats: ScanStats) -> TokenBreakdown | None:
+        if not isinstance(info, dict):
+            return None
+        cumulative = token_breakdown(info.get("total_token_usage"))
+        fallback = token_breakdown(info.get("last_token_usage"))
+        if cumulative is not None:
+            if (
+                self.previous_cumulative is not None
+                and cumulative.total_tokens < self.previous_cumulative.total_tokens
+            ):
+                stats.cumulative_resets += 1
+            delta = breakdown_delta(cumulative, self.previous_cumulative)
+            amount, self.pending_fallback = subtract_breakdown(delta, self.pending_fallback)
+            self.previous_cumulative = cumulative
+            return amount
+        if fallback is None:
+            return None
+        self.pending_fallback.add(fallback)
+        stats.last_usage_fallback_events += 1
+        return fallback
+
+
+def normalized_task_message(value: Any) -> str:
+    return redact_sensitive_text(normalize_title(value))
+
+
+def redact_sensitive_text(value: str) -> str:
+    value = SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+        value,
+    )
+    return BEARER_TOKEN_RE.sub("Bearer [REDACTED]", value)
+
+
+def task_message_kind(message: str) -> str:
+    if (
+        message.startswith("# AGENTS.md instructions")
+        or message.startswith("# AGENTS.md")
+        or message.startswith("<INSTRUCTIONS>")
+    ):
+        return "instruction"
+    control = message.casefold().rstrip(".!?؟").strip()
+    if control in CONTINUE_MESSAGES:
+        return "continue"
+    if control in IMPLEMENT_MESSAGES:
+        return "implement"
+    return "task"
+
+
+def ensure_task(
+    tasks: dict[str, TaskDetail],
+    key: str,
+    title: str,
+) -> TaskDetail:
+    task = tasks.get(key)
+    if task is None:
+        task = TaskDetail(key=key, title=title)
+        tasks[key] = task
+    return task
+
+
+def record_task_phase(task: TaskDetail, timestamp: datetime | None) -> None:
+    task.phase_count += 1
+    if timestamp is None:
+        return
+    if task.first_seen_at is None or timestamp < task.first_seen_at:
+        task.first_seen_at = timestamp
+    if task.last_seen_at is None or timestamp > task.last_seen_at:
+        task.last_seen_at = timestamp
+
+
+def scan_thread_rollout(
+    thread: DetailThread,
+    *,
+    stats: ScanStats,
+    root_tasks: dict[str, TaskDetail] | None = None,
+) -> tuple[AgentDetail, list[tuple[datetime, str]], str]:
+    agent = AgentDetail(thread=thread)
+    markers: list[tuple[datetime, str]] = []
+    current_task_key = UNATTRIBUTED_TASK_KEY
+    current_task_title = UNATTRIBUTED_TASK_TITLE
+    tracker = TokenDeltaTracker()
+    path = thread.rollout_path.expanduser()
+    stats.candidate_files += 1
+
+    if not path.is_file():
+        stats.missing_files += 1
+        agent.tokens.total_tokens = thread.database_tokens
+        agent.used_state_fallback = True
+        if root_tasks is not None:
+            task = ensure_task(root_tasks, current_task_key, current_task_title)
+            task.main_tokens.add(agent.tokens)
+        return agent, markers, current_task_key
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            stats.files_scanned += 1
+            for raw_line in handle:
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    stats.malformed_lines += 1
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                timestamp = parse_timestamp(record.get("timestamp"))
+
+                if (
+                    root_tasks is not None
+                    and record.get("type") == "event_msg"
+                    and payload.get("type") == "user_message"
+                ):
+                    message = normalized_task_message(payload.get("message"))
+                    if message:
+                        kind = task_message_kind(message)
+                        if kind == "task":
+                            current_task_key = message
+                            current_task_title = message
+                        if kind in {"task", "continue", "implement"}:
+                            task = ensure_task(
+                                root_tasks,
+                                current_task_key,
+                                current_task_title,
+                            )
+                            record_task_phase(task, timestamp)
+                            if timestamp is not None:
+                                markers.append((timestamp, current_task_key))
+
+                if (
+                    record.get("type") == "event_msg"
+                    and payload.get("type") == "token_count"
+                ):
+                    amount = tracker.consume(payload.get("info"), stats)
+                    if amount is None:
+                        continue
+                    agent.tokens.add(amount)
+                    if root_tasks is not None:
+                        task = ensure_task(
+                            root_tasks,
+                            current_task_key,
+                            current_task_title,
+                        )
+                        task.main_tokens.add(amount)
+                    if timestamp is None:
+                        stats.invalid_timestamps += 1
+
+                if (
+                    record.get("type") == "event_msg"
+                    and payload.get("type") == "agent_message"
+                ):
+                    message = normalize_title(payload.get("message"))
+                    if message:
+                        agent.result_summary = redact_sensitive_text(message)[:1200]
+
+                if (
+                    record.get("type") == "response_item"
+                    and payload.get("type") in {"function_call", "custom_tool_call"}
+                ):
+                    name = payload.get("name")
+                    if isinstance(name, str) and name:
+                        agent.tools[name] += 1
+    except (OSError, UnicodeError):
+        stats.read_errors += 1
+        agent.tokens.total_tokens = thread.database_tokens
+        agent.used_state_fallback = True
+        if root_tasks is not None:
+            task = ensure_task(root_tasks, current_task_key, current_task_title)
+            task.main_tokens.add(agent.tokens)
+        return agent, markers, current_task_key
+
+    if thread.database_tokens > agent.tokens.total_tokens:
+        adjustment = TokenBreakdown(
+            total_tokens=thread.database_tokens - agent.tokens.total_tokens
+        )
+        agent.tokens.add(adjustment)
+        agent.used_state_fallback = True
+        if root_tasks is not None:
+            task = ensure_task(root_tasks, current_task_key, current_task_title)
+            task.main_tokens.add(adjustment)
+
+    return agent, markers, current_task_key
+
+
+def task_at_time(markers: Sequence[tuple[datetime, str]], value: datetime) -> str:
+    selected = UNATTRIBUTED_TASK_KEY
+    for timestamp, task_key in markers:
+        if timestamp > value:
+            break
+        selected = task_key
+    return selected
+
+
+def scan_detail_tree(
+    threads: Sequence[DetailThread],
+) -> tuple[list[TaskDetail], list[AgentDetail], TokenBreakdown, ScanStats, list[str]]:
+    if not threads:
+        raise UsageReportError("resolved session tree is empty")
+
+    started = time.monotonic()
+    stats = ScanStats()
+    warnings: list[str] = []
+    tasks: dict[str, TaskDetail] = {}
+    root_agent, markers, _ = scan_thread_rollout(
+        threads[0],
+        stats=stats,
+        root_tasks=tasks,
+    )
+    agents = [root_agent]
+
+    for thread in threads[1:]:
+        agent, _, _ = scan_thread_rollout(thread, stats=stats)
+        created_at = timestamp_from_millis(thread.created_at_ms)
+        task_key = task_at_time(markers, created_at)
+        task = ensure_task(
+            tasks,
+            task_key,
+            UNATTRIBUTED_TASK_TITLE if task_key == UNATTRIBUTED_TASK_KEY else task_key,
+        )
+        task.subagent_tokens.add(agent.tokens)
+        task.agent_ids.append(thread.thread_id)
+        agent.task_key = task_key
+        agents.append(agent)
+
+    session_tokens = TokenBreakdown()
+    for task in tasks.values():
+        session_tokens.add(task.total_tokens)
+    if not tasks:
+        tasks[UNATTRIBUTED_TASK_KEY] = TaskDetail(
+            key=UNATTRIBUTED_TASK_KEY,
+            title=UNATTRIBUTED_TASK_TITLE,
+            main_tokens=root_agent.tokens.copy(),
+        )
+        session_tokens = root_agent.tokens.copy()
+
+    fallback_threads = sum(1 for agent in agents if agent.used_state_fallback)
+    if fallback_threads:
+        warnings.append(
+            f"{fallback_threads} thread(s) used state database totals to supplement rollout detail"
+        )
+    if stats.malformed_lines:
+        warnings.append(f"{stats.malformed_lines} malformed JSONL line(s) were skipped")
+    if stats.invalid_timestamps:
+        warnings.append(f"{stats.invalid_timestamps} token event(s) had invalid timestamps")
+    if stats.read_errors:
+        warnings.append(f"{stats.read_errors} rollout file(s) could not be read")
+
+    stats.elapsed_seconds = time.monotonic() - started
+    sorted_tasks = sorted(
+        tasks.values(),
+        key=lambda task: (task.total_tokens.total_tokens, task.title),
+        reverse=True,
+    )
+    agents.sort(key=lambda agent: agent.tokens.total_tokens, reverse=True)
+    return sorted_tasks, agents, session_tokens, stats, warnings
+
+
+def scan_window_usage(
+    rollouts: Iterable[CandidateRollout],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    thread_to_root: dict[str, str],
+) -> tuple[int, dict[str, int], ScanStats]:
+    stats = ScanStats()
+    by_root: dict[str, int] = {root_id: 0 for root_id in set(thread_to_root.values())}
+    window_total = 0
+    seen_paths: set[Path] = set()
+    started = time.monotonic()
+
+    for rollout in rollouts:
+        path = rollout.path.expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        stats.candidate_files += 1
+
+        if not path.is_file():
+            stats.missing_files += 1
+            continue
+
+        previous_cumulative: int | None = None
+        pending_last_fallback = 0
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                stats.files_scanned += 1
+                for raw_line in handle:
+                    try:
+                        record = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        stats.malformed_lines += 1
+                        continue
+
+                    payload = record.get("payload")
+                    if (
+                        record.get("type") != "event_msg"
+                        or not isinstance(payload, dict)
+                        or payload.get("type") != "token_count"
+                    ):
+                        continue
+
+                    info = payload.get("info")
+                    if not isinstance(info, dict):
+                        continue
+
+                    current_cumulative = token_total(info.get("total_token_usage"))
+                    last_usage = token_total(info.get("last_token_usage"))
+                    used_last_fallback = False
+                    if current_cumulative is not None:
+                        if previous_cumulative is None:
+                            cumulative_delta = current_cumulative
+                        elif current_cumulative >= previous_cumulative:
+                            cumulative_delta = current_cumulative - previous_cumulative
+                        else:
+                            stats.cumulative_resets += 1
+                            cumulative_delta = current_cumulative
+                        amount = max(cumulative_delta - pending_last_fallback, 0)
+                        pending_last_fallback = max(pending_last_fallback - cumulative_delta, 0)
+                        previous_cumulative = current_cumulative
+                    else:
+                        amount = last_usage
+                        used_last_fallback = amount is not None
+                        if amount is not None:
+                            pending_last_fallback += amount
+                    if amount is None:
+                        continue
+
+                    timestamp = parse_timestamp(record.get("timestamp"))
+                    if timestamp is None:
+                        stats.invalid_timestamps += 1
+                        continue
+                    if timestamp < window_start or timestamp > window_end:
+                        continue
+
+                    if used_last_fallback:
+                        stats.last_usage_fallback_events += 1
+                    window_total += amount
+                    root_id = thread_to_root.get(rollout.thread_id)
+                    if root_id is not None:
+                        by_root[root_id] = by_root.get(root_id, 0) + amount
+        except (OSError, UnicodeError):
+            stats.read_errors += 1
+
+    stats.elapsed_seconds = time.monotonic() - started
+    return window_total, by_root, stats
+
+
+def build_session_detail(
+    database: StateDatabase,
+    *,
+    session_prefix: str,
+    cutoff_ms: int,
+    window_start: datetime,
+    window_end: datetime,
+) -> SessionDetail:
+    threads, rollouts = load_detail_snapshot(
+        database,
+        session_prefix=session_prefix,
+        cutoff_ms=cutoff_ms,
+    )
+    tasks, agents, tokens, detail_stats, warnings = scan_detail_tree(threads)
+    root = threads[0]
+    thread_to_root = {thread.thread_id: root.thread_id for thread in threads}
+    window_total, by_root, window_stats = scan_window_usage(
+        rollouts,
+        window_start=window_start,
+        window_end=window_end,
+        thread_to_root=thread_to_root,
+    )
+    window_tokens = by_root.get(root.thread_id, 0)
+    for warning in warning_messages(0, 0, window_stats):
+        warnings.append(f"window scan: {warning}")
+
+    root_agent = next(agent for agent in agents if agent.thread.thread_id == root.thread_id)
+    main_tokens = root_agent.tokens.total_tokens
+    subagent_tokens = max(tokens.total_tokens - main_tokens, 0)
+    return SessionDetail(
+        root=root,
+        tasks=tasks,
+        agents=agents,
+        tokens=tokens,
+        main_tokens=main_tokens,
+        subagent_tokens=subagent_tokens,
+        window_tokens=window_tokens,
+        window_share_percent=(window_tokens / window_total * 100 if window_total else 0.0),
+        window_total=window_total,
+        window_start=window_start,
+        window_end=window_end,
+        detail_stats=detail_stats,
+        window_stats=window_stats,
+        warnings=warnings,
+    )
+
+
+def sort_reports(reports: list[SessionReport], sort_mode: str) -> None:
+    reports.sort(key=lambda item: item.thread_id, reverse=True)
+    reports.sort(key=lambda item: item.recency_at_ms, reverse=True)
+    if sort_mode == "tokens":
+        reports.sort(key=lambda item: item.total_tokens, reverse=True)
+    for index, report in enumerate(reports, start=1):
+        report.rank = index
+
+
+def timestamp_from_millis(value: int) -> datetime:
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+
+
+def local_iso(value: datetime) -> str:
+    return value.astimezone().isoformat(timespec="seconds")
+
+
+def format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+def format_share(value: float, tokens: int) -> str:
+    if tokens > 0 and 0 < value < 0.01:
+        return "<0.01%"
+    return f"{value:.2f}%"
+
+
+def format_relative_age(value: datetime, reference: datetime) -> str:
+    elapsed_seconds = max(int((reference - value).total_seconds()), 0)
+    if elapsed_seconds == 0:
+        return "now"
+    if elapsed_seconds < 60:
+        return f"{elapsed_seconds}s ago"
+
+    elapsed_minutes = elapsed_seconds // 60
+    if elapsed_minutes < 60:
+        return f"{elapsed_minutes}m ago"
+
+    elapsed_hours = elapsed_minutes // 60
+    remaining_minutes = elapsed_minutes % 60
+    if elapsed_hours < 24:
+        minute_part = f" {remaining_minutes}m" if remaining_minutes else ""
+        return f"{elapsed_hours}h{minute_part} ago"
+
+    elapsed_days = elapsed_hours // 24
+    remaining_hours = elapsed_hours % 24
+    hour_part = f" {remaining_hours}h" if remaining_hours else ""
+    return f"{elapsed_days}d{hour_part} ago"
+
+
+def render_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    *,
+    numeric_columns: set[int],
+) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    def cell(value: str, index: int) -> str:
+        return value.rjust(widths[index]) if index in numeric_columns else value.ljust(widths[index])
+
+    lines = ["  ".join(cell(header, index) for index, header in enumerate(headers))]
+    lines.append("  ".join("-" * width for width in widths))
+    for row in rows:
+        lines.append("  ".join(cell(value, index) for index, value in enumerate(row)))
+    return "\n".join(lines)
+
+
+def warning_messages(requested: int, returned: int, stats: ScanStats) -> list[str]:
+    warnings: list[str] = []
+    if returned < requested:
+        warnings.append(f"requested {requested} sessions, but only {returned} matching sessions were found")
+    if stats.missing_files:
+        warnings.append(f"{stats.missing_files} rollout file(s) were missing")
+    if stats.read_errors:
+        warnings.append(f"{stats.read_errors} rollout file(s) could not be read")
+    if stats.malformed_lines:
+        warnings.append(f"{stats.malformed_lines} malformed JSONL line(s) were skipped")
+    if stats.invalid_timestamps:
+        warnings.append(f"{stats.invalid_timestamps} token event(s) had invalid timestamps")
+    return warnings
+
+
+def print_text_report(
+    reports: Sequence[SessionReport],
+    *,
+    requested_count: int,
+    days: int,
+    sort_mode: str,
+    window_start: datetime,
+    window_end: datetime,
+    window_total: int,
+    stats: ScanStats,
+) -> None:
+    print("Codex session token usage")
+    print("=========================")
+    print(f"Window:       {local_iso(window_start)} .. {local_iso(window_end)} ({days} rolling day(s))")
+    print(f"Window total: {format_int(window_total)} tokens")
+    print(f"Selected:     {len(reports)} of {requested_count} recent interactive session(s)")
+    print(f"Sort:         {'total tokens descending' if sort_mode == 'tokens' else 'most recent first'}")
+    print()
+
+    if reports:
+        headers = (
+            "session",
+            "total (subagents)",
+            "agents",
+            f"{days}d share",
+            "duration",
+            "active",
+            "title",
+        )
+        rows = []
+        for report in reports:
+            rows.append(
+                (
+                    report.thread_id[:8],
+                    f"{format_int(report.total_tokens)} ({format_int(report.subagent_tokens)})",
+                    format_int(report.subagent_count),
+                    format_share(report.window_share_percent, report.window_tokens),
+                    (
+                        format_duration(report.duration_seconds)
+                        if report.duration_seconds is not None
+                        else "-"
+                    ),
+                    format_relative_age(timestamp_from_millis(report.recency_at_ms), window_end),
+                    report.display_title,
+                )
+            )
+        print(render_table(headers, rows, numeric_columns={1, 2, 3}))
+    else:
+        print("No matching Codex sessions found.")
+
+    print()
+    print(
+        "The window share uses only tokens produced inside the same rolling window; "
+        "lifetime totals include cached input tokens."
+    )
+    print(f"Scanned {stats.files_scanned} rollout file(s) in {stats.elapsed_seconds:.2f}s.")
+    for warning in warning_messages(requested_count, len(reports), stats):
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def report_to_dict(report: SessionReport) -> dict[str, Any]:
+    return {
+        "rank": report.rank,
+        "thread_id": report.thread_id,
+        "title": report.title,
+        "display_title": report.display_title,
+        "cwd": report.cwd,
+        "recency_at": local_iso(timestamp_from_millis(report.recency_at_ms)),
+        "duration_seconds": report.duration_seconds,
+        "main_tokens": report.main_tokens,
+        "subagent_tokens": report.subagent_tokens,
+        "total_tokens": report.total_tokens,
+        "subagent_count": report.subagent_count,
+        "window_tokens": report.window_tokens,
+        "window_share_percent": report.window_share_percent,
+    }
+
+
+def print_json_report(
+    reports: Sequence[SessionReport],
+    *,
+    codex_home: Path,
+    state_database: Path,
+    requested_count: int,
+    days: int,
+    sort_mode: str,
+    window_start: datetime,
+    window_end: datetime,
+    window_total: int,
+    stats: ScanStats,
+) -> None:
+    payload = {
+        "generated_at": local_iso(window_end),
+        "codex_home": str(codex_home),
+        "state_database": str(state_database),
+        "requested_sessions": requested_count,
+        "returned_sessions": len(reports),
+        "sort": sort_mode,
+        "window": {
+            "days": days,
+            "start": local_iso(window_start),
+            "end": local_iso(window_end),
+            "total_tokens": window_total,
+        },
+        "sessions": [report_to_dict(report) for report in reports],
+        "scan": stats.to_dict(),
+        "warnings": warning_messages(requested_count, len(reports), stats),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def percent(value: int, total: int) -> float:
+    return value / total * 100 if total else 0.0
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(seconds, 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+    if hours < 24:
+        suffix = f" {remaining_minutes}m" if remaining_minutes else ""
+        return f"{hours}h{suffix}"
+    days = hours // 24
+    remaining_hours = hours % 24
+    suffix = f" {remaining_hours}h" if remaining_hours else ""
+    return f"{days}d{suffix}"
+
+
+def optional_local_iso(value_ms: int) -> str | None:
+    if value_ms <= 0:
+        return None
+    return local_iso(timestamp_from_millis(value_ms))
+
+
+def agent_label(agent: AgentDetail) -> str:
+    if agent.thread.depth == 0:
+        role = "root"
+    elif agent.thread.agent_path:
+        role = agent.thread.agent_path.rstrip("/").rsplit("/", 1)[-1].replace("_", " ")
+    elif agent.thread.agent_role:
+        role = agent.thread.agent_role
+    else:
+        role = "subagent"
+    if agent.thread.agent_nickname:
+        return f"{role} ({agent.thread.agent_nickname})"
+    return role
+
+
+def sorted_tools(tools: Counter[str]) -> list[tuple[str, int]]:
+    return sorted(tools.items(), key=lambda item: (-item[1], item[0]))
+
+
+def agent_to_detail_dict(
+    agent: AgentDetail,
+    *,
+    session_total: int,
+    verbose: bool,
+) -> dict[str, Any]:
+    duration_seconds = max(
+        (agent.thread.updated_at_ms - agent.thread.created_at_ms) // 1000,
+        0,
+    )
+    summary_width = 600 if verbose else 180
+    return {
+        "thread_id": agent.thread.thread_id,
+        "parent_thread_id": agent.thread.parent_thread_id,
+        "depth": agent.thread.depth,
+        "agent_path": agent.thread.agent_path or None,
+        "nickname": agent.thread.agent_nickname or None,
+        "role": agent.thread.agent_role or None,
+        "label": agent_label(agent),
+        "model": agent.thread.model or None,
+        "reasoning_effort": agent.thread.reasoning_effort or None,
+        "created_at": optional_local_iso(agent.thread.created_at_ms),
+        "updated_at": optional_local_iso(agent.thread.updated_at_ms),
+        "duration_seconds": duration_seconds,
+        "task_key": agent.task_key,
+        "tokens": agent.tokens.to_dict(),
+        "session_share_percent": percent(agent.tokens.total_tokens, session_total),
+        "cached_input_share_percent": percent(
+            agent.tokens.cached_input_tokens,
+            agent.tokens.input_tokens,
+        ),
+        "tool_call_count": sum(agent.tools.values()),
+        "tools": dict(sorted_tools(agent.tools)) if verbose else dict(sorted_tools(agent.tools)[:5]),
+        "result_summary": shorten_title(agent.result_summary, summary_width),
+        "used_state_fallback": agent.used_state_fallback,
+    }
+
+
+def task_to_detail_dict(
+    task: TaskDetail,
+    *,
+    session_total: int,
+    agents_by_id: dict[str, AgentDetail],
+    verbose: bool,
+) -> dict[str, Any]:
+    total = task.total_tokens
+    task_agents = sorted(
+        (agents_by_id[agent_id] for agent_id in task.agent_ids if agent_id in agents_by_id),
+        key=lambda agent: agent.tokens.total_tokens,
+        reverse=True,
+    )
+    return {
+        "key": task.key,
+        "title": task.title,
+        "first_seen_at": local_iso(task.first_seen_at) if task.first_seen_at else None,
+        "last_seen_at": local_iso(task.last_seen_at) if task.last_seen_at else None,
+        "phase_count": task.phase_count,
+        "tokens": total.to_dict(),
+        "main_tokens": task.main_tokens.total_tokens,
+        "subagent_tokens": task.subagent_tokens.total_tokens,
+        "share_percent": percent(total.total_tokens, session_total),
+        "agent_count": len(task_agents),
+        "agent_ids": [agent.thread.thread_id for agent in task_agents],
+        "subtasks": [
+            {
+                "thread_id": agent.thread.thread_id,
+                "label": agent_label(agent),
+                "tokens": agent.tokens.total_tokens,
+                "task_share_percent": percent(agent.tokens.total_tokens, total.total_tokens),
+                "result_summary": shorten_title(
+                    agent.result_summary,
+                    600 if verbose else 180,
+                ),
+                "attribution": "spawn_time",
+            }
+            for agent in task_agents
+        ],
+        "attribution": {
+            "main": "root_timeline" if task.main_tokens.total_tokens else None,
+            "subagents": "spawn_time" if task.subagent_tokens.total_tokens else None,
+        },
+    }
+
+
+def detail_to_dict(
+    detail: SessionDetail,
+    *,
+    codex_home: Path,
+    state_database: Path,
+    days: int,
+    verbose: bool,
+) -> dict[str, Any]:
+    total = detail.tokens.total_tokens
+    agents_by_id = {agent.thread.thread_id: agent for agent in detail.agents}
+    duration_seconds = max(
+        (detail.root.updated_at_ms - detail.root.created_at_ms) // 1000,
+        0,
+    )
+    return {
+        "mode": "session",
+        "generated_at": local_iso(detail.window_end),
+        "codex_home": str(codex_home),
+        "state_database": str(state_database),
+        "session": {
+            "thread_id": detail.root.thread_id,
+            "title": detail.root.title,
+            "cwd": detail.root.cwd,
+            "model": detail.root.model or None,
+            "reasoning_effort": detail.root.reasoning_effort or None,
+            "created_at": optional_local_iso(detail.root.created_at_ms),
+            "updated_at": optional_local_iso(detail.root.updated_at_ms),
+            "duration_seconds": duration_seconds,
+            "subagent_count": max(len(detail.agents) - 1, 0),
+        },
+        "tokens": {
+            **detail.tokens.to_dict(),
+            "main_tokens": detail.main_tokens,
+            "subagent_tokens": detail.subagent_tokens,
+            "subagent_share_percent": percent(detail.subagent_tokens, total),
+            "cached_input_share_percent": percent(
+                detail.tokens.cached_input_tokens,
+                detail.tokens.input_tokens,
+            ),
+        },
+        "window": {
+            "days": days,
+            "start": local_iso(detail.window_start),
+            "end": local_iso(detail.window_end),
+            "total_tokens": detail.window_total,
+            "session_tokens": detail.window_tokens,
+            "session_share_percent": detail.window_share_percent,
+        },
+        "tasks": [
+            task_to_detail_dict(
+                task,
+                session_total=total,
+                agents_by_id=agents_by_id,
+                verbose=verbose,
+            )
+            for task in detail.tasks
+        ],
+        "agents": [
+            agent_to_detail_dict(agent, session_total=total, verbose=verbose)
+            for agent in detail.agents
+        ],
+        "attribution": {
+            "root_tokens": "cumulative token deltas between substantive user messages",
+            "control_messages": "Continue and Implement the plan remain attached to the active task",
+            "subagent_tokens": "entire subagent usage is assigned to the task active at spawn time",
+            "unattributed_key": UNATTRIBUTED_TASK_KEY,
+        },
+        "scan": {
+            "detail": detail.detail_stats.to_dict(),
+            "window": detail.window_stats.to_dict(),
+        },
+        "warnings": detail.warnings,
+    }
+
+
+def print_session_detail_json(
+    detail: SessionDetail,
+    *,
+    codex_home: Path,
+    state_database: Path,
+    days: int,
+    verbose: bool,
+) -> None:
+    print(
+        json.dumps(
+            detail_to_dict(
+                detail,
+                codex_home=codex_home,
+                state_database=state_database,
+                days=days,
+                verbose=verbose,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def print_session_detail_text(
+    detail: SessionDetail,
+    *,
+    days: int,
+    title_width_value: int,
+    verbose: bool,
+) -> None:
+    total = detail.tokens.total_tokens
+    print("Codex session task usage")
+    print("========================")
+    print(f"Session:    {detail.root.thread_id}")
+    print(f"Title:      {detail.root.title}")
+    print(f"Project:    {detail.root.cwd or '-'}")
+    if detail.root.model:
+        effort = f" / {detail.root.reasoning_effort}" if detail.root.reasoning_effort else ""
+        print(f"Model:      {detail.root.model}{effort}")
+    duration_seconds = max(
+        (detail.root.updated_at_ms - detail.root.created_at_ms) // 1000,
+        0,
+    )
+    print(f"Duration:   {format_duration(duration_seconds)}")
+    print(
+        f"Total:      {format_int(total)} tokens "
+        f"({format_int(detail.subagent_tokens)} from {max(len(detail.agents) - 1, 0)} subagents)"
+    )
+    print(
+        f"{days}d share:   "
+        f"{format_share(detail.window_share_percent, detail.window_tokens)} "
+        f"of {format_int(detail.window_total)} tokens"
+    )
+    print()
+    print("Token usage by task")
+    print("-------------------")
+    for index, task in enumerate(detail.tasks, start=1):
+        task_total = task.total_tokens.total_tokens
+        print(f"{index}. {shorten_title(task.title, max(title_width_value, 40))}")
+        print(
+            f"   {format_int(task_total)} tokens · "
+            f"{format_share(percent(task_total, total), task_total)} · "
+            f"main {format_int(task.main_tokens.total_tokens)} · "
+            f"subagents {format_int(task.subagent_tokens.total_tokens)} · "
+            f"{len(task.agent_ids)} agent(s)"
+        )
+
+    if detail.tasks:
+        top_task = detail.tasks[0]
+        top_total = top_task.total_tokens
+        print()
+        print("Why the top task used the most tokens")
+        print("-------------------------------------")
+        print(
+            f"The task accounts for "
+            f"{format_share(percent(top_total.total_tokens, total), top_total.total_tokens)} "
+            f"of this session."
+        )
+        if top_task.subagent_tokens.total_tokens:
+            print(
+                f"Its {len(top_task.agent_ids)} subagent(s) used "
+                f"{format_int(top_task.subagent_tokens.total_tokens)} tokens "
+                f"({format_share(percent(top_task.subagent_tokens.total_tokens, top_total.total_tokens), top_task.subagent_tokens.total_tokens)} of the task)."
+            )
+        if top_total.input_tokens:
+            print(
+                f"Cached input was {format_int(top_total.cached_input_tokens)} tokens "
+                f"({format_share(percent(top_total.cached_input_tokens, top_total.input_tokens), top_total.cached_input_tokens)} of input)."
+            )
+
+    agents_by_id = {agent.thread.thread_id: agent for agent in detail.agents}
+    expanded_tasks = detail.tasks if verbose else detail.tasks[:1]
+    for task in expanded_tasks:
+        task_agents = sorted(
+            (agents_by_id[agent_id] for agent_id in task.agent_ids if agent_id in agents_by_id),
+            key=lambda agent: agent.tokens.total_tokens,
+            reverse=True,
+        )
+        if not task_agents:
+            continue
+        print()
+        print(f"Subtasks: {shorten_title(task.title, max(title_width_value, 40))}")
+        print("-" * min(max(len(task.title) + 10, 20), max(title_width_value, 40)))
+        for agent in task_agents:
+            print(
+                f"- {agent_label(agent)} [{agent.thread.thread_id[:8]}]: "
+                f"{format_int(agent.tokens.total_tokens)} tokens "
+                f"({format_share(percent(agent.tokens.total_tokens, task.total_tokens.total_tokens), agent.tokens.total_tokens)})"
+            )
+            if agent.result_summary:
+                summary_width = max(title_width_value * (6 if verbose else 2), 120)
+                print(f"  Result: {shorten_title(agent.result_summary, summary_width)}")
+            if verbose:
+                cached_share = percent(
+                    agent.tokens.cached_input_tokens,
+                    agent.tokens.input_tokens,
+                )
+                duration = max(
+                    (agent.thread.updated_at_ms - agent.thread.created_at_ms) // 1000,
+                    0,
+                )
+                print(
+                    f"  Input {format_int(agent.tokens.input_tokens)} "
+                    f"(cached {format_share(cached_share, agent.tokens.cached_input_tokens)}), "
+                    f"output {format_int(agent.tokens.output_tokens)}, "
+                    f"duration {format_duration(duration)}, tools {sum(agent.tools.values())}"
+                )
+                if agent.tools:
+                    tools = ", ".join(
+                        f"{name} {count}" for name, count in sorted_tools(agent.tools)
+                    )
+                    print(f"  Tools: {tools}")
+
+    print()
+    print(
+        "Attribution: root token deltas follow substantive user tasks; "
+        "subagents are assigned to the task active when they were spawned."
+    )
+    print(
+        f"Scanned {detail.detail_stats.files_scanned} session rollout file(s) "
+        f"in {detail.detail_stats.elapsed_seconds:.2f}s."
+    )
+    for warning in detail.warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.session and args.count is not None:
+        parser.error("COUNT cannot be combined with --session")
+    if not args.session and args.count is None:
+        parser.error("COUNT is required unless --session is used")
+    if args.verbose and not args.session:
+        parser.error("--verbose requires --session")
+    if args.session and args.exclude_current:
+        parser.error("--exclude-current cannot be combined with --session")
+
+    excluded_thread_id: str | None = None
+    if args.exclude_current:
+        excluded_thread_id = os.environ.get("CODEX_THREAD_ID")
+        if not excluded_thread_id:
+            parser.error("--exclude-current requires CODEX_THREAD_ID to be set")
+
+    codex_home = args.codex_home.expanduser().resolve()
+    window_end = datetime.now(timezone.utc)
+    window_start = window_end - timedelta(days=args.days)
+    cutoff_ms = int(window_start.timestamp() * 1000)
+
+    try:
+        database = discover_state_database(codex_home)
+        if args.session:
+            detail = build_session_detail(
+                database,
+                session_prefix=args.session,
+                cutoff_ms=cutoff_ms,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if args.json:
+                print_session_detail_json(
+                    detail,
+                    codex_home=codex_home,
+                    state_database=database.path,
+                    days=args.days,
+                    verbose=args.verbose,
+                )
+            else:
+                print_session_detail_text(
+                    detail,
+                    days=args.days,
+                    title_width_value=args.title_width,
+                    verbose=args.verbose,
+                )
+            return 0
+
+        reports, thread_to_root, rollouts = load_report_snapshot(
+            database,
+            count=args.count,
+            title_width_value=args.title_width,
+            cutoff_ms=cutoff_ms,
+            excluded_thread_id=excluded_thread_id,
+        )
+        window_total, by_root, stats = scan_window_usage(
+            rollouts,
+            window_start=window_start,
+            window_end=window_end,
+            thread_to_root=thread_to_root,
+        )
+    except (UsageReportError, OSError, sqlite3.Error) as exc:
+        print(f"codex-session-usage: {exc}", file=sys.stderr)
+        return 1
+
+    for report in reports:
+        report.window_tokens = by_root.get(report.thread_id, 0)
+        report.window_share_percent = (
+            (report.window_tokens / window_total) * 100 if window_total else 0.0
+        )
+    sort_reports(reports, args.sort)
+
+    if args.json:
+        print_json_report(
+            reports,
+            codex_home=codex_home,
+            state_database=database.path,
+            requested_count=args.count,
+            days=args.days,
+            sort_mode=args.sort,
+            window_start=window_start,
+            window_end=window_end,
+            window_total=window_total,
+            stats=stats,
+        )
+    else:
+        print_text_report(
+            reports,
+            requested_count=args.count,
+            days=args.days,
+            sort_mode=args.sort,
+            window_start=window_start,
+            window_end=window_end,
+            window_total=window_total,
+            stats=stats,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -11,17 +11,23 @@ Special behavior:
   --model, -m    Open an interactive picker for a supported model
 
 Supported models:
-  gpt-5.5
-  claude-sonnet-4-6
-  claude-opus-4-6
-  qwen3-coder
-  gemini-2.5-pro
+  gpt-5.6-sol (default)  Latest frontier agentic coding model.
+  claude-opus-4-8       Anthropic's most capable model — excels at complex reasoning, analysis, and nuanced tasks.
+  glm-5.2               Z.ai model on par with Claude Opus, uses significantly less quota.
+  kimi-2.7              Kimi's latest coding model with strong reasoning and agentic performance.
+  gapgpt-qwen-3.6       Locally hosted — all traffic stays in Iran. Best for latency-sensitive or data-sovereign workloads.
+  claude-sonnet-5       Anthropic's latest Sonnet model for coding, agents, and professional work.
+  gpt-5.6-terra         Balanced GPT-5.6 coding model for everyday agentic work.
+  gpt-5.6-luna          Fast, efficient GPT-5.6 coding model.
+  gpt-5.3-codex-spark   Ultra-fast coding model.
+  gpt-5.5               Frontier agentic coding model.
+  gpt-5.4               OpenAI's cheaper frontier agentic coding model.
 
 Examples:
   gapcodex
   gapcodex --model
   gapcodex -m
-  gapcodex --model gpt-5.5
+  gapcodex --model gpt-5.6-sol
 EOF
 }
 
@@ -33,15 +39,37 @@ pick_model() {
 
   python3 /dev/fd/3 3<<'PY'
 import sys
-from typing import List
+from typing import List, Tuple
 
 MODELS = [
-    "gpt-5.5",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-    "qwen3-coder",
-    "gemini-2.5-pro",
+    ("gpt-5.6-sol", "Latest frontier agentic coding model."),
+    (
+        "claude-opus-4-8",
+        "Anthropic's most capable model — excels at complex reasoning, analysis, and nuanced tasks.",
+    ),
+    ("glm-5.2", "Z.ai model on par with Claude Opus, uses significantly less quota."),
+    ("kimi-2.7", "Kimi's latest coding model with strong reasoning and agentic performance."),
+    (
+        "gapgpt-qwen-3.6",
+        "Locally hosted — all traffic stays in Iran. Best for latency-sensitive or data-sovereign workloads.",
+    ),
+    (
+        "claude-sonnet-5",
+        "Anthropic's latest Sonnet model for coding, agents, and professional work.",
+    ),
+    ("gpt-5.6-terra", "Balanced GPT-5.6 coding model for everyday agentic work."),
+    ("gpt-5.6-luna", "Fast, efficient GPT-5.6 coding model."),
+    ("gpt-5.3-codex-spark", "Ultra-fast coding model."),
+    ("gpt-5.5", "Frontier agentic coding model."),
+    ("gpt-5.4", "OpenAI's cheaper frontier agentic coding model."),
 ]
+DEFAULT_MODEL = MODELS[0][0]
+MODEL_NAME_WIDTH = max(
+    len(f"{model_id} (default)" if model_id == DEFAULT_MODEL else model_id)
+    for model_id, _ in MODELS
+)
+
+Model = Tuple[str, str]
 
 
 def fail(message: str, exit_code: int = 1) -> None:
@@ -49,14 +77,19 @@ def fail(message: str, exit_code: int = 1) -> None:
     raise SystemExit(exit_code)
 
 
-def fallback_choice(models: List[str], tty_input, tty_output) -> str:
+def model_label(model_id: str, description: str) -> str:
+    display_name = f"{model_id} (default)" if model_id == DEFAULT_MODEL else model_id
+    return f"{display_name:<{MODEL_NAME_WIDTH}}  {description}"
+
+
+def fallback_choice(models: List[Model], tty_input, tty_output) -> str:
     print(
         "prompt_toolkit is not installed; falling back to a numbered model picker.",
         file=sys.stderr,
     )
     tty_output.write("GapCodex model picker\n")
-    for index, model in enumerate(models, start=1):
-        tty_output.write(f"  {index}. {model}\n")
+    for index, (model_id, description) in enumerate(models, start=1):
+        tty_output.write(f"  {index}. {model_label(model_id, description)}\n")
     tty_output.flush()
 
     while True:
@@ -71,12 +104,12 @@ def fallback_choice(models: List[str], tty_input, tty_output) -> str:
         if selection.isdigit():
             selected_index = int(selection)
             if 1 <= selected_index <= len(models):
-                return models[selected_index - 1]
+                return models[selected_index - 1][0]
         tty_output.write("Invalid selection. Please enter one of the listed numbers.\n")
         tty_output.flush()
 
 
-def prompt_toolkit_choice(models: List[str], tty_input, tty_output) -> str:
+def prompt_toolkit_choice(models: List[Model], tty_input, tty_output) -> str:
     from prompt_toolkit.application.current import create_app_session
     from prompt_toolkit.input.defaults import create_input
     from prompt_toolkit.output.defaults import create_output
@@ -102,8 +135,11 @@ def prompt_toolkit_choice(models: List[str], tty_input, tty_output) -> str:
         with create_app_session(input=tty_ui_input, output=tty_ui_output):
             result = choice(
                 message="GapCodex model picker",
-                options=[(model, model) for model in models],
-                default=models[0],
+                options=[
+                    (model_id, model_label(model_id, description))
+                    for model_id, description in models
+                ],
+                default=DEFAULT_MODEL,
                 style=style,
                 symbol=">",
                 show_frame=True,
