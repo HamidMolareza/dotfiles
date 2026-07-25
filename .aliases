@@ -180,10 +180,10 @@ alias projects-status='git-sync-status /home/home/my-files/projects --max-depth 
 alias sp-ssh='retry-until-success 10 "gh codespace ssh"'
 alias sp-usage='retry-until-success 10 "gh codespace ports forward 8898:8898"'
 alias sp-stop='retry-until-success 10 "gh codespace stop"'
-alias sp-proxy3='retry-until-success 1 "gh codespace ports forward 8899:8901 --codespace gh-proxy-jrvq6x5pg452r5x"'
+alias sp-proxy3='retry-until-success 1 "gh codespace ports forward 8899:8901 --codespace gh-proxy-gx447799xgrvhvr6v"'
 
 sp-proxy2() {
-  local codespace="gh-proxy-jrvq6x5pg452r5x"
+  local codespace="gh-proxy-gx447799xgrvhvr6v"
   local ssh_host="cs.gh-proxy-779qx5gp7xvgfxrr7.main"
   local local_port="8901"
   local remote_port="8899"
