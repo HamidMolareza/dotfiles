@@ -37,8 +37,8 @@ CACHE_FILE = CACHE_DIR / "quota-cache.json"
 CACHE_VERSION = 2
 CACHE_TTL_SECONDS = 300
 HTTP_TIMEOUT_SECONDS = 8.0
-HTTP_RETRY_ATTEMPTS = 3
-HTTP_RETRY_BASE_DELAY_SECONDS = 0.4
+HTTP_MAX_RETRIES = 5
+HTTP_RETRY_BASE_DELAY_SECONDS = 1.0
 MAX_CONCURRENT_PROBES = 4
 STATUS_WIDTH = 10
 NAME_WIDTH = 12
@@ -549,6 +549,7 @@ Rules:
   - account info is keyed by email, so it follows auth files when codex-auth switches or archives them
   - quota probes use a read-only HTTPS request with the current auth token
   - quota probes never trigger token refresh or modify your real auth files
+  - transient usage failures retry up to 5 times per account with 1, 2, 4, 8, and 16 second delays
   - transient probe failures keep stale cached quota when available and mark it with *
   - sorting prioritizes server-confirmed expired accounts, then nearest account expiry,
     then 7d reset, 5h reset, and lower remaining percentages
@@ -1500,8 +1501,21 @@ def usage_request_headers(access_token: str, account_id: str | None) -> dict[str
     return headers
 
 
-def retry_delay_seconds(attempt_index: int) -> float:
-    return HTTP_RETRY_BASE_DELAY_SECONDS * (2**attempt_index)
+def retry_delay_seconds(retry_index: int) -> float:
+    return HTTP_RETRY_BASE_DELAY_SECONDS * (2**retry_index)
+
+
+def wait_before_usage_retry(retry_index: int, reason: str) -> None:
+    delay_seconds = retry_delay_seconds(retry_index)
+    debug_log(
+        "waiting before usage request retry",
+        delay_seconds=delay_seconds,
+        max_retries=HTTP_MAX_RETRIES,
+        next_attempt=retry_index + 2,
+        reason=reason,
+        retry=retry_index + 1,
+    )
+    time.sleep(delay_seconds)
 
 
 def should_retry_http_status(status_code: int) -> bool:
@@ -1536,14 +1550,15 @@ def build_usage_opener(proxy_config: UsageProxyConfig):
 
 def fetch_usage_payload(url: str, headers: dict[str, str], proxy_config: UsageProxyConfig) -> dict[str, Any]:
     last_error: Exception | None = None
+    max_attempts = HTTP_MAX_RETRIES + 1
 
-    for attempt_index in range(HTTP_RETRY_ATTEMPTS):
+    for attempt_index in range(max_attempts):
         request = urllib_request.Request(url, headers=headers)
         opener = build_usage_opener(proxy_config)
         debug_log(
             "usage request attempt",
             attempt=attempt_index + 1,
-            max_attempts=HTTP_RETRY_ATTEMPTS,
+            max_attempts=max_attempts,
             proxy=proxy_config.display,
             timeout_seconds=HTTP_TIMEOUT_SECONDS,
             url=url,
@@ -1578,12 +1593,12 @@ def fetch_usage_payload(url: str, headers: dict[str, str], proxy_config: UsagePr
             if error.code == 403:
                 raise QuotaProbeError(QUOTA_UNKNOWN, transient=True) from error
             if error.code == 429:
-                if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
-                    time.sleep(retry_delay_seconds(attempt_index))
+                if attempt_index < HTTP_MAX_RETRIES:
+                    wait_before_usage_retry(attempt_index, "http 429")
                     continue
                 raise QuotaProbeError(RATE_LIMITED, transient=True) from error
-            if should_retry_http_status(error.code) and attempt_index < HTTP_RETRY_ATTEMPTS - 1:
-                time.sleep(retry_delay_seconds(attempt_index))
+            if should_retry_http_status(error.code) and attempt_index < HTTP_MAX_RETRIES:
+                wait_before_usage_retry(attempt_index, f"http {error.code}")
                 continue
             raise QuotaProbeError(f"http {error.code}", transient=should_retry_http_status(error.code)) from error
         except urllib_error.URLError as error:
@@ -1598,28 +1613,35 @@ def fetch_usage_payload(url: str, headers: dict[str, str], proxy_config: UsagePr
                 url=url,
             )
             if is_timeout_reason(reason):
-                if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
-                    time.sleep(retry_delay_seconds(attempt_index))
+                if attempt_index < HTTP_MAX_RETRIES:
+                    wait_before_usage_retry(attempt_index, TIMEOUT)
                     continue
                 raise QuotaProbeError(TIMEOUT, transient=True) from error
             if is_network_reason(reason):
-                if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
-                    time.sleep(retry_delay_seconds(attempt_index))
+                if attempt_index < HTTP_MAX_RETRIES:
+                    wait_before_usage_retry(attempt_index, NETWORK_ERROR)
                     continue
                 raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
             raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
         except (TimeoutError, socket.timeout) as error:
             last_error = error
             debug_log("usage request timeout", attempt=attempt_index + 1, error=error, url=url)
-            if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
-                time.sleep(retry_delay_seconds(attempt_index))
+            if attempt_index < HTTP_MAX_RETRIES:
+                wait_before_usage_retry(attempt_index, TIMEOUT)
                 continue
             raise QuotaProbeError(TIMEOUT, transient=True) from error
+        except OSError as error:
+            last_error = error
+            debug_log("usage request network error", attempt=attempt_index + 1, error=error, url=url)
+            if attempt_index < HTTP_MAX_RETRIES:
+                wait_before_usage_retry(attempt_index, NETWORK_ERROR)
+                continue
+            raise QuotaProbeError(NETWORK_ERROR, transient=True) from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             last_error = error
             debug_log("usage response decode failure", attempt=attempt_index + 1, error=error, url=url)
-            if attempt_index < HTTP_RETRY_ATTEMPTS - 1:
-                time.sleep(retry_delay_seconds(attempt_index))
+            if attempt_index < HTTP_MAX_RETRIES:
+                wait_before_usage_retry(attempt_index, BAD_RESPONSE)
                 continue
             raise QuotaProbeError(BAD_RESPONSE, transient=True) from error
 

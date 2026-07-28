@@ -6,8 +6,13 @@ email, and account metadata for each candidate.
 ## Quota And Reset Counts
 
 For each uncached account, the picker sends one read-only request to the existing
-Codex usage endpoint. The `Resets` column is populated from
-`rate_limit_reset_credits.available_count` in that same response; the separate
+Codex usage endpoint. Transient network, timeout, retryable HTTP, and response
+decode failures are retried up to five times independently per account, with
+exponential delays of 1, 2, 4, 8, and 16 seconds. Permanent authentication
+failures are not retried.
+
+The `Resets` column is populated from
+`rate_limit_reset_credits.available_count` in the usage response; the separate
 reset-credit details endpoint is not requested.
 
 Quota data and the reset count share the same five-minute cache. Cache schema
