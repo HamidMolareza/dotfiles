@@ -767,7 +767,7 @@ run_active_config_boundary_test() {
   [[ "$(readlink -f /home/home/Desktop/temp)" == /home/home/my-files/temp ]] \
     || fail "Desktop/temp must point to my-files/temp"
   [[ "$(grep -c '^account|' "$github")" -eq 1 ]] || fail "GitHub config must select exactly one account"
-  assert_contains "$github" "account|hamidmolareza"
+  assert_contains "$github" "account|HamidMolareza"
   assert_not_contains "$github" "wmolareza"
   assert_not_contains "$credentials" 'github|.config/gh'
   assert_contains "$excludes" '/home/home/.dotfiles/.config/gh'
