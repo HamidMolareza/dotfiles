@@ -26,6 +26,16 @@ This repository contains configuration files and scripts to set up and manage a 
    ```
 3. Review and customize configuration files as needed.
 
+## Optional Script Dependencies
+
+`install.sh` only backs up and links dotfiles; it does not install system or
+language packages. Scripts that have optional dependencies keep a dependency-free
+fallback where practical and document their own setup.
+
+For example, `codex-auth` works with a numbered menu by default and can use an
+isolated `prompt-toolkit` environment for its enhanced picker. See
+[`scripts/src/codex/codex-auth.md`](scripts/src/codex/codex-auth.md) for setup.
+
 ## Canonical IDE Paths
 
 Desktop symlinks can expose the same project through multiple logical paths.

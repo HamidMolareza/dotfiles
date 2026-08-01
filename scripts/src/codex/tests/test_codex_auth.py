@@ -5,6 +5,7 @@ import importlib.util
 import io
 import socket
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,11 @@ def load_codex_auth_module():
 
 
 codex_auth = load_codex_auth_module()
+
+
+class NonClosingStringIO(io.StringIO):
+    def close(self) -> None:
+        pass
 
 
 class FakeResponse:
@@ -59,6 +65,165 @@ class SequencedOpener:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class CodexAuthDependencyTests(unittest.TestCase):
+    def test_custom_managed_venv_path_takes_precedence(self) -> None:
+        with mock.patch.dict(
+            codex_auth.os.environ,
+            {
+                codex_auth.VENV_ENV_VAR: "~/custom-codex-auth-venv",
+                "XDG_DATA_HOME": "/ignored",
+            },
+        ):
+            self.assertEqual(
+                Path.home() / "custom-codex-auth-venv",
+                codex_auth.managed_venv_path(),
+            )
+
+    def test_managed_venv_path_uses_xdg_data_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.dict(codex_auth.os.environ, {"XDG_DATA_HOME": temporary_directory}):
+                codex_auth.os.environ.pop(codex_auth.VENV_ENV_VAR, None)
+
+                self.assertEqual(
+                    Path(temporary_directory) / "codex-auth" / "venv",
+                    codex_auth.managed_venv_path(),
+                )
+
+    def test_help_does_not_reexec_with_managed_python(self) -> None:
+        with mock.patch.object(codex_auth, "managed_venv_path") as managed_venv_path:
+            codex_auth.maybe_reexec_with_managed_python(["--help"])
+
+        managed_venv_path.assert_not_called()
+
+    def test_reexecs_with_managed_python_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            venv_path = Path(temporary_directory) / "venv"
+            python_path = venv_path / "bin" / "python"
+            python_path.parent.mkdir(parents=True)
+            python_path.touch(mode=0o755)
+
+            with (
+                mock.patch.dict(codex_auth.os.environ, {codex_auth.VENV_ENV_VAR: str(venv_path)}),
+                mock.patch.object(codex_auth.sys, "prefix", "/usr"),
+                mock.patch.object(codex_auth.os, "execv") as execv,
+            ):
+                codex_auth.maybe_reexec_with_managed_python(["--dir", "/tmp/auth"])
+
+            execv.assert_called_once_with(
+                str(python_path),
+                [str(python_path), str(SCRIPT.resolve()), "--dir", "/tmp/auth"],
+            )
+
+    def test_does_not_reexec_when_already_in_managed_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            venv_path = Path(temporary_directory) / "venv"
+            python_path = venv_path / "bin" / "python"
+            python_path.parent.mkdir(parents=True)
+            python_path.touch(mode=0o755)
+
+            with (
+                mock.patch.dict(codex_auth.os.environ, {codex_auth.VENV_ENV_VAR: str(venv_path)}),
+                mock.patch.object(codex_auth.sys, "prefix", str(venv_path)),
+                mock.patch.object(codex_auth.os, "execv") as execv,
+            ):
+                codex_auth.maybe_reexec_with_managed_python([])
+
+            execv.assert_not_called()
+
+    def test_broken_managed_python_does_not_stop_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            venv_path = Path(temporary_directory) / "venv"
+            python_path = venv_path / "bin" / "python"
+            python_path.parent.mkdir(parents=True)
+            python_path.touch(mode=0o755)
+
+            with (
+                mock.patch.dict(codex_auth.os.environ, {codex_auth.VENV_ENV_VAR: str(venv_path)}),
+                mock.patch.object(codex_auth.sys, "prefix", "/usr"),
+                mock.patch.object(codex_auth.os, "execv", side_effect=OSError("broken interpreter")),
+            ):
+                codex_auth.maybe_reexec_with_managed_python([])
+
+    def test_missing_prompt_toolkit_is_reported_as_optional_dependency(self) -> None:
+        real_import = __import__
+
+        def import_without_prompt_toolkit(name, *args, **kwargs):
+            if name.startswith("prompt_toolkit"):
+                raise ModuleNotFoundError("No module named 'prompt_toolkit'")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            mock.patch("builtins.__import__", side_effect=import_without_prompt_toolkit),
+            mock.patch.object(
+                codex_auth.importlib_metadata,
+                "version",
+                side_effect=codex_auth.importlib_metadata.PackageNotFoundError,
+            ),
+            self.assertRaises(codex_auth.PromptToolkitUnavailable) as raised,
+        ):
+            codex_auth.prompt_toolkit_choice([], None, None)
+
+        self.assertEqual("prompt-toolkit is not installed", str(raised.exception))
+
+    def test_incompatible_prompt_toolkit_version_is_reported(self) -> None:
+        real_import = __import__
+
+        def import_without_choice(name, *args, **kwargs):
+            if name.startswith("prompt_toolkit"):
+                raise ImportError("cannot import name 'choice'")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            mock.patch("builtins.__import__", side_effect=import_without_choice),
+            mock.patch.object(codex_auth.importlib_metadata, "version", return_value="3.0.43"),
+            self.assertRaises(codex_auth.PromptToolkitUnavailable) as raised,
+        ):
+            codex_auth.prompt_toolkit_choice([], None, None)
+
+        self.assertIn("prompt-toolkit 3.0.43", str(raised.exception))
+
+    def test_dependency_failure_prints_hint_and_uses_numbered_fallback(self) -> None:
+        tty_input = NonClosingStringIO("1\n")
+        tty_output = NonClosingStringIO()
+        selected = mock.sentinel.selected
+
+        with (
+            mock.patch("builtins.open", side_effect=[tty_input, tty_output]),
+            mock.patch.object(
+                codex_auth,
+                "prompt_toolkit_choice",
+                side_effect=codex_auth.PromptToolkitUnavailable("prompt-toolkit is not installed"),
+            ),
+            mock.patch.object(codex_auth, "fallback_choice", return_value=selected) as fallback_choice,
+        ):
+            result = codex_auth.choose_auth_file([])
+
+        self.assertIs(selected, result)
+        fallback_choice.assert_called_once()
+        self.assertIn(codex_auth.PROMPT_TOOLKIT_REQUIREMENT, tty_output.getvalue())
+        self.assertIn(str(codex_auth.PROMPT_TOOLKIT_SETUP_GUIDE), tty_output.getvalue())
+
+    def test_runtime_import_error_is_not_hidden_by_numbered_fallback(self) -> None:
+        tty_input = NonClosingStringIO()
+        tty_output = NonClosingStringIO()
+
+        with (
+            mock.patch("builtins.open", side_effect=[tty_input, tty_output]),
+            mock.patch.object(codex_auth, "prompt_toolkit_choice", side_effect=ImportError("runtime failure")),
+            mock.patch.object(codex_auth, "fallback_choice") as fallback_choice,
+            self.assertRaisesRegex(ImportError, "runtime failure"),
+        ):
+            codex_auth.choose_auth_file([])
+
+        fallback_choice.assert_not_called()
+
+    def test_requirement_manifest_matches_runtime_hint(self) -> None:
+        self.assertEqual(
+            codex_auth.PROMPT_TOOLKIT_REQUIREMENT,
+            codex_auth.PROMPT_TOOLKIT_REQUIREMENTS_FILE.read_text(encoding="utf-8").strip(),
+        )
 
 
 class CodexAuthRetryTests(unittest.TestCase):
