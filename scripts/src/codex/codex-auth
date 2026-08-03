@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+from importlib import metadata as importlib_metadata
 import json
 import os
 import re
@@ -80,6 +81,11 @@ DEFAULT_USAGE_PROXY_DISPLAY = "current environment"
 DEBUG_ENV_VAR = "CODEX_AUTH_DEBUG"
 DEBUG_LOG_ENV_VAR = "CODEX_AUTH_DEBUG_LOG"
 PROXY_ENV_VAR = "CODEX_AUTH_PROXY"
+VENV_ENV_VAR = "CODEX_AUTH_VENV"
+PROMPT_TOOLKIT_DISTRIBUTION = "prompt-toolkit"
+PROMPT_TOOLKIT_REQUIREMENT = "prompt-toolkit>=3.0.52,<3.1"
+PROMPT_TOOLKIT_REQUIREMENTS_FILE = Path(__file__).with_name("codex-auth.requirements.txt")
+PROMPT_TOOLKIT_SETUP_GUIDE = Path(__file__).with_name("codex-auth.md")
 NETWORK_GUARD_ACTIVE_ENV_VAR = "NETWORK_GUARD_ACTIVE"
 NETWORK_GUARD_COMMAND = "network-guard"
 DEBUG_BODY_PREVIEW_LIMIT = 240
@@ -394,6 +400,10 @@ class QuotaProbeError(RuntimeError):
         self.transient = transient
 
 
+class PromptToolkitUnavailable(RuntimeError):
+    pass
+
+
 def is_cacheable_status(status: str) -> bool:
     return status in {
         API_KEY_AUTH,
@@ -564,6 +574,9 @@ Options:
   --debug          Enable probe debug logging
   --debug-log PATH Write debug logs to PATH instead of stderr
   -h, --help       Show this help text
+
+Environment:
+  {VENV_ENV_VAR}   Optional managed Python virtual environment for the enhanced picker
 """
     )
 
@@ -608,6 +621,37 @@ def parse_args(argv: Sequence[str]) -> CliOptions:
 
 def is_help_invocation(argv: Sequence[str]) -> bool:
     return any(arg in {"-h", "--help"} for arg in argv)
+
+
+def managed_venv_path() -> Path:
+    configured_path = os.environ.get(VENV_ENV_VAR, "").strip()
+    if configured_path:
+        return Path(configured_path).expanduser()
+
+    xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    data_home = Path(xdg_data_home).expanduser() if xdg_data_home else Path.home() / ".local" / "share"
+    return data_home / "codex-auth" / "venv"
+
+
+def maybe_reexec_with_managed_python(argv: Sequence[str]) -> None:
+    if is_help_invocation(argv):
+        return
+
+    venv_path = managed_venv_path()
+    try:
+        if Path(sys.prefix).resolve() == venv_path.resolve():
+            return
+    except OSError:
+        return
+
+    python_path = venv_path / "bin" / "python"
+    if not python_path.is_file() or not os.access(python_path, os.X_OK):
+        return
+
+    try:
+        os.execv(str(python_path), [str(python_path), str(Path(__file__).resolve()), *argv])
+    except OSError:
+        return
 
 
 def script_invocation_command() -> str:
@@ -1888,11 +1932,22 @@ def prompt_toolkit_choice(
     tty_output,
     process_summary: str = EMPTY_CELL,
 ) -> AuthChoice:
-    from prompt_toolkit.application.current import create_app_session
-    from prompt_toolkit.input.defaults import create_input
-    from prompt_toolkit.output.defaults import create_output
-    from prompt_toolkit.shortcuts import choice
-    from prompt_toolkit.styles import Style
+    try:
+        from prompt_toolkit.application.current import create_app_session
+        from prompt_toolkit.input.defaults import create_input
+        from prompt_toolkit.output.defaults import create_output
+        from prompt_toolkit.shortcuts import choice
+        from prompt_toolkit.styles import Style
+    except ImportError as error:
+        try:
+            installed_version = importlib_metadata.version(PROMPT_TOOLKIT_DISTRIBUTION)
+        except importlib_metadata.PackageNotFoundError:
+            detail = "prompt-toolkit is not installed"
+        except Exception:
+            detail = "prompt-toolkit could not be loaded"
+        else:
+            detail = f"prompt-toolkit {installed_version} does not provide the required picker API"
+        raise PromptToolkitUnavailable(detail) from error
 
     style = Style.from_dict(
         {
@@ -1942,7 +1997,14 @@ def choose_auth_file(auth_files: Sequence[AuthFile], process_summary: str = EMPT
     try:
         try:
             return prompt_toolkit_choice(auth_files, tty_input, tty_output, process_summary)
-        except ImportError:
+        except PromptToolkitUnavailable as error:
+            tty_output.write(
+                f"Enhanced picker unavailable: {error}.\n"
+                f"Required: {PROMPT_TOOLKIT_REQUIREMENT}. Using numbered menu.\n"
+                f"Requirements file: {PROMPT_TOOLKIT_REQUIREMENTS_FILE}\n"
+                f"Setup guide: {PROMPT_TOOLKIT_SETUP_GUIDE}\n\n"
+            )
+            tty_output.flush()
             return fallback_choice(auth_files, tty_input, tty_output, process_summary)
     finally:
         tty_input.close()
@@ -2672,8 +2734,10 @@ def archive_active_auth_file(active_path: Path, target_path: Path) -> None:
 
 
 def main() -> None:
-    ensure_network_guard(sys.argv[1:])
-    options = parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    ensure_network_guard(argv)
+    maybe_reexec_with_managed_python(argv)
+    options = parse_args(argv)
     configure_debug_logging(options.debug, options.debug_log_path)
     proxy_config = load_usage_proxy_config(options.directory, options.proxy_url)
     debug_log(

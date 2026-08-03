@@ -3,6 +3,40 @@
 `codex-auth` switches the active Codex auth file in `~/.codex` and shows quota,
 email, and account metadata for each candidate.
 
+## Optional Enhanced Picker
+
+The numbered menu works with the Python standard library alone. The enhanced
+keyboard-driven picker additionally requires `prompt-toolkit>=3.0.52,<3.1`.
+Ubuntu 24.04 packages an older release that does not provide the
+`prompt_toolkit.shortcuts.choice` API used by this script, so keep this optional
+dependency in a dedicated virtual environment instead of installing it into the
+system Python environment.
+
+Create the environment and install the tracked requirement with the Liara
+mirror:
+
+```bash
+codex_auth_venv="${CODEX_AUTH_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/codex-auth/venv}"
+sudo apt install python3-venv
+python3 -m venv "$codex_auth_venv"
+"$codex_auth_venv/bin/python" -m pip install \
+  --index-url https://package-mirror.liara.ir/repository/pypi/simple \
+  -r "$HOME/scripts/src/codex/codex-auth.requirements.txt"
+```
+
+If the mirror is unavailable, retry the final command against PyPI:
+
+```bash
+"$codex_auth_venv/bin/python" -m pip install \
+  --index-url https://pypi.org/simple \
+  -r "$HOME/scripts/src/codex/codex-auth.requirements.txt"
+```
+
+Normal `codex-auth` invocations automatically use that environment when it
+exists. Set `CODEX_AUTH_VENV` to use a different location. If the environment
+is absent or incompatible, the script prints a setup hint and continues with
+the numbered menu.
+
 ## Quota And Reset Counts
 
 For each uncached account, the picker sends one read-only request to the existing
