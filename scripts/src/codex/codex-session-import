@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+from _codex_session_transfer import (
+    BundleEntry,
+    BundleManifest,
+    TransferError,
+    active_session_ids,
+    append_names,
+    codex_home_from,
+    copy_stable,
+    ensure_private_directory,
+    fsync_directory,
+    load_effective_names,
+    load_manifest,
+    rollout_candidates,
+    safe_destination_path,
+    sha256_file,
+    truncate_file,
+    utc_now,
+    validate_bundle_payloads,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Import every root session in a Codex session directory bundle without editing Codex's SQLite "
+            "state database. Both single-root version 1 and multi-root version 2 bundles are supported."
+        ),
+        epilog="Example: codex-session-import /mnt/usb/codex-sessions --force",
+    )
+    parser.add_argument("export_path", help="Directory bundle produced by codex-session-export")
+    parser.add_argument("--codex-home", help="Destination CODEX_HOME, default: CODEX_HOME or ~/.codex")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and show the import plan without writing files")
+    parser.add_argument("--force", action="store_true", help="Replace conflicts after creating a recoverable backup")
+    return parser
+
+
+def backup_conflicts(
+    codex_home: Path,
+    bundle: BundleManifest,
+    conflicts: dict[str, list[Path]],
+    names: dict[str, str],
+) -> Path:
+    base = codex_home / "session-import-backups" / bundle.backup_key
+    ensure_private_directory(base)
+    stamp = utc_now().replace("-", "").replace(":", "").replace(".", "-")
+    backup = base / stamp
+    counter = 1
+    while backup.exists():
+        backup = base / f"{stamp}-{counter}"
+        counter += 1
+    ensure_private_directory(backup)
+    records: list[dict[str, object]] = []
+    for session_id, paths in conflicts.items():
+        for source in paths:
+            relative = source.relative_to(codex_home)
+            destination = backup.joinpath(*relative.parts)
+            size, digest = copy_stable(source, destination)
+            records.append(
+                {
+                    "session_id": session_id,
+                    "relative_path": relative.as_posix(),
+                    "size": size,
+                    "sha256": digest,
+                    "thread_name": names.get(session_id),
+                }
+            )
+    manifest = backup / "backup-manifest.json"
+    with manifest.open("x", encoding="utf-8") as handle:
+        os.chmod(manifest, 0o600)
+        backup_metadata = {
+            "created_at": utc_now(),
+            "bundle_id": bundle.bundle_id,
+            "root_session_ids": list(bundle.root_session_ids),
+            "files": records,
+            "effective_names": {session_id: names[session_id] for session_id in conflicts if session_id in names},
+        }
+        if len(bundle.root_session_ids) == 1:
+            backup_metadata["root_session_id"] = bundle.root_session_ids[0]
+        json.dump(
+            backup_metadata,
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    fsync_directory(backup)
+    return backup
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        bundle = Path(args.export_path).expanduser().absolute()
+        codex_home = codex_home_from(args.codex_home)
+        manifest = load_manifest(bundle)
+        entries = list(manifest.entries)
+        root_ids = list(manifest.root_session_ids)
+        validate_bundle_payloads(bundle, entries)
+        ensure_home = codex_home.exists() and codex_home.is_dir()
+        if codex_home.exists() and not codex_home.is_dir():
+            raise TransferError(f"destination CODEX_HOME is not a directory: {codex_home}")
+
+        wanted = {entry.session_id for entry in entries}
+        local_names, malformed_names = load_effective_names(codex_home / "session_index.jsonl", wanted)
+        existing_by_id = {entry.session_id: rollout_candidates(codex_home, entry.session_id) for entry in entries}
+        conflicts: dict[str, list[str]] = {}
+        conflict_paths: dict[str, list[Path]] = {}
+        changes: list[BundleEntry] = []
+        name_appends: list[tuple[str, str]] = []
+
+        for entry in entries:
+            target = safe_destination_path(codex_home, entry.relative_path)
+            existing = existing_by_id[entry.session_id]
+            identical = (
+                len(existing) == 1
+                and existing[0] == target
+                and existing[0].stat().st_size == entry.size
+                and sha256_file(existing[0]) == entry.sha256
+            )
+            reasons: list[str] = []
+            if existing and not identical:
+                reasons.append("local rollout path, archive status, or content differs")
+            local_name = local_names.get(entry.session_id)
+            if entry.thread_name is not None:
+                if local_name is None:
+                    name_appends.append((entry.session_id, entry.thread_name))
+                elif local_name != entry.thread_name:
+                    reasons.append(f"local name differs ({local_name!r} != {entry.thread_name!r})")
+                    name_appends.append((entry.session_id, entry.thread_name))
+            if reasons:
+                conflicts[entry.session_id] = reasons
+                conflict_paths[entry.session_id] = existing
+            if not identical:
+                changes.append(entry)
+
+        if conflicts and not args.force:
+            details = "; ".join(f"{session_id}: {', '.join(reasons)}" for session_id, reasons in conflicts.items())
+            raise TransferError(f"import conflicts detected: {details}. Re-run with --force to back up and replace them")
+
+        helper = Path(__file__).with_name("codex-sessions")
+        mutating_ids = {entry.session_id for entry in changes} | {session_id for session_id, _ in name_appends}
+        if mutating_ids:
+            active = active_session_ids(codex_home, helper)
+            matched = sorted(mutating_ids & active)
+            if matched:
+                raise TransferError(f"refusing to modify active session(s), even with --force: {', '.join(matched)}")
+
+        if args.dry_run:
+            print(
+                f"Would import {len(changes)} changed/new session file(s), append {len(name_appends)} name record(s), "
+                f"and leave {len(entries) - len(changes)} identical file(s) unchanged."
+            )
+            if conflicts:
+                print(f"Would create a backup for {len(conflicts)} conflicting session(s) before replacement.")
+            if malformed_names:
+                print(f"Warning: ignored {malformed_names} malformed destination session-index line(s).", file=sys.stderr)
+            return 0
+
+        if not ensure_home:
+            ensure_private_directory(codex_home)
+        backup: Path | None = None
+        if conflicts:
+            backup = backup_conflicts(codex_home, manifest, conflict_paths, local_names)
+
+        staging = Path(tempfile.mkdtemp(prefix=".session-import-", dir=codex_home))
+        os.chmod(staging, 0o700)
+        staged: dict[str, Path] = {}
+        written_targets: list[Path] = []
+        removed_paths: list[Path] = []
+        index_path = codex_home / "session_index.jsonl"
+        index_existed = index_path.exists()
+        index_original_size = index_path.stat().st_size if index_existed else 0
+        try:
+            for entry in changes:
+                source = bundle.joinpath(*entry.relative_path.parts)
+                staged_path = staging / entry.session_id
+                size, digest = copy_stable(source, staged_path)
+                if size != entry.size or digest != entry.sha256:
+                    raise TransferError(f"bundle payload changed while importing: {entry.relative_path}")
+                staged[entry.session_id] = staged_path
+
+            for entry in changes:
+                target = safe_destination_path(codex_home, entry.relative_path)
+                ensure_private_directory(target.parent)
+                os.replace(staged[entry.session_id], target)
+                os.chmod(target, 0o600)
+                written_targets.append(target)
+                fsync_directory(target.parent)
+                for obsolete in existing_by_id[entry.session_id]:
+                    if obsolete != target and obsolete.exists():
+                        obsolete.unlink()
+                        removed_paths.append(obsolete)
+                        fsync_directory(obsolete.parent)
+
+            append_names(index_path, name_appends, utc_now())
+        except Exception:
+            try:
+                if index_path.exists():
+                    if index_existed:
+                        truncate_file(index_path, index_original_size)
+                    else:
+                        index_path.unlink(missing_ok=True)
+                for target in written_targets:
+                    target.unlink(missing_ok=True)
+                if backup is not None:
+                    backup_manifest = json.loads((backup / "backup-manifest.json").read_text(encoding="utf-8"))
+                    for record in backup_manifest["files"]:
+                        original = codex_home.joinpath(*Path(record["relative_path"]).parts)
+                        source = backup.joinpath(*Path(record["relative_path"]).parts)
+                        ensure_private_directory(original.parent)
+                        shutil.copy2(source, original)
+                        os.chmod(original, 0o600)
+                for path in removed_paths:
+                    if not path.exists() and backup is None:
+                        pass
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+        shutil.rmtree(staging, ignore_errors=True)
+
+        print(
+            f"Imported {len(root_ids)} root session(s) with {len(changes)} changed/new session file(s); "
+            f"{len(entries) - len(changes)} identical file(s) were left unchanged."
+        )
+        if backup is not None:
+            print(f"Backup created at {backup}")
+        if malformed_names:
+            print(f"Warning: ignored {malformed_names} malformed destination session-index line(s).", file=sys.stderr)
+        by_id = {entry.session_id: entry for entry in entries}
+        for root_id in root_ids:
+            if by_id[root_id].archived:
+                print(f"Next: codex unarchive {root_id}")
+            else:
+                print(f"Next: codex resume {root_id}")
+        return 0
+    except (TransferError, OSError) as exc:
+        print(f"codex-session-import: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

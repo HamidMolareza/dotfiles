@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import Any, TextIO
+
+from _codex_session_transfer import (
+    BundleEntry,
+    MANIFEST_SCHEMA,
+    MANIFEST_VERSION,
+    MULTI_MANIFEST_VERSION,
+    RecentSession,
+    SessionMeta,
+    ThreadRow,
+    TransferError,
+    active_session_ids,
+    codex_home_from,
+    copy_stable,
+    discover_state_database,
+    fsync_directory,
+    load_effective_names,
+    load_recent_root_sessions,
+    load_thread_forest,
+    manifest_entry_to_dict,
+    new_bundle_id,
+    normalize_uuid,
+    read_session_meta,
+    resolve_rollout,
+    utc_now,
+    validate_inactive,
+    write_json_file,
+)
+
+
+class SelectionCancelled(RuntimeError):
+    pass
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        usage="codex-session-export [SESSION_ID ...] EXPORT_PATH [options]",
+        description=(
+            "Export one or more Codex sessions and their spawned subagent trees as a portable directory bundle. "
+            "When no session ID is supplied, an interactive recent-session picker is shown."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  codex-session-export 01901234-5678-7abc-9def-0123456789ab /mnt/usb/codex-session
+  codex-session-export SESSION_ID_1 SESSION_ID_2 /mnt/usb/codex-sessions
+  codex-session-export /mnt/usb/codex-sessions
+""",
+    )
+    parser.add_argument(
+        "items",
+        nargs="+",
+        metavar="SESSION_ID|EXPORT_PATH",
+        help="Zero or more complete session UUIDs followed by the new export directory",
+    )
+    parser.add_argument("--codex-home", help="Source CODEX_HOME, default: CODEX_HOME or ~/.codex")
+    parser.add_argument("--limit", type=positive_int, default=20, help="Recent sessions shown by the picker, default: 20")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and show the export plan without writing files")
+    return parser
+
+
+def format_recent_time(value_ms: int) -> str:
+    if value_ms <= 0:
+        return "-"
+    return datetime.fromtimestamp(value_ms / 1000).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def shorten(value: str, width: int) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= width:
+        return normalized
+    return normalized[: width - 1].rstrip() + "…"
+
+
+def recent_session_label(session: RecentSession) -> str:
+    state = "active" if session.active else "archived" if session.archived else "ready"
+    cwd = shorten(session.cwd, 32) if session.cwd else "-"
+    return (
+        f"{format_recent_time(session.updated_at_ms):16}  {state:8}  {session.session_id[:8]}  "
+        f"{shorten(session.title, 58)}  [{cwd}]"
+    )
+
+
+def parse_numeric_selection(value: str, sessions: list[RecentSession]) -> list[str]:
+    normalized = value.strip().lower()
+    if normalized == "all":
+        return [session.session_id for session in sessions if not session.active]
+    selected_indexes: list[int] = []
+    for token in normalized.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"invalid range: {token!r}")
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(f"range start is greater than its end: {token!r}")
+            selected_indexes.extend(range(start, end + 1))
+        elif token.isdigit():
+            selected_indexes.append(int(token))
+        else:
+            raise ValueError(f"invalid selection: {token!r}")
+    if not selected_indexes:
+        raise ValueError("select at least one session")
+    result: list[str] = []
+    for index in selected_indexes:
+        if index < 1 or index > len(sessions):
+            raise ValueError(f"selection is outside 1-{len(sessions)}: {index}")
+        session = sessions[index - 1]
+        if session.active:
+            raise ValueError(f"session {index} is active and cannot be exported")
+        if session.session_id not in result:
+            result.append(session.session_id)
+    return result
+
+
+def fallback_picker(sessions: list[RecentSession], tty_input: TextIO, tty_output: TextIO) -> list[str]:
+    tty_output.write("Optional 'questionary' library is not installed; using the numbered selector.\n")
+    tty_output.write(
+        "For the enhanced menu, install it with 'sudo apt install python3-questionary' "
+        "or 'python3 -m pip install --user questionary'.\n\n"
+    )
+    tty_output.write("Recent Codex root sessions:\n")
+    for index, session in enumerate(sessions, start=1):
+        disabled = " (not selectable)" if session.active else ""
+        tty_output.write(f"  {index:>3}. {recent_session_label(session)}{disabled}\n")
+    tty_output.write("\nSelect numbers/ranges separated by commas, 'all', or press Enter to cancel.\n")
+    while True:
+        tty_output.write("Sessions> ")
+        tty_output.flush()
+        raw = tty_input.readline()
+        if raw == "" or not raw.strip():
+            raise SelectionCancelled("interactive session selection was cancelled")
+        try:
+            selected = parse_numeric_selection(raw, sessions)
+        except ValueError as exc:
+            tty_output.write(f"Invalid selection: {exc}\n")
+            continue
+        if selected:
+            return selected
+        tty_output.write("No transferable sessions were selected.\n")
+
+
+def questionary_picker(sessions: list[RecentSession], questionary: Any) -> list[str]:
+    choices = [
+        questionary.Choice(
+            title=recent_session_label(session),
+            value=session.session_id,
+            disabled="currently active" if session.active else None,
+        )
+        for session in sessions
+    ]
+    result = questionary.checkbox(
+        "Select Codex sessions to export",
+        choices=choices,
+        instruction="(Space toggles, Enter confirms, Ctrl-C cancels)",
+        validate=lambda selected: bool(selected) or "Select at least one session",
+    ).ask()
+    if result is None:
+        raise SelectionCancelled("interactive session selection was cancelled")
+    return [normalize_uuid(value) for value in result]
+
+
+def select_sessions_interactively(sessions: list[RecentSession]) -> list[str]:
+    if not sessions:
+        raise TransferError("no recent root sessions are available for selection")
+    try:
+        tty_input = open("/dev/tty", "r", encoding="utf-8")
+        tty_output = open("/dev/tty", "w", encoding="utf-8")
+    except OSError as exc:
+        raise TransferError(
+            "interactive selection requires a terminal; pass one or more SESSION_ID values explicitly"
+        ) from exc
+
+    try:
+        try:
+            import questionary
+        except ImportError:
+            return fallback_picker(sessions, tty_input, tty_output)
+
+        from prompt_toolkit.application.current import create_app_session
+        from prompt_toolkit.input.defaults import create_input
+        from prompt_toolkit.output.defaults import create_output
+
+        picker_input = create_input(stdin=tty_input, always_prefer_tty=True)
+        picker_output = create_output(stdout=tty_output, always_prefer_tty=True)
+        try:
+            with create_app_session(input=picker_input, output=picker_output):
+                return questionary_picker(sessions, questionary)
+        finally:
+            picker_input.close()
+    finally:
+        tty_input.close()
+        tty_output.close()
+
+
+def warn_malformed_names(count: int) -> None:
+    if count:
+        print(f"Warning: ignored {count} malformed session-index line(s).", file=sys.stderr)
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        export_path = Path(args.items[-1]).expanduser().resolve()
+        requested_ids = [normalize_uuid(value) for value in args.items[:-1]]
+        codex_home = codex_home_from(args.codex_home)
+        if export_path.exists() or export_path.is_symlink():
+            raise TransferError(f"export path already exists: {export_path}")
+        if not export_path.parent.is_dir():
+            raise TransferError(f"export parent directory does not exist: {export_path.parent}")
+
+        database = discover_state_database(codex_home)
+        helper = Path(__file__).with_name("codex-sessions")
+        menu_malformed_names = 0
+        if not requested_ids:
+            recent, menu_malformed_names = load_recent_root_sessions(database, codex_home, args.limit)
+            active = active_session_ids(codex_home, helper)
+            recent = [replace(session, active=session.session_id in active) for session in recent]
+            requested_ids = select_sessions_interactively(recent)
+
+        root_ids, rows, dropped_roots = load_thread_forest(database, requested_ids)
+        for session_id in dropped_roots:
+            print(
+                f"Warning: selected session {session_id} is already included by another selected ancestor; skipping it as a root.",
+                file=sys.stderr,
+            )
+        ids = {row.session_id for row in rows}
+        names, malformed_names = load_effective_names(codex_home / "session_index.jsonl", ids)
+        malformed_names = max(malformed_names, menu_malformed_names)
+        validate_inactive(ids, codex_home, helper)
+
+        sources: list[tuple[ThreadRow, Path, PurePosixPath, SessionMeta]] = []
+        for row in rows:
+            source = resolve_rollout(codex_home, row)
+            meta = read_session_meta(source)
+            if meta.session_id != row.session_id:
+                raise TransferError(f"session_meta id mismatch for {source}")
+            if row.parent_session_id is not None and meta.parent_session_id != row.parent_session_id:
+                raise TransferError(f"session_meta parent mismatch for {source}")
+            relative = PurePosixPath(source.relative_to(codex_home).as_posix())
+            archived = relative.parts[0] == "archived_sessions"
+            if archived != row.archived:
+                raise TransferError(f"database archived status disagrees with rollout path for {row.session_id}")
+            sources.append((row, source, relative, meta))
+
+        if args.dry_run:
+            print(
+                f"Would export {len(root_ids)} root session(s) and {len(sources)} total session file(s) "
+                f"to {export_path}"
+            )
+            warn_malformed_names(malformed_names)
+            return 0
+
+        temporary = Path(tempfile.mkdtemp(prefix=f".{export_path.name}.tmp-", dir=export_path.parent))
+        os.chmod(temporary, 0o700)
+        try:
+            entries: list[BundleEntry] = []
+            for row, source, relative, meta in sources:
+                destination = temporary.joinpath(*relative.parts)
+                size, digest = copy_stable(source, destination)
+                fsync_directory(destination.parent)
+                entries.append(
+                    BundleEntry(
+                        session_id=row.session_id,
+                        parent_session_id=row.parent_session_id,
+                        depth=row.depth,
+                        relative_path=relative,
+                        archived=relative.parts[0] == "archived_sessions",
+                        size=size,
+                        sha256=digest,
+                        thread_name=names.get(row.session_id),
+                        cli_version=meta.cli_version,
+                    )
+                )
+            validate_inactive(ids, codex_home, helper)
+            manifest: dict[str, Any] = {
+                "schema": MANIFEST_SCHEMA,
+                "version": MANIFEST_VERSION if len(root_ids) == 1 else MULTI_MANIFEST_VERSION,
+                "exported_at": utc_now(),
+                "sessions": [manifest_entry_to_dict(entry) for entry in entries],
+            }
+            if len(root_ids) == 1:
+                manifest["root_session_id"] = root_ids[0]
+            else:
+                manifest["bundle_id"] = new_bundle_id()
+                manifest["root_session_ids"] = root_ids
+            write_json_file(temporary / "manifest.json", manifest)
+            fsync_directory(temporary)
+            os.rename(temporary, export_path)
+            fsync_directory(export_path.parent)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        print(
+            f"Exported {len(root_ids)} root session(s) and {len(sources)} total session file(s) to {export_path}"
+        )
+        warn_malformed_names(malformed_names)
+        return 0
+    except SelectionCancelled as exc:
+        print(f"codex-session-export: {exc}", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        print("codex-session-export: interactive session selection was cancelled", file=sys.stderr)
+        return 130
+    except (TransferError, OSError) as exc:
+        print(f"codex-session-export: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
