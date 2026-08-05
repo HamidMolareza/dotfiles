@@ -37,6 +37,22 @@ exists. Set `CODEX_AUTH_VENV` to use a different location. If the environment
 is absent or incompatible, the script prints a setup hint and continues with
 the numbered menu.
 
+## Portable Account Metadata
+
+Account metadata is stored in `auth-metadata.json` inside the selected Codex
+home. The file may be a relative or absolute symbolic link to a persistent
+location such as removable storage. Reads and atomic writes follow the link and
+update its resolved target; the symbolic link itself is not replaced.
+
+Temporary files are created next to the resolved target so updates remain
+atomic even when the Codex home and metadata target are on different file
+systems. Clearing the final metadata entry writes a valid empty store instead
+of deleting the link or its target.
+
+If the symbolic-link target is unavailable, not mounted, or not a regular file,
+`codex-auth` stops with an explanation. It does not create a local fallback or
+silently replace the symbolic link.
+
 ## Quota And Reset Counts
 
 For each uncached account, the picker sends one read-only request to the existing

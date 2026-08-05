@@ -393,6 +393,10 @@ class SwapError(RuntimeError):
     pass
 
 
+class MetadataStoreError(RuntimeError):
+    pass
+
+
 class QuotaProbeError(RuntimeError):
     def __init__(self, status: str, *, transient: bool = False):
         super().__init__(status)
@@ -795,6 +799,33 @@ def metadata_store_path(directory: Path) -> Path:
     return directory / METADATA_STORE_NAME
 
 
+def metadata_store_io_path(directory: Path) -> Path:
+    store_path = metadata_store_path(directory)
+    if not store_path.is_symlink():
+        return store_path
+
+    try:
+        link_target = store_path.readlink()
+        resolved_target = store_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        try:
+            link_target = store_path.readlink()
+        except OSError:
+            link_target = Path("<unreadable>")
+        raise MetadataStoreError(
+            f"Metadata store symlink target is unavailable: {store_path} -> {link_target}. "
+            "Mount the target storage or repair the symlink, then retry."
+        ) from error
+
+    if not resolved_target.is_file():
+        raise MetadataStoreError(
+            f"Metadata store symlink target is not a regular file: "
+            f"{store_path} -> {link_target}. Repair the symlink, then retry."
+        )
+
+    return resolved_target
+
+
 def legacy_metadata_path(auth_path: Path) -> Path:
     return auth_path.with_name(f"{auth_path.name}{LEGACY_METADATA_SUFFIX}")
 
@@ -873,7 +904,7 @@ def account_metadata_payload(metadata: AccountMetadata) -> dict[str, object]:
 
 
 def load_account_metadata_store(directory: Path) -> dict[str, AccountMetadata] | None:
-    store_path = metadata_store_path(directory)
+    store_path = metadata_store_io_path(directory)
     try:
         payload = json.loads(store_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -903,20 +934,12 @@ def load_account_metadata_store(directory: Path) -> dict[str, AccountMetadata] |
 
 
 def write_account_metadata_store(directory: Path, metadata_by_email: dict[str, AccountMetadata]) -> None:
-    store_path = metadata_store_path(directory)
+    store_path = metadata_store_io_path(directory)
     accounts = {
         email: account_metadata_payload(metadata)
         for email, metadata in sorted(metadata_by_email.items())
         if metadata.has_values() and not metadata.error
     }
-
-    if not accounts:
-        try:
-            store_path.unlink()
-        except FileNotFoundError:
-            return
-        fsync_directory(store_path.parent)
-        return
 
     temp_path = store_path.with_name(f"{store_path.name}.tmp-{secrets.token_hex(4)}")
     payload = {"version": METADATA_VERSION, "accounts": accounts}
@@ -2796,6 +2819,8 @@ def main() -> None:
             else:
                 print(f"Active auth switched: {active_auth.name} <-> {selected_auth.name}")
             return
+    except MetadataStoreError as error:
+        fail(str(error))
     finally:
         close_debug_logging()
 

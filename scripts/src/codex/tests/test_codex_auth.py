@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import io
+import json
 import socket
 import sys
 import tempfile
@@ -224,6 +225,150 @@ class CodexAuthDependencyTests(unittest.TestCase):
             codex_auth.PROMPT_TOOLKIT_REQUIREMENT,
             codex_auth.PROMPT_TOOLKIT_REQUIREMENTS_FILE.read_text(encoding="utf-8").strip(),
         )
+
+
+class CodexAuthMetadataStoreTests(unittest.TestCase):
+    def test_write_through_relative_symlink_preserves_link_and_updates_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth_directory = root / "codex-home"
+            target_directory = root / "portable-store"
+            auth_directory.mkdir()
+            target_directory.mkdir()
+
+            target_path = target_directory / codex_auth.METADATA_STORE_NAME
+            target_path.write_text('{"version": 1, "accounts": {}}\n', encoding="utf-8")
+            store_path = auth_directory / codex_auth.METADATA_STORE_NAME
+            relative_target = Path("..") / target_directory.name / target_path.name
+            store_path.symlink_to(relative_target)
+
+            codex_auth.write_account_metadata_store(
+                auth_directory,
+                {"person@example.invalid": codex_auth.AccountMetadata(seller="Portable seller")},
+            )
+
+            self.assertTrue(store_path.is_symlink())
+            self.assertEqual(relative_target, store_path.readlink())
+            payload = json.loads(target_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "Portable seller",
+                payload["accounts"]["person@example.invalid"]["seller"],
+            )
+            self.assertEqual([], list(target_directory.glob(f"{target_path.name}.tmp-*")))
+
+    def test_empty_store_keeps_symlink_and_writes_valid_empty_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth_directory = root / "codex-home"
+            target_directory = root / "portable-store"
+            auth_directory.mkdir()
+            target_directory.mkdir()
+
+            target_path = target_directory / codex_auth.METADATA_STORE_NAME
+            target_path.write_text(
+                '{"version": 1, "accounts": {"person@example.invalid": {"seller": "old"}}}\n',
+                encoding="utf-8",
+            )
+            store_path = auth_directory / codex_auth.METADATA_STORE_NAME
+            store_path.symlink_to(target_path)
+
+            codex_auth.write_account_metadata_store(auth_directory, {})
+
+            self.assertTrue(store_path.is_symlink())
+            self.assertEqual(
+                {"version": codex_auth.METADATA_VERSION, "accounts": {}},
+                json.loads(target_path.read_text(encoding="utf-8")),
+            )
+
+    def test_regular_store_can_be_created_and_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            auth_directory = Path(temporary_directory)
+            store_path = auth_directory / codex_auth.METADATA_STORE_NAME
+
+            codex_auth.write_account_metadata_store(
+                auth_directory,
+                {"person@example.invalid": codex_auth.AccountMetadata(note="local")},
+            )
+            self.assertFalse(store_path.is_symlink())
+            self.assertEqual(
+                "local",
+                json.loads(store_path.read_text(encoding="utf-8"))["accounts"]
+                ["person@example.invalid"]["note"],
+            )
+
+            codex_auth.write_account_metadata_store(auth_directory, {})
+            self.assertEqual(
+                {"version": codex_auth.METADATA_VERSION, "accounts": {}},
+                json.loads(store_path.read_text(encoding="utf-8")),
+            )
+
+    def test_broken_symlink_fails_without_creating_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            auth_directory = Path(temporary_directory)
+            store_path = auth_directory / codex_auth.METADATA_STORE_NAME
+            missing_target = Path("missing-device") / codex_auth.METADATA_STORE_NAME
+            store_path.symlink_to(missing_target)
+
+            with self.assertRaisesRegex(
+                codex_auth.MetadataStoreError,
+                "symlink target is unavailable",
+            ):
+                codex_auth.write_account_metadata_store(
+                    auth_directory,
+                    {"person@example.invalid": codex_auth.AccountMetadata(seller="seller")},
+                )
+
+            self.assertTrue(store_path.is_symlink())
+            self.assertEqual(missing_target, store_path.readlink())
+            self.assertFalse((auth_directory / "missing-device").exists())
+            self.assertEqual([], list(auth_directory.glob(f"{store_path.name}.tmp-*")))
+
+    def test_symlink_to_directory_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            auth_directory = Path(temporary_directory) / "codex-home"
+            target_directory = Path(temporary_directory) / "portable-store"
+            auth_directory.mkdir()
+            target_directory.mkdir()
+            store_path = auth_directory / codex_auth.METADATA_STORE_NAME
+            store_path.symlink_to(target_directory, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                codex_auth.MetadataStoreError,
+                "not a regular file",
+            ):
+                codex_auth.load_account_metadata_store(auth_directory)
+
+            self.assertTrue(store_path.is_symlink())
+
+    def test_main_reports_broken_metadata_symlink_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            auth_directory = Path(temporary_directory)
+            store_path = auth_directory / codex_auth.METADATA_STORE_NAME
+            store_path.symlink_to(Path("missing-device") / codex_auth.METADATA_STORE_NAME)
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    codex_auth.sys,
+                    "argv",
+                    [str(SCRIPT), "--dir", str(auth_directory)],
+                ),
+                mock.patch.object(codex_auth, "ensure_network_guard"),
+                mock.patch.object(codex_auth, "maybe_reexec_with_managed_python"),
+                mock.patch.object(
+                    codex_auth,
+                    "load_usage_proxy_config",
+                    return_value=codex_auth.UsageProxyConfig(display="test"),
+                ),
+                mock.patch.object(codex_auth.sys, "stderr", stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                codex_auth.main()
+
+            self.assertEqual(1, raised.exception.code)
+            self.assertIn("symlink target is unavailable", stderr.getvalue())
+            self.assertIn("Mount the target storage or repair the symlink", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
 
 
 class CodexAuthRetryTests(unittest.TestCase):
